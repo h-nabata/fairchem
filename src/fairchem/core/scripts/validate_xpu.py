@@ -29,10 +29,30 @@ import torch
 from ase.build import bulk, molecule
 
 
+def validate_prediction(prediction, natoms, stress=False):
+    """Reject malformed outputs before NumPy broadcasting can hide an error."""
+    expected = {"energy": (), "forces": (natoms, 3)}
+    if stress:
+        expected["stress"] = (6,)
+    if natoms < 1:
+        raise ValueError("At least one atom is required")
+    for name, shape in expected.items():
+        if name not in prediction:
+            raise ValueError(f"Missing prediction: {name}")
+        actual = np.asarray(prediction[name])
+        if actual.shape != shape:
+            raise ValueError(
+                f"Prediction {name} has shape {actual.shape}; expected {shape}"
+            )
+
+
 def compare_predictions(reference, candidate, natoms, tolerances):
     """
     Compare finite energy, force and optional stress values in ASE units.
     """
+    stress = "stress" in reference or "stress" in candidate
+    validate_prediction(reference, natoms, stress)
+    validate_prediction(candidate, natoms, stress)
     errors = {
         "energy_eV_per_atom": abs(candidate["energy"] - reference["energy"]) / natoms,
         "forces_eV_per_A": float(
@@ -66,6 +86,10 @@ def evaluate(atoms, stress=False):
     }
     if stress:
         result["stress"] = np.asarray(atoms.get_stress()).copy()
+    validate_prediction(result, len(atoms), stress)
+    for name, value in result.items():
+        if not np.isfinite(value).all():
+            raise ValueError(f"Nonfinite {name} in ASE evaluation")
     return result
 
 
@@ -103,6 +127,54 @@ def finite_difference_check(atoms, force, step, tolerance):
     }
 
 
+def finite_difference_stress_check(atoms, stress, step, tolerance):
+    """Check all six ASE stress components against energy strain derivatives.
+
+    Off-diagonal strains use half the engineering shear in each symmetric
+    matrix entry, so their derivative equals one Voigt stress component.
+    """
+    original_cell = atoms.cell.copy()
+    original_positions = atoms.positions.copy()
+    volume = atoms.get_volume()
+    if not np.isfinite(volume) or volume <= 0:
+        raise ValueError("Stress finite differences require a positive cell volume")
+    numeric = []
+    try:
+        for row, col in ((0, 0), (1, 1), (2, 2), (1, 2), (0, 2), (0, 1)):
+            energies = []
+            for sign in (1, -1):
+                strain = np.eye(3)
+                if row == col:
+                    strain[row, col] += sign * step
+                else:
+                    strain[row, col] += sign * step / 2
+                    strain[col, row] += sign * step / 2
+                # Restore first: each strain must be relative to the same cell.
+                atoms.set_cell(original_cell, scale_atoms=False)
+                atoms.set_positions(original_positions)
+                atoms.set_cell(original_cell @ strain, scale_atoms=True)
+                energies.append(evaluate(atoms)["energy"])
+            numeric.append((energies[0] - energies[1]) / (2 * step * volume))
+    finally:
+        atoms.set_cell(original_cell, scale_atoms=False)
+        atoms.set_positions(original_positions)
+        atoms.calc.reset()
+    numeric = np.asarray(numeric)
+    analytic = np.asarray(stress)
+    if analytic.shape != (6,):
+        raise ValueError("Stress must contain six ASE Voigt components")
+    errors = np.abs(numeric - analytic)
+    return {
+        "passed": bool(np.isfinite(errors).all() and np.max(errors) <= tolerance),
+        "voigt_order": ["xx", "yy", "zz", "yz", "xz", "xy"],
+        "strain_step": step,
+        "analytic_eV_per_A3": analytic.tolist(),
+        "finite_difference_eV_per_A3": numeric.tolist(),
+        "absolute_errors_eV_per_A3": errors.tolist(),
+        "tolerance_eV_per_A3": tolerance,
+    }
+
+
 def synchronized_timings(atoms, device, warmup, repeats, stress=False):
     """
     Time complete ASE energy/force calls including transfers and graph generation.
@@ -127,7 +199,9 @@ def synchronized_timings(atoms, device, warmup, repeats, stress=False):
         "minimum_ms": min(durations),
         "samples_ms": durations,
         "warmup_calls": warmup,
-        "includes": "ASE conversion, graph generation, energy/forces and transfers",
+        "includes": (
+            "ASE conversion, graph generation, energy/forces, transfers and output checks"
+        ),
     }
 
 
@@ -182,12 +256,16 @@ def probe_fp64_reduction(device):
     }
 
 
-def run_case(args, atoms, task, device, merge_mole, stress=False):
+def run_case(args, atoms, task, device, merge_mole, stress=False, progress=None):
     """
     Load a fresh predictor so each timing retains its chosen MoLE configuration.
     """
     from fairchem.core import FAIRChemCalculator, pretrained_mlip
     from fairchem.core.units.mlip_unit.api.inference import InferenceSettings
+
+    def stage(name):
+        if progress is not None:
+            progress.update(device=str(device), merge_mole=merge_mole, stage=name)
 
     settings = InferenceSettings(
         base_precision_dtype=torch.float32,
@@ -199,16 +277,21 @@ def run_case(args, atoms, task, device, merge_mole, stress=False):
         merge_mole=merge_mole,
         compile=args.compile and device.type == "xpu",
     )
+    stage("load_model")
     predictor = pretrained_mlip.get_predict_unit(
         args.model, device=str(device), inference_settings=settings
     )
     structure = atoms.copy()
     structure.calc = FAIRChemCalculator(predictor, task_name=task)
+    stage("first_evaluation")
+    if device.type == "xpu":
+        torch.xpu.synchronize(device)
     start = time.perf_counter()
     values = evaluate(structure, stress)
     if device.type == "xpu":
         torch.xpu.synchronize(device)
     first_evaluation_seconds = time.perf_counter() - start
+    stage("model_tensor_inventory")
     result = {
         "device": str(device),
         "model_tensor_elements": model_tensor_inventory(predictor, device),
@@ -216,19 +299,27 @@ def run_case(args, atoms, task, device, merge_mole, stress=False):
         "first_evaluation_seconds": first_evaluation_seconds,
         "energy_eV": values["energy"],
         "forces_eV_per_A": values["forces"].tolist(),
-        "finite_difference": finite_difference_check(
-            structure, values["forces"], args.fd_step, args.fd_tolerance
-        ),
-        "timing": synchronized_timings(
-            structure, device, args.warmup, args.repeats, stress
-        ),
     }
+    stage("force_finite_difference")
+    result["finite_difference"] = finite_difference_check(
+        structure, values["forces"], args.fd_step, args.fd_tolerance
+    )
     if stress:
         result["stress_eV_per_A3"] = values["stress"].tolist()
+        stage("stress_finite_difference")
+        result["stress_finite_difference"] = finite_difference_stress_check(
+            structure, values["stress"], args.stress_fd_step, args.stress_fd_tolerance
+        )
+    stage("timing")
+    result["timing"] = synchronized_timings(
+        structure, device, args.warmup, args.repeats, stress
+    )
     del structure, predictor
     gc.collect()
     if device.type == "xpu":
-        torch.xpu.empty_cache()
+        with torch.xpu.device(device):
+            torch.xpu.empty_cache()
+    stage("complete")
     return values, result
 
 
@@ -269,6 +360,8 @@ def build_parser():
     parser.add_argument("--energy-tolerance", type=float, default=1e-4)
     parser.add_argument("--force-tolerance", type=float, default=5e-4)
     parser.add_argument("--stress-tolerance", type=float, default=5e-5)
+    parser.add_argument("--stress-fd-step", type=float, default=0.001)
+    parser.add_argument("--stress-fd-tolerance", type=float, default=5e-4)
     return parser
 
 
@@ -287,6 +380,7 @@ def main(argv=None):
         "platform": platform.platform(),
         "python": platform.python_version(),
         "cases": {},
+        "options": vars(args),
         "note": "Small-system smoke checks; no claim about all operators or workloads.",
     }
     try:
@@ -300,6 +394,8 @@ def main(argv=None):
                 args.energy_tolerance,
                 args.force_tolerance,
                 args.stress_tolerance,
+                args.stress_fd_step,
+                args.stress_fd_tolerance,
             )
         ):
             raise ValueError("Finite-difference step and tolerances must be positive")
@@ -309,11 +405,17 @@ def main(argv=None):
         if not torch.xpu.is_available():
             raise RuntimeError("No XPU available; CPU fallback is not permitted")
         device = torch.device("xpu", device.index if device.index is not None else 0)
+        if device.index >= torch.xpu.device_count():
+            raise ValueError(f"Requested {device}, but it is not an available XPU")
         report["device_name"] = torch.xpu.get_device_name(device)
         properties = torch.xpu.get_device_properties(device)
         report["device_properties"] = str(properties)
         report["has_fp64"] = getattr(properties, "has_fp64", "not exposed")
         report["torch_xpu_build"] = getattr(torch.version, "xpu", None)
+        report["active_check"] = {
+            "device": str(device),
+            "stage": "fp64_reduction_probe",
+        }
         report["fp64_reduction_probe"] = probe_fp64_reduction(device)
         tolerances = {
             "energy_eV_per_atom": args.energy_tolerance,
@@ -335,13 +437,16 @@ def main(argv=None):
                 continue
             case = {"natoms": len(atoms), "task": task}
             report["cases"][name] = case
+            progress = {"case": name}
+            report["active_check"] = progress
             stress = args.stress and name == "periodic"
             reference, case["cpu"] = run_case(
-                args, atoms, task, torch.device("cpu"), False, stress
+                args, atoms, task, torch.device("cpu"), False, stress, progress
             )
             candidate, case["xpu_unmerged"] = run_case(
-                args, atoms, task, device, False, stress
+                args, atoms, task, device, False, stress, progress
             )
+            progress["stage"] = "cpu_vs_xpu_comparison"
             case["cpu_vs_xpu"] = compare_predictions(
                 reference, candidate, len(atoms), tolerances
             )
@@ -352,10 +457,16 @@ def main(argv=None):
                     case["xpu_unmerged"]["finite_difference"]["passed"],
                 )
             )
+            if stress:
+                case["passed"] &= (
+                    case["cpu"]["stress_finite_difference"]["passed"]
+                    and case["xpu_unmerged"]["stress_finite_difference"]["passed"]
+                )
             if args.compare_merged:
                 merged, case["xpu_merged"] = run_case(
-                    args, atoms, task, device, True, stress
+                    args, atoms, task, device, True, stress, progress
                 )
+                progress["stage"] = "unmerged_vs_merged_comparison"
                 case["unmerged_vs_merged"] = compare_predictions(
                     candidate, merged, len(atoms), tolerances
                 )
@@ -363,7 +474,12 @@ def main(argv=None):
                     case["unmerged_vs_merged"]["passed"]
                     and case["xpu_merged"]["finite_difference"]["passed"]
                 )
+                if stress:
+                    case["passed"] &= case["xpu_merged"]["stress_finite_difference"][
+                        "passed"
+                    ]
             passed &= case["passed"]
+        report.pop("active_check", None)
         report["passed"] = passed
     except Exception as exc:
         report["error"] = {"type": type(exc).__name__, "message": str(exc)}

@@ -71,12 +71,25 @@ are outside this implementation. Unsupported XPU settings raise an error.
 If XPU is unavailable, an explicit XPU request raises an error instead of
 silently running on the CPU. On a mixed NVIDIA/Intel host, explicitly select
 `xpu:0`: automatic device selection retains CUDA preference.
+Explicit XPU availability, ordinal and parallel-worker checks run before the
+public pretrained loader downloads a checkpoint.
+
+Do not wrap conservative UMA calculations in `torch.inference_mode()`: forces,
+stress and Hessians require autograd. The predictor rejects that context before
+preparing the model. An outer `torch.no_grad()` context is supported because the
+conservative prediction section explicitly enables gradients and then restores
+the caller's state.
 
 FP32 here describes the network's base precision. UMA intentionally accumulates
 system energies and virial terms in FP64. This branch preserves those sums
 and their gradients rather than silently reducing their precision. The
 validation script probes FP64 `index_add` and its backward operation as well
 as reporting the device's `has_fp64` property when available.
+
+This is not an end-to-end FP64 network implementation. In particular, existing
+MoLE merge constructors create new layers at the default dtype; selecting an
+FP64 base dtype does not establish full FP64 fidelity during merging. The
+FP32 network path and its intentional FP64 accumulations are the target here.
 
 ## Hardware acceptance test
 
@@ -93,8 +106,16 @@ It checks tensor placement, finite outputs, energy/force agreement, optional
 periodic stress, a force component against a central energy difference, and
 optional merged/unmerged agreement. Timings synchronize XPU and force fresh
 ASE calculations so that the calculator cache is not mistaken for GPU speed.
+Every warmup and timed evaluation checks output shapes and finite values; these
+checks are included in the reported timings. With `--stress`, all six Voigt
+components are also checked independently against energy strain derivatives on
+CPU and each requested XPU mode. `--stress-fd-step` defaults to `0.001` and
+`--stress-fd-tolerance` to `5e-4` eV/Å³. These new finite-difference criteria do
+not change the stricter CPU/XPU stress comparison tolerance.
 Warmup and repeated timings are separate. Tolerances are numerical acceptance
 criteria for these small tests, not the model's error relative to DFT.
+The JSON records command options and, on an exception, `active_check` identifies
+the structure, device, merge setting and failing stage.
 
 The default cases are a molecule and a small distorted periodic crystal.
 They do not establish production suitability for large slabs, long molecular
@@ -107,6 +128,61 @@ PyTorch supports XPU compilation, but UMA's graph construction, dynamic shapes
 and derivative paths still require real-device validation. Keep eager mode
 as the initial correctness reference. This branch does not claim that XPU
 matches NVIDIA Nitro throughput.
+
+## Other interfaces and optional backends
+
+The TorchSim wrapper preserves an explicit `xpu:<index>` and keeps the concrete
+ordinal resolved by its predictor. Its automatic selection prefers CUDA, then
+XPU, then CPU. The wrapper uses the unmerged `batch` settings for heterogeneous
+systems. Dispatch tests do not establish that all TorchSim integrators or
+optional kernels work on Intel GPUs.
+
+Ray Serve, `InferenceBatcher`, multiplexed `ModelSpec` serving, and automatic
+batch-size probing do not implement XPU resource allocation in this branch.
+Explicit XPU requests are rejected rather than scheduled as CPU jobs or given
+unmeasured CPU timing defaults. Local independent single-device predictors
+remain available.
+
+The nvalchemiops/Warp D3 implementation supports CPU and CUDA, not XPU. To add
+D3 to an XPU UMA calculator, select `device="cpu"` on `DFTD3Calculator`; this
+does not change the UMA calculator's device. Selecting XPU for D3 raises an
+error before optional-backend import or parameter download.
+
+Portable UMA model registration no longer imports Nitro/Triton implementation
+packages. The NVIDIA neighbor-list module and `fairchem_cpp` are loaded only
+when their respective paths are used. This avoids otherwise unrelated CUDA
+binary failures blocking ordinary UMA imports. The CUDA dependencies declared
+by the upstream package remain installed; they have not been removed from
+features that use them.
+
+## Source-level regression coverage
+
+Additional CPU/simulated-device tests cover:
+
+- Public loader rejection before checkpoint download and XPU ordinal retention
+  through TorchSim.
+- Importing public UMA APIs and registering models when optional CUDA extensions
+  raise a shared-library error; retrying model registration after a failure.
+- Explicit periodic-boundary overrides, mixed-periodicity batches and
+  `always_use_pbc` batch shapes. Neighbor lists are compared with known cells
+  and the existing independent ASE references.
+- Device-derived autocast protection in normalization layers and CPU Dynamo
+  full-graph tracing of those layers with gradient comparison.
+- Nested override precedence without mutating the caller, CPU preparation of
+  FP32 MoLE from double-precision inputs, and protection against ambient CPU
+  autocast rounding merged weights.
+- Conservative prediction under `no_grad`, clear rejection of `inference_mode`,
+  and no CUDA TF32 state mutation during XPU inference.
+- Forces-only Hessians in evaluation mode, checked against a quadratic energy
+  with an exact Hessian for both loop and vectorized differentiation.
+- Validation-tool shape checks, nonfinite outputs during timing, six-component
+  stress finite differences, and restoration after failed evaluations.
+
+These tests use synthetic weights and CPU kernels where numerical values are
+required. FakeTensor checks test device/shape/dtype propagation, not Intel
+kernel execution. Real-XPU tests are skipped on CPU-only hosts.
+The [source-audit validation record](intel_xpu_validation.md) lists the exact
+test selections, results and remaining coverage gaps.
 
 ## Upstream scope
 
