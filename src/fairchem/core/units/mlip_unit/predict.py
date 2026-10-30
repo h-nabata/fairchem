@@ -219,6 +219,10 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
     ):
         super().__init__()
         os.environ[CURRENT_DEVICE_TYPE_STR] = device
+        # Fail before loading a potentially large checkpoint if the requested
+        # accelerator is unavailable; never silently substitute CPU inference.
+        self._setup_device(device)
+        os.environ[CURRENT_DEVICE_TYPE_STR] = self.device
 
         self.set_seed(seed)
         self._setup_refs(atom_refs, form_elem_refs)
@@ -233,6 +237,8 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         self._inference_model_path = inference_model_path
         self._overrides = copy.deepcopy(overrides)
         self._requested_device = device
+        if torch.device(device).type == "xpu":
+            self._validate_xpu_settings()
         self._setup_threads(self.inference_settings)
 
         if self.inference_settings.wigner_cuda:
@@ -241,7 +247,6 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
             )
 
         self._load_model()
-        self._setup_device(device)
         # After _load_model, so a request UMA Nitro could not serve is judged by
         # the mode that actually runs.
         if _uses_reduced_precision(self.inference_settings, device):
@@ -363,8 +368,11 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         self.lazy_model_intialized = False
         del self.model
         gc.collect()
-        if torch.device(self._requested_device).type == "cuda":
+        device_type = torch.device(self._requested_device).type
+        if device_type == "cuda":
             torch.cuda.empty_cache()
+        elif device_type == "xpu":
+            torch.xpu.empty_cache()
         self._load_model()
         self._log_settings_change(before)
 
@@ -455,8 +463,8 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         self._seed = seed
         random.seed(seed)
         np.random.seed(seed)
+        # torch.manual_seed seeds all available device backends, including XPU.
         torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
 
     def _setup_refs(self, atom_refs: dict | None, form_elem_refs: dict | None) -> None:
         """
@@ -481,8 +489,50 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         """
         Setup inference device.
         """
-        assert device in ["cpu", "cuda"], "device must be either 'cpu' or 'cuda'"
-        self.device = get_device_for_local_rank() if device == "cuda" else "cpu"
+        if device in ("cpu", "cuda"):
+            self.device = get_device_for_local_rank() if device == "cuda" else "cpu"
+            return
+        requested = torch.device(device)
+        if requested.type != "xpu":
+            raise ValueError("device must be 'cpu', 'cuda', 'xpu', or 'xpu:<index>'")
+        if not hasattr(torch, "xpu") or not torch.xpu.is_available():
+            raise RuntimeError(
+                "XPU was requested but torch.xpu.is_available() is False. "
+                "Install an XPU-enabled PyTorch build and a compatible Intel GPU driver."
+            )
+        index = (
+            torch.xpu.current_device() if requested.index is None else requested.index
+        )
+        if index >= torch.xpu.device_count():
+            raise ValueError(
+                f"Requested xpu:{index}, but only {torch.xpu.device_count()} "
+                "XPU device(s) are available."
+            )
+        self.device = f"xpu:{index}"
+
+    def _validate_xpu_settings(self) -> None:
+        """
+        Reject CUDA-only paths instead of reaching unsupported kernels on XPU.
+        """
+        settings = self.inference_settings
+        if settings.nitro or settings.execution_mode == ExecutionMode.UMAS_FAST_GPU:
+            raise ValueError(
+                "UMA Nitro and umas_fast_gpu require CUDA. Use inference_settings='xpu' "
+                "or execution_mode='general' for Intel GPUs."
+            )
+        if settings.internal_graph_gen_version not in (1, 2):
+            raise ValueError(
+                "XPU requires internal_graph_gen_version=1 or 2; "
+                "version 3 uses NVIDIA-specific neighbor-list kernels."
+            )
+        if settings.tf32:
+            raise ValueError("XPU inference requires tf32=False.")
+        if settings.base_precision_dtype != torch.float32:
+            raise ValueError(
+                "XPU inference currently supports base_precision_dtype=float32."
+            )
+        if settings.execution_mode is None:
+            settings.execution_mode = ExecutionMode.GENERAL
 
     def _build_overrides_from_settings(
         self,
@@ -504,6 +554,17 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         # User overrides take precedence
         if user is not None and "backbone" in user:
             overrides["backbone"].update(user["backbone"])
+
+        # User overrides take precedence, so validate the effective settings as
+        # well; otherwise an override can re-enable a CUDA-only implementation.
+        if torch.device(self._requested_device).type == "xpu":
+            backbone = overrides["backbone"]
+            if backbone.get("execution_mode") == ExecutionMode.UMAS_FAST_GPU:
+                raise ValueError("The umas_fast_gpu backbone override requires CUDA.")
+            if backbone.get("radius_pbc_version", 2) not in (1, 2):
+                raise ValueError(
+                    "XPU backbone overrides require radius_pbc_version=1 or 2."
+                )
 
         return overrides
 
@@ -762,7 +823,18 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
             if self.model.module.backbone.regress_config.direct_forces
             else nullcontext()
         )
-        with inference_context, tf32_context_manager(self.inference_settings.tf32):
+        # FP32 is the supported XPU contract even inside a caller's autocast
+        # context. Preserve that contract for every backbone operation.
+        autocast_context = (
+            torch.autocast("xpu", enabled=False)
+            if torch.device(getattr(self, "device", "cpu")).type == "xpu"
+            else nullcontext()
+        )
+        with (
+            inference_context,
+            tf32_context_manager(self.inference_settings.tf32),
+            autocast_context,
+        ):
             output = self.model(data)
             predictions = self._process_outputs(data, output, undo_refs)
 
@@ -921,6 +993,9 @@ class ParallelMLIPPredictUnit(MLIPPredictUnitProtocol):
         gp_config: GraphParallelConfig | None = None,
     ):
         super().__init__()
+
+        if torch.device(device).type == "xpu":
+            raise ValueError("ParallelMLIPPredictUnit does not support XPU devices.")
 
         gp_config = gp_utils.resolve_gp_config_for_workers(gp_config, num_workers)
 

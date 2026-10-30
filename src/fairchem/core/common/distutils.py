@@ -300,6 +300,16 @@ def get_device_for_local_rank() -> str:
     if "cuda" in os.environ[CURRENT_DEVICE_TYPE_STR]:
         assert torch.cuda.is_available(), "cannot set cpu=false and no cuda available!"
         return f"cuda:{torch.cuda.current_device()}"
+    elif os.environ[CURRENT_DEVICE_TYPE_STR].split(":", 1)[0] == "xpu":
+        if not torch.xpu.is_available():
+            raise RuntimeError(
+                "XPU was selected, but torch.xpu.is_available() is False"
+            )
+        device = torch.device(os.environ[CURRENT_DEVICE_TYPE_STR])
+        index = device.index if device.index is not None else torch.xpu.current_device()
+        if index >= torch.xpu.device_count():
+            raise ValueError(f"XPU device index {index} is not available")
+        return f"xpu:{index}"
     elif os.environ[CURRENT_DEVICE_TYPE_STR] == "cpu":
         return "cpu"
     else:

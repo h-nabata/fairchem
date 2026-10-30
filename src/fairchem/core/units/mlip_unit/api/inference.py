@@ -282,6 +282,24 @@ def inference_settings_batch():
     )
 
 
+def inference_settings_xpu():
+    """
+    FP32 eager inference on a single Intel GPU using portable PyTorch operations.
+
+    MOLE merging reduces repeated work for fixed-composition simulations. XPU
+    compilation is opt-in until numerical and performance checks pass on the
+    target GPU; CUDA-specific Nitro and Triton kernels are not used.
+    """
+    return InferenceSettings(
+        tf32=False,
+        activation_checkpointing=False,
+        merge_mole=True,
+        compile=False,
+        internal_graph_gen_version=2,
+        execution_mode="general",
+    )
+
+
 # The multigpu preset is a reduced-precision fast path: merged MOLE and
 # torch.compile with TF32 matrix multiplies on CUDA (tensors stay FP32), trading
 # precision for speed. Multi-worker inference runs it, since Nitro is single-GPU.
@@ -330,6 +348,7 @@ NAME_TO_INFERENCE_SETTING = {
     "multigpu": inference_settings_multigpu(),
     "traineval": inference_settings_traineval(),
     "nitro": inference_settings_nitro(),
+    "xpu": inference_settings_xpu(),
 }
 
 
@@ -343,7 +362,7 @@ def describe_inference_settings(settings: InferenceSettings) -> str:
     """
     auto_backend = replace(settings, execution_mode=None)
     for name, preset in NAME_TO_INFERENCE_SETTING.items():
-        if name != "default" and auto_backend == preset:
+        if name != "default" and auto_backend == replace(preset, execution_mode=None):
             return name
     return repr(settings)
 

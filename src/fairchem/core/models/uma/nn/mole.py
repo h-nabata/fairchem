@@ -103,6 +103,11 @@ class MOLEDGL(torch.nn.Module):
         self.global_mole_tensors = global_mole_tensors
 
     def forward(self, x):
+        if x.device.type == "xpu":
+            raise NotImplementedError(
+                "The fairchem_cpp DGL MoLE kernels do not support XPU. "
+                "Use moe_layer_type='pytorch' for Intel GPU inference."
+            )
         with torch.autocast(device_type=self.weights.device.type, enabled=False):
             weights = torch.einsum(
                 "eoi, be->bio",

@@ -135,7 +135,7 @@ def get_predict_unit(
     model_name: str,
     inference_settings: InferenceSettings | str = "default",
     overrides: dict | None = None,
-    device: Literal["cuda", "cpu"] | None = None,
+    device: str | None = None,
     cache_dir: str = CACHE_DIR,
     workers: int = 1,
     seed: int = 41,
@@ -157,7 +157,9 @@ def get_predict_unit(
             MOLE unmerged for heterogeneous inputs. More advanced use cases can use a
             custom InferenceSettings object.
         overrides: Optional dictionary of settings to override default inference settings.
-        device: Optional torch device to load the model onto. If None, uses the default device.
+        device: Optional device ("cpu", "cuda", "xpu", or "xpu:<index>").
+            If None, prefers CUDA, then XPU, then CPU. On XPU, "default" selects
+            FP32 eager inference with portable PyTorch operations and MOLE merging.
         cache_dir: Path to folder where model files will be stored. Default is "~/.cache/fairchem"
         workers: Number of parallel workers for prediction unit. Default is 1. If greater than 1,
             we will instantiate a ParallelMLIPPredictUnit instead of the normal predict unit.

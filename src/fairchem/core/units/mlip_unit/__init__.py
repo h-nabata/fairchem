@@ -8,7 +8,7 @@ file in the root directory of this source tree.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -26,7 +26,7 @@ def load_predict_unit(
     path: str | Path,
     inference_settings: InferenceSettings | str = "default",
     overrides: dict | None = None,
-    device: Literal["cuda", "cpu"] | None = None,
+    device: str | None = None,
     atom_refs: dict | None = None,
     form_elem_refs: dict | None = None,
     workers: int = 1,
@@ -45,7 +45,9 @@ def load_predict_unit(
             broken. "batch" keeps MOLE unmerged for heterogeneous inputs. More advanced
             use cases can use a custom InferenceSettings object.
         overrides: Optional dictionary of settings to override default inference settings.
-        device: Optional torch device to load the model onto.
+        device: Optional device ("cpu", "cuda", "xpu", or "xpu:<index>").
+            An omitted device prefers CUDA, then XPU, then CPU. XPU is supported
+            for a single worker; its default settings use FP32 eager inference.
         atom_refs: Optional dictionary of isolated atom reference energies.
         form_elem_refs: Optional dictionary of element reference energies for formation energy calculations.
         workers: Number of parallel workers for prediction unit. Default is 1. If greater than 1,
@@ -58,8 +60,22 @@ def load_predict_unit(
     """
 
     if device is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch, "xpu") and torch.xpu.is_available():
+            device = "xpu"
+        else:
+            device = "cpu"
         logging.warning(f"device was not explicitly set, using {device=}.")
+
+    if torch.device(device).type == "xpu":
+        if workers != 1 or gp_config is not None:
+            raise ValueError(
+                "XPU inference supports workers=1 without graph parallelism. "
+                "Run independent predictors on xpu:0 and xpu:1 for separate jobs."
+            )
+        if inference_settings == "default":
+            inference_settings = "xpu"
 
     inference_settings = guess_inference_settings(inference_settings)
     if workers > 1:

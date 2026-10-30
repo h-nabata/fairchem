@@ -122,7 +122,7 @@ class FAIRChemCalculator(Calculator):
         task_name: UMATask | None = None,
         inference_settings: InferenceSettings | str = "default",
         overrides: dict | None = None,
-        device: Literal["cuda", "cpu"] | None = None,
+        device: str | None = None,
         seed: int = 41,
         workers: int = 1,
     ) -> FAIRChemCalculator:
@@ -144,7 +144,7 @@ class FAIRChemCalculator(Calculator):
                 heterogeneous inputs. More advanced use cases can use a custom
                 InferenceSettings object.
             overrides: Optional dictionary of settings to override default inference settings.
-            device: Optional torch device to load the model onto.
+            device: Optional device ("cpu", "cuda", "xpu", or "xpu:<index>").
             seed: Random seed for reproducibility.
             workers: Number of parallel workers for prediction unit. Default is 1.
         """
