@@ -88,24 +88,70 @@ def collate_predictions(predict_fn):
         # Get the full prediction dictionary from the original predict method
         preds = predict_fn(predict_unit, data, undo_element_references)
         collated_preds = defaultdict(list)
+        batch_by_device = {}
         for i, dataset in enumerate(data.dataset):
             for task in predict_unit.dataset_to_tasks[dataset]:
+                prediction = preds[task.name]
                 if task.level == "system":
-                    collated_preds[task.property].append(
-                        preds[task.name][i].unsqueeze(0)
-                    )
+                    collated_preds[task.property].append(prediction[i].unsqueeze(0))
                 elif task.level == "atom":
-                    collated_preds[task.property].append(
-                        preds[task.name][data.batch == i]
-                    )
+                    if len(data.dataset) == 1:
+                        # A valid single-system batch already has the required
+                        # atom order. Boolean indexing would copy it and can
+                        # require a device synchronization for the output size.
+                        collated_preds[task.property].append(prediction)
+                    else:
+                        # Prediction no longer moves the caller's batch in place.
+                        # Share one index transfer across properties on a device.
+                        if prediction.device not in batch_by_device:
+                            batch_by_device[prediction.device] = data.batch.to(
+                                prediction.device
+                            )
+                        batch = batch_by_device[prediction.device]
+                        collated_preds[task.property].append(prediction[batch == i])
                 else:
                     raise RuntimeError(
                         f"Unrecognized task level={task.level} found in data batch at position {i}"
                     )
 
-        return {prop: torch.cat(val) for prop, val in collated_preds.items()}
+        return {
+            prop: values[0]
+            if len(data.dataset) == 1 and len(values) == 1
+            else torch.cat(values)
+            for prop, values in collated_preds.items()
+        }
 
     return collated_predict
+
+
+def _copy_data_to_device(
+    data: AtomicData, device: str | torch.device, dtype: torch.dtype
+) -> AtomicData:
+    """Copy a batch once per tensor, combining device and dtype conversion.
+
+    Deep-copying with a tensor memo preserves metadata and non-leaf autograd
+    inputs without re-running AtomicData's scalar validation on an accelerator.
+    """
+    memo = {}
+
+    def copy_tensors(value):
+        if torch.is_tensor(value):
+            if id(value) not in memo:
+                memo[id(value)] = value.to(
+                    device=device,
+                    dtype=dtype if value.is_floating_point() else value.dtype,
+                    copy=True,
+                )
+        elif isinstance(value, (tuple, list)):
+            for item in value:
+                copy_tensors(item)
+        elif isinstance(value, dict):
+            for item in value.values():
+                copy_tensors(item)
+
+    for _, value in data:
+        copy_tensors(value)
+    return copy.deepcopy(data, memo)
 
 
 def _prepare_inference_gradients(backbone, data: AtomicData) -> None:
@@ -116,6 +162,23 @@ def _prepare_inference_gradients(backbone, data: AtomicData) -> None:
         data["pos"].requires_grad_(True)
     if regress_config.stress:
         data["cell"].requires_grad_(True)
+
+
+def _clear_exception_tracebacks(error: Exception) -> None:
+    """Release failed-model frames before allocating a fallback model."""
+    pending = [error]
+    seen = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        current.__traceback__ = None
+        pending.extend(
+            cause
+            for cause in (current.__cause__, current.__context__)
+            if cause is not None
+        )
 
 
 _REDUCED_PRECISION_WARNING = (
@@ -279,6 +342,9 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
                 self._load_nitro_model(checkpoint)
             except UMANitroNotSupportedError as error:
                 logging.warning(f"UMA Nitro cannot serve this request: {error}.")
+                # Nitro can reject checkpoint tensors after constructing its
+                # backbone. Release that partial model before building Hydra.
+                _clear_exception_tracebacks(error)
                 self.inference_settings.nitro = False
                 self._load_hydra_model(checkpoint)
                 self._log_settings_change(before)
@@ -366,6 +432,9 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         release = getattr(self.model.module, "release_inference_resources", None)
         if release is not None:
             release()
+        # A bound callback keeps its module alive even after deleting self.model.
+        # Release that reference before collecting and loading the replacement.
+        del release
         self.lazy_model_intialized = False
         del self.model
         gc.collect()
@@ -391,6 +460,21 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         """
         Take the next step down: nitro to multigpu, or multigpu to the general model.
         """
+        settings = self.inference_settings
+        if not (
+            settings.nitro
+            or settings.merge_mole
+            or settings.compile
+            or settings.execution_mode == ExecutionMode.UMAS_FAST_GPU
+        ):
+            # Reloading the same general model cannot resolve the failure.
+            # Retain the original traceback for errors that must propagate.
+            raise error
+        # Recoverable exceptions may retain the failed model and its large
+        # intermediates through forward/prepare traceback frames. They must be
+        # dropped before the replacement model is allocated, including chained
+        # kernel errors. The error messages remain available for the warning.
+        _clear_exception_tracebacks(error)
         if self.inference_settings.nitro:
             # The same settings without nitro: multigpu, for the default preset.
             self._fall_back_with(
@@ -760,19 +844,14 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
             if single_atom_result is not None:
                 return single_atom_result
 
-        # Regular model prediction path
-        # this needs to be .clone() to avoid issues with graph parallel modifying this data with MOLE
-        data_device = data.to(self.device).clone()
-
         dtype = self.inference_settings.base_precision_dtype
         if not self._warned_upcast:
-            self._warned_upcast = warn_if_upcasting(data_device.pos.dtype, dtype)
-        for key, val in data_device:
-            if torch.is_tensor(val) and val.is_floating_point():
-                data_device[key] = val.to(dtype)
+            self._warned_upcast = warn_if_upcasting(data.pos.dtype, dtype)
+        # Keep the caller isolated from graph-parallel/MOLE mutations without
+        # first retaining another full copy on the accelerator.
+        data_device = _copy_data_to_device(data, self.device, dtype)
 
-        backbone = self.model.module.backbone
-        _prepare_inference_gradients(backbone, data_device)
+        _prepare_inference_gradients(self.model.module.backbone, data_device)
 
         # Model handles any per-prediction checks (e.g., MOLE consistency)
         try:
@@ -810,10 +889,7 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
             ),
             self.inference_settings.base_precision_dtype,
         )
-        preparation_data = data.clone().cpu()
-        for key, value in preparation_data:
-            if torch.is_tensor(value) and value.is_floating_point():
-                preparation_data[key] = value.to(dtype)
+        preparation_data = _copy_data_to_device(data, "cpu", dtype)
         # Model handles its own preparation (MOLE merge, eval mode, etc.).
         # CPU autocast must not permanently round the merged FP32 parameters.
         with torch.autocast("cpu", enabled=False):
