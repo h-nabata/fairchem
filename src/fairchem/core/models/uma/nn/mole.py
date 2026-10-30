@@ -163,41 +163,39 @@ class MOLE(torch.nn.Module):
         self.global_mole_tensors = global_mole_tensors
 
     def merged_linear_layer(self):
+        # The merged layer uses the first system's coefficients. Avoid mixing
+        # every system and allocating/randomizing a second real weight matrix
+        # merely to overwrite it. Explicit dtype also preserves FP64 sources.
         linear = torch.nn.Linear(
             in_features=self.in_features,
             out_features=self.out_features,
             bias=self.bias is not None,
-        ).to(self.weights.device)
+            device="meta",
+            dtype=self.weights.dtype,
+        )
 
-        with torch.autocast(device_type=self.weights.device.type, enabled=False):
+        with (
+            torch.no_grad(),
+            torch.autocast(device_type=self.weights.device.type, enabled=False),
+        ):
             weights = torch.einsum(
                 "eoi, be->boi",
                 self.weights,
-                self.global_mole_tensors.expert_mixing_coefficients,
+                self.global_mole_tensors.expert_mixing_coefficients[:1],
             )
-
-        with torch.no_grad():
-            linear.weight.copy_(weights[0])
+            linear.weight = torch.nn.Parameter(weights[0])
             if self.bias is not None:
-                linear.bias.copy_(self.bias)
+                linear.bias = torch.nn.Parameter(self.bias.clone())
         return linear
 
     def forward(self, x):
-        with torch.autocast(device_type=self.weights.device.type, enabled=False):
-            weights = torch.einsum(
-                "eoi, be->boi",
-                self.weights,
-                self.global_mole_tensors.expert_mixing_coefficients,
-            )
-
-        out = []
         ac_start_idx = self.global_mole_tensors.ac_start_idx
         assert len(self.global_mole_tensors.mole_sizes) > 0
         # TODO: precompute these if needed but they should be small and on cpu
         start_idxs = [0] + torch.cumsum(
             self.global_mole_tensors.mole_sizes, dim=0
         ).tolist()
-        mole_intervals = list(zip(start_idxs, start_idxs[1:]))
+        mole_intervals = zip(start_idxs, start_idxs[1:])
 
         # Because activation checkpointing can chunk the inputs, we need to only compute
         # the mole_size intervals that overlap with the current chunks
@@ -207,17 +205,51 @@ class MOLE(torch.nn.Module):
         # if the input segment is (5,15) then we compute the following 2 segments
         # (5,10),(10,15)
         input_segment = (ac_start_idx, ac_start_idx + x.shape[0])
+        assert (
+            0 <= input_segment[0] <= input_segment[1] <= start_idxs[-1]
+        ), f"Input segment {input_segment} is outside MoLE sizes {start_idxs[-1]}"
 
+        segments = []
         for n, mole_segment in enumerate(mole_intervals):
             interval_overlap = interval_intersection(input_segment, mole_segment)
-            if interval_overlap is not None:
+            # Intervals are half-open for tensor slicing. A touching boundary
+            # or a system with zero edges must not launch an empty GEMM.
+            if (
+                interval_overlap is not None
+                and interval_overlap[0] < interval_overlap[1]
+            ):
                 start = interval_overlap[0] - ac_start_idx
                 end = interval_overlap[1] - ac_start_idx
-                out.append(
-                    linear_with_folded_batch(x[start:end], weights[n], bias=self.bias)
-                )
+                segments.append((n, start, end))
 
-        result = torch.concatenate(out, dim=0)
+        first_system = segments[0][0] if segments else 0
+        last_system = segments[-1][0] + 1 if segments else 1
+        # Checkpoint chunks often touch only one or two systems. Mixing all
+        # systems would retain an unnecessary [batch, out, in] allocation in
+        # every layer/chunk. A slice also preserves gradients to the routing
+        # coefficients without constructing a device-side index tensor.
+        with torch.autocast(device_type=self.weights.device.type, enabled=False):
+            weights = torch.einsum(
+                "eoi, be->boi",
+                self.weights,
+                self.global_mole_tensors.expert_mixing_coefficients[
+                    first_system:last_system
+                ],
+            )
+
+        if not segments:
+            # Preserve an empty input's shape and autograd connections to the
+            # parameters/routing coefficients, including all-zero edge batches.
+            return linear_with_folded_batch(x, weights[0], bias=self.bias)
+
+        out = [
+            linear_with_folded_batch(
+                x[start:end], weights[n - first_system], bias=self.bias
+            )
+            for n, start, end in segments
+        ]
+
+        result = out[0] if len(out) == 1 else torch.concatenate(out, dim=0)
         assert (
             result.shape[0] == x.shape[0]
         ), f"result shape {result.shape}, does not match input shape {x.shape} at dim 0"

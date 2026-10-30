@@ -71,6 +71,10 @@ class CoefficientMapping(torch.nn.Module):
         self.register_buffer("m_harmonic", m_harmonic, persistent=False)
         self.register_buffer("m_complex", m_complex, persistent=False)
         self.register_buffer("to_m", to_m, persistent=False)
+        # ``to_m`` is a permutation matrix. Cache its integer gather indices
+        # so inference need not perform dense matrix products just to reorder
+        # Wigner rows/columns. Keep the matrix for existing callers.
+        self.register_buffer("to_m_index", to_m.argmax(dim=1), persistent=False)
 
         self.pre_compute_coefficient_idx()
 

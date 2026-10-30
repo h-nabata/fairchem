@@ -64,14 +64,10 @@ def reduce_node_to_system(
         dtype=torch.float64,
     )
 
-    if node_values.dim() == 1:
-        system_values.index_add_(0, batch, node_values.to(system_values.dtype))
-    else:
-        # For multi-dimensional tensors, we need to handle each trailing dimension
-        flat_node = node_values.view(node_values.shape[0], -1)
-        flat_system = system_values.view(num_systems, -1)
-        flat_system.index_add_(0, batch, flat_node.to(flat_system.dtype))
-        system_values = flat_system.view(output_shape)
+    # index_add_ supports arbitrary trailing dimensions directly, including
+    # strided and empty inputs. Flattening with view() rejects both cases and
+    # using reshape() instead would introduce an unnecessary contiguous copy.
+    system_values.index_add_(0, batch, node_values.to(system_values.dtype))
 
     if gp_utils.initialized():
         reduced = gp_utils.reduce_from_model_parallel_region(system_values)
@@ -251,7 +247,7 @@ def compute_hessian_vmap(
             -1 * forces_flat,
             pos,
             grad_outputs=vec,
-            retain_graph=True,
+            retain_graph=create_graph,
             create_graph=create_graph,
         )[0]
 
@@ -295,7 +291,7 @@ def compute_hessian_loop(
         hessian[:, i] = torch.autograd.grad(
             -forces_flat[i],
             pos,
-            retain_graph=i < n_forces - 1,
+            retain_graph=create_graph or i < n_forces - 1,
             create_graph=create_graph,
         )[0].flatten()
 

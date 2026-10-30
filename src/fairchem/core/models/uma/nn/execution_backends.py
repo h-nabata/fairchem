@@ -145,7 +145,7 @@ class ExecutionBackend:
         Transform raw Wigner matrices for this backend.
 
         Default: Apply coefficient selection (if mmax != lmax) and
-        pre-compose with M-mapping via einsum.
+        reorder into M-major layout with cached permutation indices.
 
         Args:
             wigner: Raw Wigner matrices [E, L, L]
@@ -157,21 +157,13 @@ class ExecutionBackend:
         Returns:
             Transformed (wigner, wigner_inv) ready for this backend.
         """
+        # M-mapping is a pure permutation, not a learned linear transform.
+        # Compose the optional coefficient selection before gathering, avoiding
+        # two dense products and the full per-edge selection intermediates.
+        index = mappingReduced.to_m_index
         if coefficient_index is not None:
-            wigner = wigner.index_select(1, coefficient_index)
-            wigner_inv = wigner_inv.index_select(2, coefficient_index)
-
-        wigner = torch.einsum(
-            "mk,nkj->nmj",
-            mappingReduced.to_m.to(wigner.dtype),
-            wigner,
-        )
-        wigner_inv = torch.einsum(
-            "njk,mk->njm",
-            wigner_inv,
-            mappingReduced.to_m.to(wigner_inv.dtype),
-        )
-        return wigner, wigner_inv
+            index = coefficient_index.index_select(0, index)
+        return wigner.index_select(1, index), wigner_inv.index_select(2, index)
 
     @staticmethod
     def node_to_edge_wigner_permute(

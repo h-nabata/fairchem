@@ -13,7 +13,6 @@ import types
 import warnings
 from typing import TYPE_CHECKING
 
-import numpy as np
 import torch
 import torch.nn as nn
 from matplotlib import pyplot as plt
@@ -48,6 +47,48 @@ warnings.filterwarnings(
     message="index_reduce\\(\\) is in beta",
     category=UserWarning,
 )
+
+
+def _route_head_outputs(head_output, data, dataset_names, wrap_property):
+    """Split outputs on their device without gathering property values.
+
+    Each atom mask is a lookup in the system mask, reused for all properties
+    on that device. ``where`` preserves zeros outside the selected dataset,
+    even if an unselected prediction is NaN/Inf, and allocates independent
+    output storage just like the previous masked assignment implementation.
+    """
+    nsystems = len(data.dataset)
+    full_output = {}
+    atom_system_ids = {}
+    for dataset_name in dataset_names:
+        selected_systems = [name == dataset_name for name in data.dataset]
+        has_systems = any(selected_systems)
+        system_masks = {}
+        atom_masks = {}
+        for key, value in head_output.items():
+            if not has_systems:
+                output = value.new_zeros(value.shape)
+            else:
+                device = value.device
+                if device not in system_masks:
+                    system_masks[device] = torch.tensor(
+                        selected_systems, dtype=torch.bool, device=device
+                    )
+                mask = system_masks[device]
+                if value.shape[0] != nsystems:
+                    if device not in atom_masks:
+                        if device not in atom_system_ids:
+                            atom_system_ids[device] = data.batch_full.to(device)
+                        atom_masks[device] = torch.index_select(
+                            mask, 0, atom_system_ids[device]
+                        )
+                    mask = atom_masks[device]
+                mask = mask.reshape((-1,) + (1,) * (value.ndim - 1))
+                output = torch.where(mask, value, 0)
+            full_output[f"{dataset_name}_{key}"] = (
+                {key: output} if wrap_property else output
+            )
+    return full_output
 
 
 @registry.register_model("escnmd_moe_backbone")
@@ -115,8 +156,36 @@ class eSCNMDMoeBackbone(eSCNMDBackbone, MOLEInterface):
         self.num_experts = 0
 
         # create a new non moe model and load weights into there
+        # Match each loaded tensor before copying the state. A blanket cast to
+        # the parameter dtype would also downcast intentional FP64 buffers in
+        # an FP32 model; the process default dtype can instead round FP64
+        # parameters. Neither should change as a side effect of merging.
         new_model = eSCNMDBackbone(**self.parent_kwargs)
-        new_model.load_state_dict(self.state_dict())
+        source_tensors = dict(self.named_parameters()) | dict(self.named_buffers())
+        tensor_specs = {
+            id(tensor): (source_tensors[name].device, source_tensors[name].dtype)
+            for name, tensor in (
+                dict(new_model.named_parameters()) | dict(new_model.named_buffers())
+            ).items()
+        }
+
+        def match_tensor(tensor):
+            device, dtype = tensor_specs[id(tensor)]
+            converted = tensor.to(device=device, dtype=dtype)
+            # Modules such as CoefficientMapping are shared by multiple
+            # layers, so _apply may revisit an already converted buffer.
+            tensor_specs[id(converted)] = (device, dtype)
+            return converted
+
+        new_model._apply(match_tensor)
+        state = self.state_dict()
+        new_model.load_state_dict(state)
+        # Derived buffers are not in state_dict. Preserve their values too:
+        # rebuilding at another default dtype can round them before the cast.
+        with torch.no_grad():
+            for name, buffer in new_model.named_buffers():
+                if name not in state:
+                    buffer.copy_(source_tensors[name])
         new_model.eval()
         return new_model
 
@@ -562,7 +631,6 @@ class DatasetSpecificMoEWrapper(nn.Module, HeadInterface):
             data.natoms.shape[0], dtype=torch.int, device=emb["batch"].device
         ).scatter(0, emb["batch"], 1, reduce="add")  # data.natoms.cpu()
         self.global_mole_tensors.natoms = emb["batch"].shape[0]
-        data_batch_full = data.batch_full.cpu()
 
         # generate a one hot mask based on dataset , one for each system
         self.global_mole_tensors.expert_mixing_coefficients = torch.zeros(
@@ -585,29 +653,9 @@ class DatasetSpecificMoEWrapper(nn.Module, HeadInterface):
         # run the internal head
         head_output = self.head(data, emb)
 
-        # breakout the outputs to correct heads named by datasetname
-        np_dataset_names = np.array(data.dataset)
-        full_output = {}
-        for dataset_name in self.dataset_names:
-            dataset_mask = np_dataset_names == dataset_name
-            for key, mole_output_tensor in head_output.items():
-                # TODO can't we use torch.zeros here?
-                output_tensor = mole_output_tensor.new_zeros(
-                    mole_output_tensor.shape
-                )  # float('inf'))
-                if dataset_mask.any():
-                    if output_tensor.shape[0] == dataset_mask.shape[0]:
-                        output_tensor[dataset_mask] = mole_output_tensor[dataset_mask]
-                    else:  # assume atoms are the first dimension
-                        atoms_mask = torch.isin(
-                            data_batch_full,
-                            torch.where(torch.from_numpy(dataset_mask))[0],
-                        )
-                        output_tensor[atoms_mask] = mole_output_tensor[atoms_mask]
-                full_output[f"{dataset_name}_{key}"] = (
-                    {key: output_tensor} if self.wrap_property else output_tensor
-                )
-        return full_output
+        return _route_head_outputs(
+            head_output, data, self.dataset_names, self.wrap_property
+        )
 
 
 class DatasetSpecificSingleHeadWrapper(nn.Module, HeadInterface):
@@ -644,7 +692,6 @@ class DatasetSpecificSingleHeadWrapper(nn.Module, HeadInterface):
 
     @conditional_grad(torch.enable_grad())
     def forward(self, data, emb: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        data_batch_full = data.batch_full.cpu()
         # run the internal head
         head_output = self.head(data, emb)
 
@@ -670,28 +717,6 @@ class DatasetSpecificSingleHeadWrapper(nn.Module, HeadInterface):
         assert (
             set(data.dataset) <= set(self.dataset_names)
         ), f"Input dataset names: {set(data.dataset)} must be a strict subset of model's valid dataset names: {set(self.dataset_names)} "
-        # breakout the outputs to correct heads named by datasetname
-        np_dataset_names = np.array(data.dataset)
-
-        full_output = {}
-        for dataset_name in self.dataset_names:
-            dataset_mask = np_dataset_names == dataset_name
-            for key, head_output_tensor in head_output.items():
-                # TODO can't we use torch.zeros here?
-                output_tensor = head_output_tensor.new_zeros(
-                    head_output_tensor.shape
-                )  # float('inf'))
-                if dataset_mask.any():
-                    if output_tensor.shape[0] == dataset_mask.shape[0]:
-                        output_tensor[dataset_mask] = head_output_tensor[dataset_mask]
-                    else:  # assume atoms are the first dimension
-                        atoms_mask = torch.isin(
-                            data_batch_full,
-                            torch.where(torch.from_numpy(dataset_mask))[0],
-                        )
-                        output_tensor[atoms_mask] = head_output_tensor[atoms_mask]
-                full_output[f"{dataset_name}_{key}"] = (
-                    {key: output_tensor} if self.wrap_property else output_tensor
-                )
-
-        return full_output
+        return _route_head_outputs(
+            head_output, data, self.dataset_names, self.wrap_property
+        )
