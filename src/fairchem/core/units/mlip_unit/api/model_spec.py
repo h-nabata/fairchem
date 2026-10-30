@@ -236,6 +236,13 @@ class ModelSpec:
                 diagnose than an immediate failure.
         """
         if self.device is not None:
+            if torch.device(self.device).type == "xpu":
+                raise ValueError(
+                    "XPU model serving through Ray is not supported by this "
+                    "implementation: device allocation and isolation are "
+                    "CUDA-specific. Use a local MLIPPredictUnit or "
+                    "FAIRChemCalculator with device='xpu:<index>' instead."
+                )
             if (
                 torch.device(self.device).type == "cuda"
                 and not torch.cuda.is_available()

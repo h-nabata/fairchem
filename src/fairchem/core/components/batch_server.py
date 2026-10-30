@@ -913,6 +913,12 @@ def _check_predict_unit_device(predict_unit: MLIPPredictUnit, num_gpus: float) -
             number of GPUs the replica will be able to see.
     """
     device = torch.device(predict_unit.device)
+    if device.type == "xpu":
+        raise ValueError(
+            "XPU model serving through Ray is not supported by this "
+            "implementation: device allocation and isolation are CUDA-specific. "
+            "Use a local MLIPPredictUnit or FAIRChemCalculator instead."
+        )
     if device.type != "cuda":
         return
 
@@ -1108,6 +1114,10 @@ def update_served_predict_unit(
             "process, so its checkpoint cannot be updated."
         )
 
+    _check_predict_unit_device(
+        predict_unit,
+        record.options_kwargs.get("ray_actor_options", {}).get("num_gpus", 0),
+    )
     predict_unit_ref = ray.put(predict_unit)
     _deploy_app(
         deployment=record.deployment,
@@ -1367,6 +1377,12 @@ def probe_optimal_batch_size(
 
     device = predict_unit.device
 
+    if torch.device(device).type == "xpu":
+        raise ValueError(
+            "Automatic batch-size probing is implemented only for CUDA GPUs. "
+            "XPU performance must be measured with explicit synchronized timings; "
+            "the CPU defaults are not XPU measurements."
+        )
     if "cuda" not in str(device):
         logging.info("Autobatch probing skipped for CPU device, using defaults")
         return AutobatchResult(

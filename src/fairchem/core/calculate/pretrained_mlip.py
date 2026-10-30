@@ -13,11 +13,13 @@ from dataclasses import dataclass
 from importlib import resources
 from typing import TYPE_CHECKING, Literal
 
+import torch
 from huggingface_hub import hf_hub_download
 from omegaconf import OmegaConf
 
 from fairchem.core import calculate
 from fairchem.core._config import CACHE_DIR
+from fairchem.core.common.distutils import resolve_xpu_device
 from fairchem.core.units.mlip_unit import MLIPPredictUnit, load_predict_unit
 
 if TYPE_CHECKING:
@@ -173,6 +175,14 @@ def get_predict_unit(
         UnknownCheckpointError: If model_name is neither a registered model name nor
             an existing file. Subclasses KeyError and ValueError.
     """
+    # Fail before authentication/download if an explicit Intel device cannot
+    # serve the request. The predictor performs the same check on local loads.
+    if device is not None and torch.device(device).type == "xpu":
+        if workers != 1 or gp_config is not None:
+            raise ValueError(
+                "XPU inference supports workers=1 without graph parallelism."
+            )
+        device = resolve_xpu_device(device)
     checkpoint = resolve_checkpoint(model_name, cache_dir)
     return load_predict_unit(
         checkpoint.path,

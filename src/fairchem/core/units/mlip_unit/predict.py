@@ -42,6 +42,7 @@ from fairchem.core.common.distutils import (
     CURRENT_DEVICE_TYPE_STR,
     assign_device_for_local_rank,
     get_device_for_local_rank,
+    resolve_xpu_device,
     setup_env_local_multi_gpu,
 )
 from fairchem.core.common.utils import get_commit_hash_for_repo
@@ -495,20 +496,7 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         requested = torch.device(device)
         if requested.type != "xpu":
             raise ValueError("device must be 'cpu', 'cuda', 'xpu', or 'xpu:<index>'")
-        if not hasattr(torch, "xpu") or not torch.xpu.is_available():
-            raise RuntimeError(
-                "XPU was requested but torch.xpu.is_available() is False. "
-                "Install an XPU-enabled PyTorch build and a compatible Intel GPU driver."
-            )
-        index = (
-            torch.xpu.current_device() if requested.index is None else requested.index
-        )
-        if index >= torch.xpu.device_count():
-            raise ValueError(
-                f"Requested xpu:{index}, but only {torch.xpu.device_count()} "
-                "XPU device(s) are available."
-            )
-        self.device = f"xpu:{index}"
+        self.device = resolve_xpu_device(requested)
 
     def _validate_xpu_settings(self) -> None:
         """
@@ -541,7 +529,10 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         settings: InferenceSettings,
     ) -> dict:
         """Build backbone config overrides by delegating to model-specific logic."""
-        overrides = {} if user is None else dict(user)
+        # The backbone mapping is updated below. A shallow copy would overwrite
+        # the caller's nested values before they can take precedence, and would
+        # conceal unsupported XPU overrides from the validation below.
+        overrides = {} if user is None else copy.deepcopy(user)
         if "backbone" not in overrides:
             overrides["backbone"] = {}
 
@@ -734,6 +725,21 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
     def predict(
         self, data: AtomicData, undo_element_references: bool = True
     ) -> dict[str, torch.tensor]:
+        regress_config = getattr(self.model.module.backbone, "regress_config", None)
+        if (
+            torch.is_inference_mode_enabled()
+            and regress_config is not None
+            and not regress_config.direct_forces
+            and any(
+                getattr(regress_config, property_name, False)
+                for property_name in ("forces", "stress", "hessian")
+            )
+        ):
+            raise RuntimeError(
+                "Energy-derived forces, stress, and Hessians require autograd. "
+                "Call predict() outside torch.inference_mode(); torch.no_grad() "
+                "can be used instead."
+            )
         if not self.lazy_model_intialized:
             self._initialize(data)  # may fall back: nitro -> multigpu -> general
             revision = get_commit_hash_for_repo(os.path.dirname(__file__))
@@ -773,10 +779,9 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
             self.model.module.on_predict_check(data_device)
         except MergeMoleConsistencyError as error:
             self._fall_back(error)
-            # The multigpu model re-merges for this input, or falls back further. The
-            # reloaded model is on the CPU until _lazy_init moves it, and data.to()
-            # above moved ``data`` in place, so merge from a CPU copy.
-            self._initialize(data.clone().cpu())
+            # The multigpu model re-merges for this input, or falls back further.
+            # _lazy_init prepares its own CPU copy even if data is already on GPU.
+            self._initialize(data)
             self.model.module.on_predict_check(data_device)
 
         try:
@@ -784,15 +789,37 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         except UMANitroNotSupportedError as error:
             # e.g. a geometry whose radius graph outgrows Nitro's capacity.
             self._fall_back(error)
-            self._initialize(data.clone().cpu())
+            self._initialize(data)
             return self._run_inference(data_device, undo_element_references)
 
     def _lazy_init(self, data: AtomicData) -> None:
         """
         Lazy initialization on first predict call.
         """
-        # Model handles its own preparation (MOLE merge, eval mode, etc.)
-        self.model.module.prepare_for_inference(data, self.inference_settings)
+        # Checkpoints are loaded on CPU. Preparing MOLE with an already-device-
+        # resident batch would mix accelerator inputs and CPU weights; float64
+        # inputs also break the head's FP32 expert contraction before predict()
+        # gets a chance to cast them. Prepare from a private CPU copy at the
+        # loaded model's precision, preserving the caller's batch and placement.
+        # The final requested precision is applied after preparation, as before.
+        dtype = next(
+            (
+                parameter.dtype
+                for parameter in self.model.parameters()
+                if parameter.is_floating_point()
+            ),
+            self.inference_settings.base_precision_dtype,
+        )
+        preparation_data = data.clone().cpu()
+        for key, value in preparation_data:
+            if torch.is_tensor(value) and value.is_floating_point():
+                preparation_data[key] = value.to(dtype)
+        # Model handles its own preparation (MOLE merge, eval mode, etc.).
+        # CPU autocast must not permanently round the merged FP32 parameters.
+        with torch.autocast("cpu", enabled=False):
+            self.model.module.prepare_for_inference(
+                preparation_data, self.inference_settings
+            )
         # Inference differentiates outputs with respect to inputs, not weights.
         self.model.requires_grad_(False)
 
@@ -821,18 +848,26 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         inference_context = (
             torch.no_grad()
             if self.model.module.backbone.regress_config.direct_forces
-            else nullcontext()
+            else torch.enable_grad()
+        )
+        device_type = torch.device(getattr(self, "device", "cpu")).type
+        # PyTorch's TF32 controls affect CUDA only. Leave that backend's global
+        # state untouched when an independent Intel predictor is running.
+        precision_context = (
+            nullcontext()
+            if device_type == "xpu"
+            else tf32_context_manager(self.inference_settings.tf32)
         )
         # FP32 is the supported XPU contract even inside a caller's autocast
         # context. Preserve that contract for every backbone operation.
         autocast_context = (
             torch.autocast("xpu", enabled=False)
-            if torch.device(getattr(self, "device", "cpu")).type == "xpu"
+            if device_type == "xpu"
             else nullcontext()
         )
         with (
             inference_context,
-            tf32_context_manager(self.inference_settings.tf32),
+            precision_context,
             autocast_context,
         ):
             output = self.model(data)

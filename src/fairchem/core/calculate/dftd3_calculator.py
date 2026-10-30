@@ -267,6 +267,12 @@ class _NValChemiDFTD3Calculator(Calculator):
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
+        if self.device.type not in {"cpu", "cuda"}:
+            raise ValueError(
+                "The nvalchemiops DFT-D3 backend supports only CPU and CUDA, "
+                f"not {self.device.type!r}. Use device='cpu' for the D3 "
+                "calculator when the wrapped UMA calculator runs on XPU."
+            )
         self.functional = functional
         self.damping_parameters = _DFTD3_BJ_PARAMETERS[functional]
         self.cutoff = float(cutoff)
@@ -429,8 +435,9 @@ class DFTD3Calculator(Calculator):
         calculator: Base ASE calculator whose predictions receive the D3 term.
         functional: DFT-D3(BJ) parameterization, either ``"r2scan"`` or
             ``"pbe"``.
-        device: Torch device for D3. Defaults to CUDA when available, otherwise
-            CPU.
+        device: Torch device for D3 (CPU or CUDA). Defaults to CUDA when
+            available, otherwise CPU. This device is independent of the base
+            calculator; use ``device="cpu"`` to add D3 to an XPU UMA calculator.
         cutoff: D3 neighbor cutoff in Angstrom. Defaults to 15 Å.
         smoothing_fraction: Fraction of the cutoff over which C5 smoothing is
             applied. Defaults to 0.2 (the outer 20% of the cutoff).

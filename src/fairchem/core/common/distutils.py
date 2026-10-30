@@ -285,6 +285,25 @@ def assign_device_for_local_rank(cpu: bool, local_rank: int) -> None:
         torch.cuda.set_device(local_rank)
 
 
+def resolve_xpu_device(device: str | torch.device) -> str:
+    """Validate an Intel device before checkpoint I/O and preserve its ordinal."""
+    requested = torch.device(device)
+    if requested.type != "xpu":
+        raise ValueError(f"Expected an XPU device, got {device!r}")
+    if not hasattr(torch, "xpu") or not torch.xpu.is_available():
+        raise RuntimeError(
+            "XPU was requested but torch.xpu.is_available() is False. "
+            "Install an XPU-enabled PyTorch build and a compatible Intel GPU driver."
+        )
+    index = torch.xpu.current_device() if requested.index is None else requested.index
+    if index >= torch.xpu.device_count():
+        raise ValueError(
+            f"Requested xpu:{index}, but only {torch.xpu.device_count()} "
+            "XPU device(s) are available."
+        )
+    return f"xpu:{index}"
+
+
 def get_device_for_local_rank() -> str:
     if os.environ.get(CURRENT_DEVICE_TYPE_STR) is None:
         os.environ[CURRENT_DEVICE_TYPE_STR] = (
@@ -301,15 +320,7 @@ def get_device_for_local_rank() -> str:
         assert torch.cuda.is_available(), "cannot set cpu=false and no cuda available!"
         return f"cuda:{torch.cuda.current_device()}"
     elif os.environ[CURRENT_DEVICE_TYPE_STR].split(":", 1)[0] == "xpu":
-        if not torch.xpu.is_available():
-            raise RuntimeError(
-                "XPU was selected, but torch.xpu.is_available() is False"
-            )
-        device = torch.device(os.environ[CURRENT_DEVICE_TYPE_STR])
-        index = device.index if device.index is not None else torch.xpu.current_device()
-        if index >= torch.xpu.device_count():
-            raise ValueError(f"XPU device index {index} is not available")
-        return f"xpu:{index}"
+        return resolve_xpu_device(os.environ[CURRENT_DEVICE_TYPE_STR])
     elif os.environ[CURRENT_DEVICE_TYPE_STR] == "cpu":
         return "cpu"
     else:

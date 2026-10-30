@@ -142,7 +142,10 @@ def test_xpu_preset_reports_its_name():
     assert describe_inference_settings(inference_settings_xpu()) == "xpu"
 
 
-def test_xpu_inference_disables_and_restores_callers_autocast():
+def test_xpu_inference_disables_and_restores_callers_autocast(monkeypatch):
+    cuda_precision = Mock(side_effect=AssertionError("XPU must not touch CUDA TF32"))
+    monkeypatch.setattr(predict_module, "tf32_context_manager", cuda_precision)
+
     class AutocastCheckingModel:
         module = SimpleNamespace(
             backbone=SimpleNamespace(regress_config=SimpleNamespace(direct_forces=True))
@@ -162,6 +165,7 @@ def test_xpu_inference_disables_and_restores_callers_autocast():
         result = predictor._run_inference(None, False)
         assert torch.is_autocast_enabled("xpu")
     assert result["energy"].dtype == torch.float32
+    cuda_precision.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -174,14 +178,63 @@ def test_xpu_inference_disables_and_restores_callers_autocast():
 def test_user_overrides_cannot_enable_cuda_only_paths(
     backbone_override, error, monkeypatch
 ):
-    backbone_cls = SimpleNamespace(build_inference_settings=lambda settings: {})
+    # Use the actual UMA builder: it supplies general/v2 defaults that must not
+    # overwrite user overrides before the unsupported-path validation runs.
+    from fairchem.core.models.uma.escn_md import eSCNMDBackbone
+
     monkeypatch.setattr(
         predict_module,
         "get_backbone_class_from_checkpoint",
-        lambda checkpoint: backbone_cls,
+        lambda checkpoint: eSCNMDBackbone,
     )
     predictor = SimpleNamespace(_requested_device="xpu:1")
     with pytest.raises(ValueError, match=error):
         MLIPPredictUnit._build_overrides_from_settings(
             predictor, None, {"backbone": backbone_override}, inference_settings_xpu()
         )
+
+
+def test_backbone_user_overrides_win_without_mutating_caller(monkeypatch):
+    from fairchem.core.models.uma.escn_md import eSCNMDBackbone
+
+    monkeypatch.setattr(
+        predict_module,
+        "get_backbone_class_from_checkpoint",
+        lambda checkpoint: eSCNMDBackbone,
+    )
+    user = {"backbone": {"radius_pbc_version": 1, "edge_chunk_size": 64}}
+    before = copy.deepcopy(user)
+    predictor = SimpleNamespace(_requested_device="xpu:1")
+    actual = MLIPPredictUnit._build_overrides_from_settings(
+        predictor, None, user, inference_settings_xpu()
+    )
+    assert actual["backbone"]["radius_pbc_version"] == 1
+    assert actual["backbone"]["edge_chunk_size"] == 64
+    assert actual["backbone"]["execution_mode"] == "general"
+    assert user == before
+
+
+def test_xpu_derivatives_enable_grad_and_restore_callers_no_grad():
+    class StressModel:
+        module = SimpleNamespace(
+            backbone=SimpleNamespace(
+                regress_config=SimpleNamespace(
+                    direct_forces=False, forces=False, stress=True
+                )
+            )
+        )
+
+        def __call__(self, cell):
+            energy = cell.square().sum()
+            return {"stress": torch.autograd.grad(energy, cell)[0]}
+
+    predictor = MLIPPredictUnit.__new__(MLIPPredictUnit)
+    predictor.device = "xpu:0"
+    predictor.inference_settings = inference_settings_xpu()
+    predictor.model = StressModel()
+    predictor._process_outputs = lambda data, output, undo_refs: output
+    cell = torch.eye(3).requires_grad_()
+    with torch.no_grad():
+        result = predictor._run_inference(cell, False)
+        assert not torch.is_grad_enabled()
+    torch.testing.assert_close(result["stress"], 2 * torch.eye(3))

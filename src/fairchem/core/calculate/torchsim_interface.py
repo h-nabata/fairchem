@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 import typing
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import torch
 
@@ -178,7 +178,7 @@ class FairChemModel(_TSModelInterface):
         model: str | Path,
         *,  # force remaining arguments to be keyword-only
         model_cache_dir: str | Path | None = None,
-        device: torch.device | None = None,
+        device: str | torch.device | None = None,
         dtype: torch.dtype | None = None,
         compute_stress: bool = False,
         task_name: UMATask | str | None = None,
@@ -192,8 +192,9 @@ class FairChemModel(_TSModelInterface):
             neighbor_list_fn (Callable | None): Function to compute neighbor lists
                 (not currently supported)
             model_cache_dir (str | Path | None): Path where to save the model
-            device (torch.device | None): Device to use for computation. If None,
-                defaults to CUDA if available, otherwise CPU.
+            device (str | torch.device | None): Device to use for computation. If
+                None, prefers CUDA, then XPU, then CPU. Specify ``xpu:<index>``
+                explicitly on hosts with both NVIDIA and Intel GPUs.
             dtype (torch.dtype | None): Data type to use for computation
             compute_stress (bool): Whether to compute stress tensor
             task_name (UMATask | str | None): Task type for UMA models (optional,
@@ -232,12 +233,20 @@ class FairChemModel(_TSModelInterface):
             task_name = UMATask(task_name)
 
         # Use the efficient predictor API for optimal performance
-        self._device = device or torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
+        if device is None:
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif hasattr(torch, "xpu") and torch.xpu.is_available():
+                device = "xpu"
+            else:
+                device = "cpu"
+        self._device = torch.device(device)
+        # XPU ordinals are part of the predictor's device contract. Dropping
+        # the index here sends a state on xpu:1 to the current/default GPU.
+        # Keep the existing local-rank CUDA resolution in the predictor.
+        device_str = (
+            str(self._device) if self._device.type == "xpu" else self._device.type
         )
-        device_str: Literal["cuda", "cpu"] = (
-            self._device.type
-        )  # ty:ignore[invalid-assignment]
         self.task_name = task_name
 
         # Create efficient batch predictor for fast inference. TorchSim sends
@@ -254,6 +263,11 @@ class FairChemModel(_TSModelInterface):
             self.predictor = pretrained_mlip.get_predict_unit(
                 model, inference_settings="batch", device=device_str
             )
+
+        if self._device.type == "xpu":
+            # The predictor resolves a bare "xpu" to a concrete ordinal. Keep
+            # state transfers on that GPU even if the current device changes.
+            self._device = torch.device(self.predictor.device)
 
         self.implemented_properties = ["energy", "forces"]
         if compute_stress:

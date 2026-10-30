@@ -32,7 +32,7 @@ def test_xpu_device_resolution_preserves_selected_index(
 def test_unavailable_xpu_does_not_fall_back_to_cpu(monkeypatch):
     monkeypatch.setenv(distutils.CURRENT_DEVICE_TYPE_STR, "xpu")
     monkeypatch.setattr(torch.xpu, "is_available", lambda: False)
-    with pytest.raises(RuntimeError, match="XPU was selected"):
+    with pytest.raises(RuntimeError, match="XPU was requested"):
         distutils.get_device_for_local_rank()
 
 
@@ -40,5 +40,5 @@ def test_invalid_xpu_index_does_not_fall_back_to_current_device(monkeypatch):
     monkeypatch.setenv(distutils.CURRENT_DEVICE_TYPE_STR, "xpu:2")
     monkeypatch.setattr(torch.xpu, "is_available", lambda: True)
     monkeypatch.setattr(torch.xpu, "device_count", lambda: 2)
-    with pytest.raises(ValueError, match="index 2 is not available"):
+    with pytest.raises(ValueError, match="Requested xpu:2"):
         distutils.get_device_for_local_rank()
