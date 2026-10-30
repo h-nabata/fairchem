@@ -1,0 +1,379 @@
+"""
+Copyright (c) Meta Platforms, Inc. and affiliates.
+
+This source code is licensed under the MIT license found in the
+LICENSE file in the root directory of this source tree.
+
+Run FP32 correctness checks and synchronized ASE timings on a real Intel GPU.
+
+Example:
+    python -m fairchem.core.scripts.validate_xpu --device xpu:0 \
+        --compare-merged --stress --output xpu-validation.json
+
+The tolerances are configurable smoke-test thresholds, not an accuracy claim
+for a checkpoint. No weights are downloaded unless this command is executed.
+"""
+
+from __future__ import annotations
+
+import argparse
+import gc
+import json
+import platform
+import time
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
+
+import numpy as np
+import torch
+from ase.build import bulk, molecule
+
+
+def compare_predictions(reference, candidate, natoms, tolerances):
+    """
+    Compare finite energy, force and optional stress values in ASE units.
+    """
+    errors = {
+        "energy_eV_per_atom": abs(candidate["energy"] - reference["energy"]) / natoms,
+        "forces_eV_per_A": float(
+            np.max(np.abs(candidate["forces"] - reference["forces"]))
+        ),
+    }
+    if "stress" in reference:
+        errors["stress_eV_per_A3"] = float(
+            np.max(np.abs(candidate["stress"] - reference["stress"]))
+        )
+    finite = all(
+        np.isfinite(value).all()
+        for prediction in (reference, candidate)
+        for value in prediction.values()
+    )
+    return {
+        "passed": bool(finite and all(v <= tolerances[k] for k, v in errors.items())),
+        "finite": bool(finite),
+        "max_absolute_errors": errors,
+    }
+
+
+def evaluate(atoms, stress=False):
+    """
+    Force a fresh ASE evaluation instead of timing cached calculator results.
+    """
+    atoms.calc.reset()
+    result = {
+        "energy": float(atoms.get_potential_energy()),
+        "forces": np.asarray(atoms.get_forces()).copy(),
+    }
+    if stress:
+        result["stress"] = np.asarray(atoms.get_stress()).copy()
+    return result
+
+
+def finite_difference_check(atoms, force, step, tolerance):
+    """
+    Check the largest force component using central energy differences.
+
+    The default 0.005 A step limits FP32 cancellation. Repeat with several
+    steps before attributing a mismatch to a backend or using Hessians.
+    """
+    atom, axis = np.unravel_index(np.argmax(np.abs(force)), force.shape)
+    original = atoms.positions.copy()
+    energies = []
+    try:
+        for sign in (1, -1):
+            positions = original.copy()
+            positions[atom, axis] += sign * step
+            atoms.set_positions(positions)
+            energies.append(evaluate(atoms)["energy"])
+    finally:
+        atoms.set_positions(original)
+        atoms.calc.reset()
+    numeric = -(energies[0] - energies[1]) / (2 * step)
+    analytic = float(force[atom, axis])
+    error = abs(numeric - analytic)
+    return {
+        "passed": bool(np.isfinite(error) and error <= tolerance),
+        "atom": int(atom),
+        "axis": int(axis),
+        "step_A": step,
+        "analytic_eV_per_A": analytic,
+        "finite_difference_eV_per_A": numeric,
+        "absolute_error_eV_per_A": error,
+        "tolerance_eV_per_A": tolerance,
+    }
+
+
+def synchronized_timings(atoms, device, warmup, repeats, stress=False):
+    """
+    Time complete ASE energy/force calls including transfers and graph generation.
+    """
+
+    def synchronize():
+        if device.type == "xpu":
+            torch.xpu.synchronize(device)
+
+    for _ in range(warmup):
+        evaluate(atoms, stress)
+    synchronize()
+    durations = []
+    for _ in range(repeats):
+        synchronize()
+        start = time.perf_counter()
+        evaluate(atoms, stress)
+        synchronize()
+        durations.append((time.perf_counter() - start) * 1000)
+    return {
+        "median_ms": float(np.median(durations)),
+        "minimum_ms": min(durations),
+        "samples_ms": durations,
+        "warmup_calls": warmup,
+        "includes": "ASE conversion, graph generation, energy/forces and transfers",
+    }
+
+
+def model_tensor_inventory(predictor, device):
+    """
+    Reject unexpected model placement or floating-point precision.
+    """
+    inventory = {}
+    count = 0
+    for name, tensor in list(predictor.model.named_parameters()) + list(
+        predictor.model.named_buffers()
+    ):
+        count += 1
+        key = f"{tensor.device}/{tensor.dtype}"
+        inventory[key] = inventory.get(key, 0) + tensor.numel()
+        if tensor.device != device:
+            raise RuntimeError(
+                f"Model tensor {name} is on {tensor.device}, not {device}"
+            )
+        if tensor.is_floating_point() and tensor.dtype != torch.float32:
+            raise RuntimeError(f"Model tensor {name} uses {tensor.dtype}, not FP32")
+    if not count:
+        raise RuntimeError("No model tensors found; cannot verify device placement")
+    return inventory
+
+
+def probe_fp64_reduction(device):
+    """
+    Exercise FP64 index_add and autograd, needed by UMA's FP32 model path.
+    """
+    source = torch.tensor(
+        [1.0, 2.0, 3.0], dtype=torch.float32, device=device, requires_grad=True
+    )
+    indices = torch.tensor([0, 1, 0], device=device)
+    reduced = torch.zeros(2, dtype=torch.float64, device=device).index_add(
+        0, indices, source.double()
+    )
+    gradient = torch.autograd.grad(reduced.square().sum(), source)[0]
+    torch.testing.assert_close(
+        reduced.cpu(), torch.tensor([4.0, 2.0], dtype=torch.float64)
+    )
+    torch.testing.assert_close(
+        gradient.cpu(), torch.tensor([8.0, 4.0, 8.0], dtype=torch.float32)
+    )
+    return {
+        "passed": True,
+        "dtype": str(reduced.dtype),
+        "device": str(reduced.device),
+        "reduction": reduced.detach().cpu().tolist(),
+        "gradient": gradient.detach().cpu().tolist(),
+        "note": "FP32 model parameters still require FP64 energy/stress reductions.",
+    }
+
+
+def run_case(args, atoms, task, device, merge_mole, stress=False):
+    """
+    Load a fresh predictor so each timing retains its chosen MoLE configuration.
+    """
+    from fairchem.core import FAIRChemCalculator, pretrained_mlip
+    from fairchem.core.units.mlip_unit.api.inference import InferenceSettings
+
+    settings = InferenceSettings(
+        base_precision_dtype=torch.float32,
+        activation_checkpointing=False,
+        tf32=False,
+        nitro=False,
+        execution_mode="general",
+        internal_graph_gen_version=2,
+        merge_mole=merge_mole,
+        compile=args.compile and device.type == "xpu",
+    )
+    predictor = pretrained_mlip.get_predict_unit(
+        args.model, device=str(device), inference_settings=settings
+    )
+    structure = atoms.copy()
+    structure.calc = FAIRChemCalculator(predictor, task_name=task)
+    start = time.perf_counter()
+    values = evaluate(structure, stress)
+    if device.type == "xpu":
+        torch.xpu.synchronize(device)
+    first_evaluation_seconds = time.perf_counter() - start
+    result = {
+        "device": str(device),
+        "model_tensor_elements": model_tensor_inventory(predictor, device),
+        "settings": predictor.inference_settings.to_omegaconf(),
+        "first_evaluation_seconds": first_evaluation_seconds,
+        "energy_eV": values["energy"],
+        "forces_eV_per_A": values["forces"].tolist(),
+        "finite_difference": finite_difference_check(
+            structure, values["forces"], args.fd_step, args.fd_tolerance
+        ),
+        "timing": synchronized_timings(
+            structure, device, args.warmup, args.repeats, stress
+        ),
+    }
+    if stress:
+        result["stress_eV_per_A3"] = values["stress"].tolist()
+    del structure, predictor
+    gc.collect()
+    if device.type == "xpu":
+        torch.xpu.empty_cache()
+    return values, result
+
+
+def _version(package):
+    try:
+        return version(package)
+    except PackageNotFoundError:
+        return "not installed"
+
+
+def _json_safe(value):
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list, set)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, float) and not np.isfinite(value):
+        return str(value)
+    return value
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", default="uma-s-1p2p1")
+    parser.add_argument("--device", default="xpu:0")
+    parser.add_argument("--output", type=Path, default=Path("xpu-validation.json"))
+    parser.add_argument(
+        "--case", choices=("all", "molecule", "periodic"), default="all"
+    )
+    parser.add_argument("--stress", action="store_true", help="Check periodic stress")
+    parser.add_argument("--compare-merged", action="store_true")
+    parser.add_argument(
+        "--compile", action="store_true", help="Experimental XPU compile"
+    )
+    parser.add_argument("--warmup", type=int, default=3)
+    parser.add_argument("--repeats", type=int, default=10)
+    parser.add_argument("--fd-step", type=float, default=0.005)
+    parser.add_argument("--fd-tolerance", type=float, default=0.02)
+    parser.add_argument("--energy-tolerance", type=float, default=1e-4)
+    parser.add_argument("--force-tolerance", type=float, default=5e-4)
+    parser.add_argument("--stress-tolerance", type=float, default=5e-5)
+    return parser
+
+
+def main(argv=None):
+    """
+    Return nonzero on absent XPU, exceptions, nonfinite outputs or failed checks.
+    """
+    args = build_parser().parse_args(argv)
+    report = {
+        "passed": False,
+        "model": args.model,
+        "requested_device": args.device,
+        "versions": {
+            name: _version(name) for name in ("torch", "fairchem-core", "ase", "e3nn")
+        },
+        "platform": platform.platform(),
+        "python": platform.python_version(),
+        "cases": {},
+        "note": "Small-system smoke checks; no claim about all operators or workloads.",
+    }
+    try:
+        if args.warmup < 0 or args.repeats < 1:
+            raise ValueError("warmup must be nonnegative and repeats positive")
+        if any(
+            not np.isfinite(value) or value <= 0
+            for value in (
+                args.fd_step,
+                args.fd_tolerance,
+                args.energy_tolerance,
+                args.force_tolerance,
+                args.stress_tolerance,
+            )
+        ):
+            raise ValueError("Finite-difference step and tolerances must be positive")
+        device = torch.device(args.device)
+        if device.type != "xpu":
+            raise ValueError("--device must be an XPU device, such as xpu:0")
+        if not torch.xpu.is_available():
+            raise RuntimeError("No XPU available; CPU fallback is not permitted")
+        device = torch.device("xpu", device.index if device.index is not None else 0)
+        report["device_name"] = torch.xpu.get_device_name(device)
+        properties = torch.xpu.get_device_properties(device)
+        report["device_properties"] = str(properties)
+        report["has_fp64"] = getattr(properties, "has_fp64", "not exposed")
+        report["torch_xpu_build"] = getattr(torch.version, "xpu", None)
+        report["fp64_reduction_probe"] = probe_fp64_reduction(device)
+        tolerances = {
+            "energy_eV_per_atom": args.energy_tolerance,
+            "forces_eV_per_A": args.force_tolerance,
+            "stress_eV_per_A3": args.stress_tolerance,
+        }
+        report["comparison_tolerances"] = tolerances
+        water = molecule("H2O")
+        water.positions[1, 0] += 0.04
+        water.info.update(charge=0, spin=1)
+        copper = bulk("Cu", "fcc", a=3.6, cubic=True)
+        copper.positions[0, 0] += 0.04
+        passed = True
+        for name, atoms, task in (
+            ("molecule", water, "omol"),
+            ("periodic", copper, "omat"),
+        ):
+            if args.case not in ("all", name):
+                continue
+            case = {"natoms": len(atoms), "task": task}
+            report["cases"][name] = case
+            stress = args.stress and name == "periodic"
+            reference, case["cpu"] = run_case(
+                args, atoms, task, torch.device("cpu"), False, stress
+            )
+            candidate, case["xpu_unmerged"] = run_case(
+                args, atoms, task, device, False, stress
+            )
+            case["cpu_vs_xpu"] = compare_predictions(
+                reference, candidate, len(atoms), tolerances
+            )
+            case["passed"] = all(
+                (
+                    case["cpu_vs_xpu"]["passed"],
+                    case["cpu"]["finite_difference"]["passed"],
+                    case["xpu_unmerged"]["finite_difference"]["passed"],
+                )
+            )
+            if args.compare_merged:
+                merged, case["xpu_merged"] = run_case(
+                    args, atoms, task, device, True, stress
+                )
+                case["unmerged_vs_merged"] = compare_predictions(
+                    candidate, merged, len(atoms), tolerances
+                )
+                case["passed"] &= (
+                    case["unmerged_vs_merged"]["passed"]
+                    and case["xpu_merged"]["finite_difference"]["passed"]
+                )
+            passed &= case["passed"]
+        report["passed"] = passed
+    except Exception as exc:
+        report["error"] = {"type": type(exc).__name__, "message": str(exc)}
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(
+        json.dumps(_json_safe(report), indent=2, default=str, allow_nan=False) + "\n"
+    )
+    print(f"{'PASS' if report['passed'] else 'FAIL'}: {args.output}")
+    return 0 if report["passed"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
