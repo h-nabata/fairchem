@@ -36,8 +36,6 @@ except ImportError:
     AseAtomsAdaptor = None
     pmg_installed = False
 
-from fairchem.core.graph.radius_graph_pbc_nvidia import get_neighbors_nvidia_atoms
-
 IndexType = Union[slice, torch.Tensor, np.ndarray, Sequence]
 
 
@@ -397,6 +395,10 @@ class AtomicData:
             if external_graph_method == ExternalGraphMethod.PYMATGEN:
                 split_idx_dist = get_neighbors_pymatgen(atoms, radius, max_neigh)
             elif external_graph_method == ExternalGraphMethod.NVIDIA:
+                from fairchem.core.graph.radius_graph_pbc_nvidia import (
+                    get_neighbors_nvidia_atoms,
+                )
+
                 split_idx_dist = get_neighbors_nvidia_atoms(atoms, radius, max_neigh)
             else:
                 raise ValueError(

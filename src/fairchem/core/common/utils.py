@@ -206,20 +206,30 @@ def setup_imports(config: dict | None = None) -> None:
     if has_already_setup:
         return
 
-    try:
-        project_root = _get_project_root()
-        logging.info(f"Project root: {project_root}")
-        importlib.import_module("fairchem.core.common.logger")
+    project_root = _get_project_root()
+    logging.info(f"Project root: {project_root}")
+    importlib.import_module("fairchem.core.common.logger")
 
-        import_keys = ["trainers", "datasets", "models", "tasks"]
-        for key in import_keys:
-            for f in (project_root / "core" / key).rglob("*.py"):
-                _import_local_file(f, project_root=project_root)
+    # These implementation packages do not register models. Importing them
+    # eagerly initializes CUDA-specific kernels and allocator settings even
+    # for CPU/XPU callers. Their execution backends import them on demand.
+    lazy_implementation_dirs = (
+        project_root / "core" / "models" / "uma" / "triton",
+        project_root / "core" / "models" / "uma" / "uma_nitro",
+    )
+    import_keys = ["trainers", "datasets", "models", "tasks"]
+    for key in import_keys:
+        for f in (project_root / "core" / key).rglob("*.py"):
+            if any(f.is_relative_to(path) for path in lazy_implementation_dirs):
+                continue
+            _import_local_file(f, project_root=project_root)
 
-        if not skip_experimental_imports:
-            setup_experimental_imports(project_root)
-    finally:
-        registry.register("imports_setup", True)
+    if not skip_experimental_imports:
+        setup_experimental_imports(project_root)
+
+    # A failed import must remain retryable instead of advertising a partially
+    # initialized registry as ready.
+    registry.register("imports_setup", True)
 
 
 def debug_log_entry_exit(func):

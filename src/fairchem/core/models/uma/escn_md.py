@@ -639,7 +639,12 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
         if self.otf_graph:
             pbc = None
             if self.always_use_pbc:
-                pbc = torch.ones(len(data_dict), 3, dtype=torch.bool)
+                pbc = torch.ones(
+                    len(data_dict["natoms"]),
+                    3,
+                    dtype=torch.bool,
+                    device=data_dict["pos"].device,
+                )
             else:
                 assert (
                     "pbc" in data_dict
@@ -1140,7 +1145,7 @@ class MLP_EFS_Head(nn.Module, HeadInterface):
             outputs[forces_key] = {"forces": forces} if self.wrap_property else forces
             outputs[stress_key] = {"stress": stress} if self.wrap_property else stress
         elif self.regress_config.forces and not self.regress_config.direct_forces:
-            forces = compute_forces(energy_part, data["pos"], training=self.training)
+            forces = compute_forces(energy_part, data["pos"], training=create_graph)
             outputs[forces_key] = {"forces": forces} if self.wrap_property else forces
         else:
             forces = None

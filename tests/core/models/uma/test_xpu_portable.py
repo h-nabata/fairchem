@@ -203,5 +203,5 @@ def test_xpu_dgl_mole_fails_before_entering_cpp_kernels():
     layer = MOLEDGL(2, 8, 8, globals_, bias=True)
     with FakeTensorMode(allow_fallback_kernels=False):
         x = torch.empty((4, 8), device="xpu:0")
-        with pytest.raises(NotImplementedError, match="moe_layer_type='pytorch'"):
+        with pytest.raises(NotImplementedError, match="mole_layer_type='pytorch'"):
             layer(x)

@@ -8,19 +8,28 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 import math
-from contextlib import suppress
 from dataclasses import dataclass
+from functools import lru_cache
 
 import torch
 import torch.nn as nn
 
 from .matmul import linear_with_folded_batch
 
-fairchem_cpp_found = False
-with suppress(ModuleNotFoundError):
-    import fairchem_cpp  # try to use DGL if available
 
-    fairchem_cpp_found = True
+@lru_cache(maxsize=1)
+def _load_fairchem_cpp():
+    # A binary extension built for another PyTorch/CUDA version can fail with
+    # ImportError or OSError. Do not load it for the portable PyTorch MoLE path.
+    try:
+        import fairchem_cpp
+    except (ImportError, OSError) as exc:
+        raise ImportError(
+            "DGL MoLE requires a working fairchem_cpp extension matching "
+            "PyTorch and the target device. Use mole_layer_type='pytorch' "
+            "to use the portable implementation."
+        ) from exc
+    return fairchem_cpp
 
 
 def interval_intersection(interval1, interval2):
@@ -106,8 +115,9 @@ class MOLEDGL(torch.nn.Module):
         if x.device.type == "xpu":
             raise NotImplementedError(
                 "The fairchem_cpp DGL MoLE kernels do not support XPU. "
-                "Use moe_layer_type='pytorch' for Intel GPU inference."
+                "Use mole_layer_type='pytorch' for Intel GPU inference."
             )
+        fairchem_cpp = _load_fairchem_cpp()
         with torch.autocast(device_type=self.weights.device.type, enabled=False):
             weights = torch.einsum(
                 "eoi, be->bio",

@@ -381,8 +381,7 @@ def canonical_pbc(data, pbc: torch.Tensor | None) -> list[bool]:
 
     if pbc is None:
         data.pbc = torch.atleast_2d(data.pbc)
-        pbc = torch.BoolTensor([True, True, True])
-        pbc[~torch.any(data.pbc, dim=0)] = False
+        pbc = torch.any(data.pbc, dim=0)
 
     # If a per-system PBC tensor was passed in, collapse it via logical OR
     # so a dimension is periodic when any system requests it.
@@ -417,6 +416,12 @@ def radius_graph_pbc_v2(
     enforce_max_neighbors_strictly: bool = False,
     pbc: torch.Tensor | None = None,
 ):
+    # Preserve the per-system flags before canonical_pbc collapses them. An
+    # explicit override (including always_use_pbc) must also control image
+    # repetitions, not only the global warning/check flags.
+    sys_pbc = torch.atleast_2d(data.pbc if pbc is None else pbc).to(
+        device=data.pos.device, dtype=torch.bool
+    )
     pbc = canonical_pbc(data, pbc)
 
     device = data.pos.device
@@ -446,11 +451,9 @@ def radius_graph_pbc_v2(
     cross_a2a3 = torch.cross(data.cell[:, 1], data.cell[:, 2], dim=-1)
     cell_vol = torch.sum(data.cell[:, 0] * cross_a2a3, dim=-1, keepdim=True)
 
-    # Use per-system PBC from data.pbc so mixed-PBC batches are handled correctly.
+    # Use per-system PBC so mixed-PBC batches are handled correctly.
     # Each system's rep (number of periodic image repetitions) is computed from
     # its own cell and masked to zero for non-periodic dimensions.
-    sys_pbc = torch.atleast_2d(data.pbc)  # (batch_size, 3)
-
     inv_min_dist_a1 = torch.norm(cross_a2a3 / cell_vol, p=2, dim=-1)
     rep_a1 = torch.where(
         sys_pbc[:, 0],
