@@ -121,28 +121,50 @@ def get_max_neighbors_mask(
         )
         return mask_num_neighbors, num_neighbors_image
 
-    # Create a tensor of size [num_atoms, max_num_neighbors] to sort the distances of the neighbors.
-    # Fill with infinity so we can easily remove unused distances later.
+    # Only atoms above the cap need sorting. Padding every atom to the
+    # largest degree can be much larger than the edge list in heterogeneous
+    # batches (for example, many isolated atoms and one dense neighborhood).
+    overfull = num_neighbors > max_num_neighbors_threshold
+    overfull_atoms = torch.nonzero(overfull).flatten()
+    has_uncapped_atoms = len(overfull_atoms) < len(num_neighbors)
+    index_neighbor_offset = torch.cumsum(num_neighbors, dim=0) - num_neighbors
+    if has_uncapped_atoms:
+        overfull_edges = overfull[index]
+        edge_positions = torch.nonzero(overfull_edges).flatten()
+        atom_rows = torch.cumsum(overfull.long(), dim=0) - 1
+        index_sort_map = (
+            atom_rows[index[edge_positions]] * max_num_neighbors
+            + edge_positions
+            - index_neighbor_offset[index[edge_positions]]
+        )
+        capped_counts = num_neighbors[overfull_atoms]
+        capped_offsets = index_neighbor_offset[overfull_atoms]
+        capped_distances = atom_distance[edge_positions]
+        # Preserve the existing finite filtering when capping is active,
+        # including under-cap rows that no longer enter the padded matrix.
+        mask_num_neighbors = torch.isfinite(atom_distance) & ~overfull_edges
+    else:
+        # Homogeneous over-cap batches still need every row. Avoid filtering
+        # their entire edge list only to select the same distances again.
+        index_sort_map = (
+            index * max_num_neighbors
+            + torch.arange(len(index), device=device)
+            - torch.repeat_interleave(
+                index_neighbor_offset, num_neighbors, output_size=len(index)
+            )
+        )
+        capped_counts = num_neighbors
+        capped_offsets = index_neighbor_offset
+        capped_distances = atom_distance
+        mask_num_neighbors = torch.zeros(len(index), device=device, dtype=bool)
     distance_sort = torch.full(
-        [num_atoms * max_num_neighbors],
+        [len(overfull_atoms) * max_num_neighbors],
         np.inf,
         device=device,
         dtype=atom_distance.dtype,
     )
-
-    # Create an index map to map distances from atom_distance to distance_sort
-    # index_sort_map assumes index to be sorted
-    index_neighbor_offset = torch.cumsum(num_neighbors, dim=0) - num_neighbors
-    index_neighbor_offset_expand = torch.repeat_interleave(
-        index_neighbor_offset, num_neighbors
-    )
-    index_sort_map = (
-        index * max_num_neighbors
-        + torch.arange(len(index), device=device)
-        - index_neighbor_offset_expand
-    )
-    distance_sort.index_copy_(0, index_sort_map, atom_distance)
-    distance_sort = distance_sort.view(num_atoms, max_num_neighbors)
+    distance_sort.index_copy_(0, index_sort_map, capped_distances)
+    distance_sort = distance_sort.view(len(overfull_atoms), max_num_neighbors)
 
     # Sort neighboring atoms based on distance
     distance_sort, index_sort = torch.sort(distance_sort, dim=1)
@@ -168,23 +190,36 @@ def get_max_neighbors_mask(
         distance_sort = distance_sort[:, :max_num_included]
         index_sort = index_sort[:, :max_num_included]
 
-        # Recompute the number of neighbors
-        num_neighbors_thresholded = num_neighbors.clamp(max=num_included_per_atom)
-
+        # Recompute capped rows, retaining under-cap rows without sorting.
+        capped_neighbors = torch.minimum(capped_counts, num_included_per_atom)
+        if has_uncapped_atoms:
+            num_neighbors_thresholded[overfull_atoms] = capped_neighbors
+            # NaNs sort after infinity padding. An under-cap row's old cutoff
+            # is NaN exactly when enough NaNs reach column `cap`; the old
+            # comparison then excludes that whole row. Preserve that case
+            # without its padded distances or a host-side finite check.
+            nan_counts = torch.zeros_like(num_neighbors)
+            nan_counts.scatter_add_(0, index, torch.isnan(atom_distance).long())
+            valid_uncapped = nan_counts < (
+                max_num_neighbors - max_num_neighbors_threshold
+            )
+            if math.isnan(math.inf + degeneracy_tolerance):
+                valid_uncapped.zero_()
+            mask_num_neighbors &= valid_uncapped[index]
+            num_neighbors_thresholded.masked_fill_(~overfull & ~valid_uncapped, 0)
+        else:
+            num_neighbors_thresholded = capped_neighbors
         num_neighbors_image = sum_partitions(num_neighbors_thresholded, image_indptr)
 
     # Offset index_sort so that it indexes into index
-    index_sort = index_sort + index_neighbor_offset.view(-1, 1).expand(
-        -1, max_num_included
-    )
+    index_sort = index_sort + capped_offsets.view(-1, 1).expand(-1, max_num_included)
     # Remove "unused pairs" with infinite distances
     mask_finite = torch.isfinite(distance_sort)
     index_sort = torch.masked_select(index_sort, mask_finite)
 
     # At this point index_sort contains the index into index of the
     # closest max_num_neighbors_threshold neighbors per atom
-    # Create a mask to remove all pairs not in index_sort
-    mask_num_neighbors = torch.zeros(len(index), device=device, dtype=bool)
+    # Add selected capped edges to the already retained under-cap edges.
     mask_num_neighbors.index_fill_(0, index_sort, True)
     return mask_num_neighbors, num_neighbors_image
 
@@ -426,6 +461,14 @@ def radius_graph_pbc_v2(
 
     device = data.pos.device
     batch_size = len(data.natoms)
+    if len(data.pos) == 0 or (
+        hasattr(data, "node_partition") and len(data.node_partition) == 0
+    ):
+        return (
+            torch.empty((2, 0), device=device, dtype=torch.long),
+            data.cell.new_empty((0, 3)),
+            torch.zeros_like(data.natoms, dtype=torch.long),
+        )
     data_batch_idxs = (
         data.batch
         if data.batch is not None
@@ -510,7 +553,10 @@ def radius_graph_pbc_v2(
     # If node_partition exists, this means we want to generate only a partial graph
     # from a subset of target atoms to the entire set of source atoms
     if hasattr(data, "node_partition"):
-        node_partition = data.node_partition
+        # Neighbor capping expects edges grouped by global target index.
+        # Canonicalize a private index tensor without changing the caller's
+        # partition; arbitrary input order otherwise corrupts capped graphs.
+        node_partition, _ = torch.sort(data.node_partition)
         target_atom_pos = atom_pos[node_partition]
         target_atom_image = data_batch_idxs[node_partition]
     else:
@@ -525,10 +571,10 @@ def radius_graph_pbc_v2(
         torch.arange(num_atoms, device=device).long(), num_cells_per_atom
     )
     source_atom_image = data_batch_idxs[source_atom_index]
-    source_atom_pos = atom_pos[source_atom_index]
 
-    # For each atom the index of the PBC cell
-    pbc_cell_index = torch.tensor([], device=device).long()
+    # Concatenate once: repeatedly growing this tensor copies all earlier
+    # systems for every new system in a heterogeneous batch.
+    pbc_cell_indices = []
     offset = 0
     for i in range(batch_size):
         cell_indices = (
@@ -536,16 +582,12 @@ def radius_graph_pbc_v2(
             .repeat(num_atoms_per_image[i])
             .long()
         )
-        pbc_cell_index = torch.cat([pbc_cell_index, cell_indices], dim=0)
+        pbc_cell_indices.append(cell_indices)
         offset = offset + cells_per_image[i]
 
-    # Remember the source cell for later use
-    source_cell = unit_cell[pbc_cell_index]
-
-    # Compute their PBC cell offsets
-    source_pbc_cell_offsets = pbc_cell_offsets[pbc_cell_index]
-    # Add on the PBC cell offsets
-    source_atom_pos = source_atom_pos + source_pbc_cell_offsets
+    pbc_cell_index = torch.cat(pbc_cell_indices)
+    del pbc_cell_indices, cell_indices
+    source_atom_pos = atom_pos[source_atom_index] + pbc_cell_offsets[pbc_cell_index]
 
     # Given the positions of all the atoms has been computed, we
     # split them up using a cubic grid to make pairwise comparisons
@@ -553,56 +595,32 @@ def radius_graph_pbc_v2(
     # is grid_resolution.
 
     # Compute the grid index for each dimension for each atom
-    max_internal_cell = (
-        max(source_atom_pos.abs().max(), target_atom_pos.abs().max()) / grid_resolution
-    )
-    if max_internal_cell > 200:
+    # The source tiles include the unshifted atoms and therefore every target.
+    # One reduction suffices; Python max(tensor, tensor) also synchronizes an
+    # accelerator unnecessarily to compare the two scalar tensors.
+    max_coordinate = source_atom_pos.abs().max()
+    if max_coordinate / grid_resolution > 200:
         box_size_warning(data.cell, data.pos, pbc)
-        grid_resolution = max(
-            grid_resolution,
-            max(source_atom_pos.abs().max(), target_atom_pos.abs().max()) / 200,
-        )
+        grid_resolution = max_coordinate / 200
     source_atom_grid = torch.floor(source_atom_pos / grid_resolution).long()
     target_atom_grid = torch.floor(target_atom_pos / grid_resolution).long()
 
-    # Find the min and max grid index for each image
-    unique_atom_image, num_source_atoms_per_image = torch.unique(
-        source_atom_image, return_counts=True
-    )
-    max_num_source_atoms = torch.max(num_source_atoms_per_image)
-    # Create a new array with size [batch_size, max_num_source_atoms] to hold
-    # the grid indices for each atom. We can then perform max/min on each
-    # image separately.
-    # First, create a mapping from the array of source atoms to the 2D array.
-    source_atom_offset_per_image = torch.cumsum(num_source_atoms_per_image, dim=0).roll(
-        1
-    )
-    source_atom_offset_per_image[0] = 0
-    source_atom_offset_per_image = torch.repeat_interleave(
-        source_atom_offset_per_image, num_source_atoms_per_image, 0
-    )
-    source_atom_mapping = (
-        torch.arange(len(source_atom_offset_per_image), device=device, dtype=torch.long)
-        - source_atom_offset_per_image
-    )
-    source_atom_mapping = (
-        source_atom_mapping
-        + torch.repeat_interleave(unique_atom_image, num_source_atoms_per_image, 0)
-        * max_num_source_atoms
-    )
-
-    # Create 2D array
-    source_atom_grid_per_image = torch.zeros(
-        batch_size * max_num_source_atoms, 3, device=device, dtype=torch.long
-    )
-    # Populate with the grid values
-    source_atom_grid_per_image[source_atom_mapping] = source_atom_grid
-    source_atom_grid_per_image = source_atom_grid_per_image.view(
-        batch_size, max_num_source_atoms, 3
-    )
-    # Perform min and max operations per image
-    grid_min, no_op = torch.min(source_atom_grid_per_image, dim=1)
-    grid_max, no_op = torch.max(source_atom_grid_per_image, dim=1)
+    # Reduce directly into one row per system. Padding all systems to the
+    # largest tiled system wastes memory and includes spurious zero grid
+    # coordinates in the bounds of smaller systems.
+    if batch_size == 1:
+        grid_min = source_atom_grid.amin(dim=0, keepdim=True)
+        grid_max = source_atom_grid.amax(dim=0, keepdim=True)
+    else:
+        image_index = source_atom_image[:, None].expand(-1, 3)
+        grid_min = torch.zeros((batch_size, 3), device=device, dtype=torch.long)
+        grid_max = torch.zeros_like(grid_min)
+        grid_min.scatter_reduce_(
+            0, image_index, source_atom_grid, reduce="amin", include_self=False
+        )
+        grid_max.scatter_reduce_(
+            0, image_index, source_atom_grid, reduce="amax", include_self=False
+        )
 
     # Size of grid in each dimension for each image
     grid_size = grid_max - grid_min + 1
@@ -642,59 +660,14 @@ def radius_graph_pbc_v2(
     )
     target_atom_grid_id = target_atom_grid_id + target_atom_grid_offset
 
-    # Compute a mapping from the array of atoms to a 2D array containing
-    # all the atoms in each grid cell of size [num_grid_cells, max_atoms_per_grid_cell].
-    # Pad each list of atoms for each grid cell so each
-    # list is of the same length - max_atoms_per_grid_cell.
+    # Keep only occupied cells. A dense [all cells, maximum occupancy]
+    # table scales with vacuum volume and the densest cell in any system.
+    # Sorting is unchanged so ties retain the previous source traversal order.
     sort_grid_id, sort_indices = torch.sort(source_atom_grid_id)
-    grid_cell_atom_count = torch.zeros(
-        num_grid_cells, device=device, dtype=source_atom_grid_id.dtype
+    occupied_grid_ids, grid_cell_atom_count = torch.unique_consecutive(
+        sort_grid_id, return_counts=True
     )
-    grid_cell_atom_count.index_add_(
-        0, source_atom_grid_id, torch.ones_like(source_atom_grid_id)
-    )
-
-    # Maximum number of atoms in a grid cell used to pad the array of atoms in each
-    max_atoms_per_grid_cell = torch.max(grid_cell_atom_count)
-
-    # Compute a mapping from the grid cell lists to the atoms in that grid cell
-    cum_sum_grid_cell_atom_count = torch.cumsum(grid_cell_atom_count, 0)
-    cum_sum_grid_cell_atom_count = torch.roll(cum_sum_grid_cell_atom_count, 1, 0)
-    cum_sum_grid_cell_atom_count[0] = 0
-    cum_sum_grid_cell_offset = torch.repeat_interleave(
-        cum_sum_grid_cell_atom_count, grid_cell_atom_count, dim=0
-    )
-    grid_cell_offset = (  # If this OOMs it could be because boxsize is large and PBC is on
-        torch.arange(num_grid_cells, device=device) * max_atoms_per_grid_cell
-    )
-    grid_cell_offset = torch.repeat_interleave(
-        grid_cell_offset, grid_cell_atom_count, dim=0
-    )
-    grid_atom_map = (
-        torch.arange(len(grid_cell_offset), device=device)
-        + grid_cell_offset
-        - cum_sum_grid_cell_offset
-    )
-
-    # If an entry doesn't have an atom, set to a value of -1
-    grid_atom_index = (
-        torch.zeros(
-            num_grid_cells * max_atoms_per_grid_cell, dtype=torch.long, device=device
-        )
-        - 1
-    )
-    # Populate the 2D array with the atom indices
-    grid_atom_index[grid_atom_map] = sort_indices
-    grid_atom_index = grid_atom_index.view(num_grid_cells, max_atoms_per_grid_cell)
-    # Add a Null grid cell to the end
-    grid_atom_index = torch.cat(
-        [
-            grid_atom_index,
-            torch.zeros(max_atoms_per_grid_cell, device=device).view(1, -1).long() - 1,
-        ],
-        dim=0,
-    )
-    null_grid_index = num_grid_cells
+    grid_cell_start = torch.cumsum(grid_cell_atom_count, 0) - grid_cell_atom_count
 
     # How many grid cells do we need to include in each direction given the search radius?
     padding_size = math.floor(radius / grid_resolution) + 1
@@ -711,8 +684,7 @@ def radius_graph_pbc_v2(
     )
     padding_offsets = padding_offsets.unsqueeze(0).repeat(batch_size, 1, 1)
 
-    grid_index = target_atom_grid.view(-1, 1, 3).repeat(1, num_padding_grid_cells, 1)
-    grid_index = grid_index + padding_offsets[target_atom_image]
+    grid_index = target_atom_grid[:, None, :] + padding_offsets[target_atom_image]
     max_index = target_atom_grid_size.view(-1, 1, 3).expand(
         -1, num_padding_grid_cells, -1
     )
@@ -727,34 +699,54 @@ def radius_graph_pbc_v2(
     )
     padding_offsets = torch.sum(padding_offsets, dim=2)
 
-    # For every cell, compute a list of neighboring grid cells.
-    neighboring_grid_cells = target_atom_grid_id.view(-1, 1).repeat(
-        1, num_padding_grid_cells
+    # For each target, preserve cell traversal order while expanding only
+    # actual source atoms, rather than padding every cell to the maximum
+    # occupancy. Out-of-bounds cells use a key above every valid grid id.
+    neighboring_grid_cells = (
+        target_atom_grid_id[:, None] + padding_offsets[target_atom_image]
     )
-    neighboring_grid_cells = neighboring_grid_cells + padding_offsets[target_atom_image]
-
-    # Filter neighboring cells that are out of bounds
-    neighboring_grid_cells.masked_fill_(out_of_bounds, null_grid_index)
-
-    target_atom_edge_index = (
-        torch.arange(len(target_atom_pos), device=device)
-        .view(-1, 1, 1)
-        .repeat(1, num_padding_grid_cells, max_atoms_per_grid_cell)
+    neighboring_grid_cells.masked_fill_(out_of_bounds, num_grid_cells)
+    neighboring_grid_cells = neighboring_grid_cells.reshape(-1)
+    # A direct lookup is faster for compact grids, but cap its size by the
+    # number of tiled atoms so vacuum cannot turn it into a volume allocation.
+    if num_grid_cells <= 4 * len(source_atom_grid_id):
+        cell_to_occupied = torch.full(
+            (num_grid_cells + 1,), -1, device=device, dtype=torch.long
+        )
+        cell_to_occupied[occupied_grid_ids] = torch.arange(
+            len(occupied_grid_ids), device=device
+        )
+        occupied_index = cell_to_occupied[neighboring_grid_cells].clamp(min=0)
+    else:
+        occupied_index = torch.searchsorted(occupied_grid_ids, neighboring_grid_cells)
+        occupied_index = occupied_index.clamp(max=len(occupied_grid_ids) - 1)
+    candidate_counts = torch.where(
+        occupied_grid_ids[occupied_index] == neighboring_grid_cells,
+        grid_cell_atom_count[occupied_index],
+        0,
     )
-    source_atom_edge_index = grid_atom_index[neighboring_grid_cells]
+    candidate_starts = torch.cumsum(candidate_counts, 0) - candidate_counts
+    source_offsets = torch.repeat_interleave(
+        grid_cell_start[occupied_index] - candidate_starts, candidate_counts
+    )
+    source_atom_edge_index = sort_indices[
+        torch.arange(len(source_offsets), device=device) + source_offsets
+    ]
+    target_atom_edge_index = torch.repeat_interleave(
+        torch.arange(len(target_atom_pos), device=device),
+        candidate_counts.view(-1, num_padding_grid_cells).sum(dim=1),
+        output_size=len(source_atom_edge_index),
+    )
 
-    # Remove padded atoms
-    atom_pad_mask = source_atom_edge_index.ne(-1)
-    source_atom_edge_index = torch.masked_select(source_atom_edge_index, atom_pad_mask)
-    target_atom_edge_index = torch.masked_select(target_atom_edge_index, atom_pad_mask)
-
-    # Get the atom positions
-    source_atom_edge_pos = source_atom_pos[source_atom_edge_index]
-    target_atom_edge_pos = target_atom_pos[target_atom_edge_index]
-
-    # Compute their distances
+    # Keep the same distance arithmetic, but release gathered positions after
+    # subtraction instead of retaining both candidate-sized arrays to return.
     atom_distance_sqr = torch.sum(
-        (target_atom_edge_pos - source_atom_edge_pos) ** 2, dim=1
+        (
+            target_atom_pos[target_atom_edge_index]
+            - source_atom_pos[source_atom_edge_index]
+        )
+        ** 2,
+        dim=1,
     )
     # Is the distance within the radius and not 0 (the same atom)
     within_radius_mask = torch.logical_and(
@@ -773,11 +765,7 @@ def radius_graph_pbc_v2(
     source_idx = source_atom_index[source_atom_edge_index]
     target_idx = target_atom_edge_index
     # The cell for each source atom
-    source_cell = source_cell[source_atom_edge_index]
-    # The number of edge per image
-    no_op, num_neighbors_image = torch.unique(
-        source_atom_image[source_atom_edge_index], return_counts=True
-    )
+    source_cell = unit_cell[pbc_cell_index[source_atom_edge_index]]
 
     # Reduce the number of neighbors for each atom to the
     # desired threshold max_num_neighbors_threshold
@@ -786,7 +774,7 @@ def radius_graph_pbc_v2(
     # otherwise the neighbor count will be wrong
     # this will fail the test test_generate_graph_batch_partition in test_radius_graph_pbc.py
     if hasattr(data, "node_partition"):
-        target_idx_for_num_neighbors = data.node_partition[target_idx]
+        target_idx_for_num_neighbors = node_partition[target_idx]
     else:
         target_idx_for_num_neighbors = target_idx
 
@@ -811,6 +799,6 @@ def radius_graph_pbc_v2(
 
     # if we used node_partition, we need to map target indices back to original indices
     if hasattr(data, "node_partition"):
-        edge_index[1] = data.node_partition[edge_index[1]]
+        edge_index[1] = node_partition[edge_index[1]]
 
     return edge_index, source_cell, num_neighbors_image
