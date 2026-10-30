@@ -91,6 +91,15 @@ def _route_head_outputs(head_output, data, dataset_names, wrap_property):
     return full_output
 
 
+def _mole_requires_absolute_composition(model) -> bool:
+    # UMA-S-1.2 includes the initial zero in the composition mean, so its
+    # embedding is sum(atom embeddings) / (natoms + 1). Equal elemental
+    # ratios alone therefore do not imply equal expert mixing coefficients.
+    return getattr(model, "model_id", None) == "UMA-S-1.2" and getattr(
+        model, "use_composition_embedding", False
+    )
+
+
 @registry.register_model("escnmd_moe_backbone")
 class eSCNMDMoeBackbone(eSCNMDBackbone, MOLEInterface):
     def __init__(
@@ -161,6 +170,10 @@ class eSCNMDMoeBackbone(eSCNMDBackbone, MOLEInterface):
         # an FP32 model; the process default dtype can instead round FP64
         # parameters. Neither should change as a side effect of merging.
         new_model = eSCNMDBackbone(**self.parent_kwargs)
+        # The plain backbone must retain the routing semantics used to merge
+        # it: subsequent inputs are checked by the bound consistency methods.
+        new_model.model_id = self.model_id
+        new_model.use_composition_embedding = self.use_composition_embedding
         source_tensors = dict(self.named_parameters()) | dict(self.named_buffers())
         tensor_specs = {
             id(tensor): (source_tensors[name].device, source_tensors[name].dtype)
@@ -291,11 +304,12 @@ class eSCNMDMoeBackbone(eSCNMDBackbone, MOLEInterface):
 
     def _assert_all_mole_info_consistent(self, data) -> None:
         """
-        Assert all systems in the batch have the same reduced composition,
-        charge, spin, and dataset.
+        Assert all systems have compatible composition, charge, spin, and dataset.
 
         Reduced composition is the composition vector divided by the number
         of atoms, so e.g. H2O and H4O2 have the same reduced composition.
+        UMA-S-1.2 additionally requires identical elemental counts because
+        its composition embedding depends on system size.
         """
         num_systems = data.natoms.numel()
         if num_systems <= 1:
@@ -314,6 +328,15 @@ class eSCNMDMoeBackbone(eSCNMDBackbone, MOLEInterface):
             ),
             accumulate=True,
         )
+
+        if (
+            _mole_requires_absolute_composition(self)
+            and not (compositions == compositions[0:1]).all()
+        ):
+            raise MergeMoleConsistencyError(
+                "UMA-S-1.2 requires identical absolute compositions "
+                "when using merge_mole"
+            )
 
         # Normalize to reduced compositions
         reduced = compositions / compositions.sum(dim=1, keepdim=True)
@@ -392,6 +415,13 @@ class eSCNMDMoeBackbone(eSCNMDBackbone, MOLEInterface):
         merged = self._merged_composition
         # Move current tensors to same device as merged (CPU) for comparison
         device = merged[0].device
+
+        if _mole_requires_absolute_composition(self) and not torch.equal(
+            merged[0], current[0].to(device)
+        ):
+            raise MergeMoleConsistencyError(
+                "UMA-S-1.2 absolute composition differs from merged model"
+            )
 
         merged_norm = merged[0].float() / merged[0].sum()
         curr_norm = current[0].float().to(device) / current[0].sum().to(device)
