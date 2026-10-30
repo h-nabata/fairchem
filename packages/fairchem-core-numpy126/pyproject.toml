@@ -9,7 +9,7 @@ license = {text = "MIT License"}
 dynamic = ["version", "readme"]
 requires-python = ">=3.10, <3.14"
 dependencies = [
-    "torch~=2.13.0",
+    "torch>=2.13.0,<2.16",
     # 2.56.1 is the first release whose ray.serve._private.config handles
     # protobuf>=7 removing FieldDescriptor.label; older ray breaks serve.run.
     # Pinning the ray floor keeps that constraint where it belongs instead of
