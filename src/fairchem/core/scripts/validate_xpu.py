@@ -4,7 +4,7 @@ Copyright (c) Meta Platforms, Inc. and affiliates.
 This source code is licensed under the MIT license found in the
 LICENSE file in the root directory of this source tree.
 
-Run FP32 correctness checks and synchronized ASE timings on a real Intel GPU.
+Run FP32 correctness, synchronized ASE timing and allocator-memory checks on XPU.
 
 Example:
     python -m fairchem.core.scripts.validate_xpu --device xpu:0 \
@@ -175,7 +175,22 @@ def finite_difference_stress_check(atoms, stress, step, tolerance):
     }
 
 
-def synchronized_timings(atoms, device, warmup, repeats, stress=False):
+def _xpu_memory_snapshot(device, *, reset_peak=False):
+    """Read actual allocator counters after outstanding device work completes."""
+    torch.xpu.synchronize(device)
+    if reset_peak:
+        torch.xpu.reset_peak_memory_stats(device)
+    return {
+        "allocated_bytes": torch.xpu.memory_allocated(device),
+        "reserved_bytes": torch.xpu.memory_reserved(device),
+        "peak_allocated_bytes": torch.xpu.max_memory_allocated(device),
+        "peak_reserved_bytes": torch.xpu.max_memory_reserved(device),
+    }
+
+
+def synchronized_timings(
+    atoms, device, warmup, repeats, stress=False, *, measure_memory=False
+):
     """
     Time complete ASE energy/force calls including transfers and graph generation.
     """
@@ -184,9 +199,19 @@ def synchronized_timings(atoms, device, warmup, repeats, stress=False):
         if device.type == "xpu":
             torch.xpu.synchronize(device)
 
+    measure_memory = measure_memory and device.type == "xpu"
+    memory = {}
+    if measure_memory:
+        memory["warmup"] = {"before": _xpu_memory_snapshot(device, reset_peak=True)}
     for _ in range(warmup):
         evaluate(atoms, stress)
-    synchronize()
+    if measure_memory:
+        memory["warmup"]["after"] = _xpu_memory_snapshot(device)
+        memory["repeated_evaluation"] = {
+            "before": _xpu_memory_snapshot(device, reset_peak=True)
+        }
+    else:
+        synchronize()
     durations = []
     for _ in range(repeats):
         synchronize()
@@ -194,7 +219,7 @@ def synchronized_timings(atoms, device, warmup, repeats, stress=False):
         evaluate(atoms, stress)
         synchronize()
         durations.append((time.perf_counter() - start) * 1000)
-    return {
+    result = {
         "median_ms": float(np.median(durations)),
         "minimum_ms": min(durations),
         "samples_ms": durations,
@@ -203,6 +228,10 @@ def synchronized_timings(atoms, device, warmup, repeats, stress=False):
             "ASE conversion, graph generation, energy/forces, transfers and output checks"
         ),
     }
+    if measure_memory:
+        memory["repeated_evaluation"]["after"] = _xpu_memory_snapshot(device)
+        result["xpu_memory"] = memory
+    return result
 
 
 def model_tensor_inventory(predictor, device):
@@ -246,12 +275,53 @@ def probe_fp64_reduction(device):
     torch.testing.assert_close(
         gradient.cpu(), torch.tensor([8.0, 4.0, 8.0], dtype=torch.float32)
     )
+    # Stress/virial accumulation uses native multi-dimensional index_add_.
+    # Keep the source strided so the probe also covers the non-contiguous path.
+    multidimensional_source = (
+        torch.arange(1, 19, dtype=torch.float32, device=device)
+        .reshape(3, 2, 3)
+        .transpose(1, 2)
+        .requires_grad_()
+    )
+    multidimensional_reduced = torch.zeros(
+        (2, 3, 2), dtype=torch.float64, device=device
+    ).index_add_(0, indices, multidimensional_source.double())
+    multidimensional_gradient = torch.autograd.grad(
+        multidimensional_reduced.square().sum(), multidimensional_source
+    )[0]
+    torch.testing.assert_close(
+        multidimensional_reduced.cpu(),
+        torch.tensor(
+            [[[14, 20], [16, 22], [18, 24]], [[7, 10], [8, 11], [9, 12]]],
+            dtype=torch.float64,
+        ),
+    )
+    torch.testing.assert_close(
+        multidimensional_gradient.cpu(),
+        torch.tensor(
+            [
+                [[28, 40], [32, 44], [36, 48]],
+                [[14, 20], [16, 22], [18, 24]],
+                [[28, 40], [32, 44], [36, 48]],
+            ],
+            dtype=torch.float32,
+        ),
+    )
     return {
         "passed": True,
         "dtype": str(reduced.dtype),
         "device": str(reduced.device),
         "reduction": reduced.detach().cpu().tolist(),
         "gradient": gradient.detach().cpu().tolist(),
+        "multidimensional": {
+            "passed": True,
+            "dtype": str(multidimensional_reduced.dtype),
+            "device": str(multidimensional_reduced.device),
+            "source_shape": list(multidimensional_source.shape),
+            "source_contiguous": multidimensional_source.is_contiguous(),
+            "reduction": multidimensional_reduced.detach().cpu().tolist(),
+            "gradient": multidimensional_gradient.detach().cpu().tolist(),
+        },
         "note": "FP32 model parameters still require FP64 energy/stress reductions.",
     }
 
@@ -277,48 +347,103 @@ def run_case(args, atoms, task, device, merge_mole, stress=False, progress=None)
         merge_mole=merge_mole,
         compile=args.compile and device.type == "xpu",
     )
-    stage("load_model")
-    predictor = pretrained_mlip.get_predict_unit(
-        args.model, device=str(device), inference_settings=settings
-    )
-    structure = atoms.copy()
-    structure.calc = FAIRChemCalculator(predictor, task_name=task)
-    stage("first_evaluation")
-    if device.type == "xpu":
-        torch.xpu.synchronize(device)
-    start = time.perf_counter()
-    values = evaluate(structure, stress)
-    if device.type == "xpu":
-        torch.xpu.synchronize(device)
-    first_evaluation_seconds = time.perf_counter() - start
-    stage("model_tensor_inventory")
-    result = {
-        "device": str(device),
-        "model_tensor_elements": model_tensor_inventory(predictor, device),
-        "settings": predictor.inference_settings.to_omegaconf(),
-        "first_evaluation_seconds": first_evaluation_seconds,
-        "energy_eV": values["energy"],
-        "forces_eV_per_A": values["forces"].tolist(),
-    }
-    stage("force_finite_difference")
-    result["finite_difference"] = finite_difference_check(
-        structure, values["forces"], args.fd_step, args.fd_tolerance
-    )
-    if stress:
-        result["stress_eV_per_A3"] = values["stress"].tolist()
-        stage("stress_finite_difference")
-        result["stress_finite_difference"] = finite_difference_stress_check(
-            structure, values["stress"], args.stress_fd_step, args.stress_fd_tolerance
+    predictor = structure = None
+    completed = False
+    memory = {}
+    try:
+        stage("load_model")
+        if device.type == "xpu":
+            memory["load_model"] = {
+                "before": _xpu_memory_snapshot(device, reset_peak=True)
+            }
+        predictor = pretrained_mlip.get_predict_unit(
+            args.model, device=str(device), inference_settings=settings
         )
-    stage("timing")
-    result["timing"] = synchronized_timings(
-        structure, device, args.warmup, args.repeats, stress
-    )
-    del structure, predictor
-    gc.collect()
-    if device.type == "xpu":
-        with torch.xpu.device(device):
-            torch.xpu.empty_cache()
+        if device.type == "xpu":
+            memory["load_model"]["after"] = _xpu_memory_snapshot(device)
+        structure = atoms.copy()
+        structure.calc = FAIRChemCalculator(predictor, task_name=task)
+        stage("first_evaluation")
+        if device.type == "xpu":
+            memory["first_evaluation"] = {
+                "before": _xpu_memory_snapshot(device, reset_peak=True)
+            }
+        start = time.perf_counter()
+        values = evaluate(structure, stress)
+        if device.type == "xpu":
+            torch.xpu.synchronize(device)
+        first_evaluation_seconds = time.perf_counter() - start
+        if device.type == "xpu":
+            memory["first_evaluation"]["after"] = _xpu_memory_snapshot(device)
+        stage("model_tensor_inventory")
+        result = {
+            "device": str(device),
+            "model_tensor_elements": model_tensor_inventory(predictor, device),
+            "settings": predictor.inference_settings.to_omegaconf(),
+            "first_evaluation_seconds": first_evaluation_seconds,
+            "energy_eV": values["energy"],
+            "forces_eV_per_A": values["forces"].tolist(),
+        }
+        stage("force_finite_difference")
+        result["finite_difference"] = finite_difference_check(
+            structure, values["forces"], args.fd_step, args.fd_tolerance
+        )
+        if stress:
+            result["stress_eV_per_A3"] = values["stress"].tolist()
+            stage("stress_finite_difference")
+            result["stress_finite_difference"] = finite_difference_stress_check(
+                structure,
+                values["stress"],
+                args.stress_fd_step,
+                args.stress_fd_tolerance,
+            )
+        stage("timing")
+        result["timing"] = synchronized_timings(
+            structure,
+            device,
+            args.warmup,
+            args.repeats,
+            stress,
+            measure_memory=device.type == "xpu",
+        )
+        if device.type == "xpu":
+            memory.update(result["timing"].pop("xpu_memory"))
+            result["xpu_memory"] = {
+                "scope": (
+                    "PyTorch allocator on the selected XPU in this process; "
+                    "excludes CPU and non-PyTorch allocations. Peaks include "
+                    "existing allocations and reserved cached blocks at each "
+                    "window's start and are reset before each window. First "
+                    "evaluation includes lazy GPU transfer, model "
+                    "preparation and optional compilation. Memory queries are "
+                    "outside timed intervals."
+                ),
+                "windows": memory,
+            }
+        completed = True
+    finally:
+        # Detach the copied structure's calculator even when evaluation fails.
+        # Only this case's references are released; the caller's Atoms is intact.
+        if completed:
+            stage("cleanup")
+        if structure is not None:
+            structure.calc = None
+        predictor = structure = None
+        gc.collect()
+        if device.type == "xpu":
+            try:
+                with torch.xpu.device(device):
+                    torch.xpu.empty_cache()
+            except Exception as error:
+                # A failing driver can also reject cleanup. Preserve the
+                # original inference error and its stage in that situation.
+                if completed:
+                    raise
+                if progress is not None:
+                    progress["cleanup_error"] = {
+                        "type": type(error).__name__,
+                        "message": str(error),
+                    }
     stage("complete")
     return values, result
 

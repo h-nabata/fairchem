@@ -8,6 +8,7 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import ClassVar
 from unittest.mock import Mock
@@ -21,6 +22,7 @@ from ase.stress import full_3x3_to_voigt_6_stress
 
 from fairchem.core.scripts.validate_xpu import (
     _json_safe,
+    _xpu_memory_snapshot,
     compare_predictions,
     evaluate,
     finite_difference_check,
@@ -97,6 +99,110 @@ def test_benchmark_does_not_measure_ase_cache_and_synchronizes(monkeypatch):
     synchronize.assert_called_with(torch.device("xpu:1"))
     assert len(result["samples_ms"]) == 3
     assert result["minimum_ms"] >= 0
+
+
+def test_xpu_memory_snapshot_synchronizes_resets_and_reads_selected_device(
+    monkeypatch,
+):
+    events = []
+    selected = torch.device("xpu:1")
+
+    def record(name, result=None):
+        def call(device):
+            assert device == selected
+            events.append(name)
+            return result
+
+        return call
+
+    monkeypatch.setattr(torch.xpu, "synchronize", record("synchronize"))
+    monkeypatch.setattr(torch.xpu, "reset_peak_memory_stats", record("reset_peak"))
+    for name, value in (
+        ("memory_allocated", 100),
+        ("memory_reserved", 200),
+        ("max_memory_allocated", 150),
+        ("max_memory_reserved", 250),
+    ):
+        monkeypatch.setattr(torch.xpu, name, record(name, value))
+
+    assert _xpu_memory_snapshot(selected, reset_peak=True) == {
+        "allocated_bytes": 100,
+        "reserved_bytes": 200,
+        "peak_allocated_bytes": 150,
+        "peak_reserved_bytes": 250,
+    }
+    assert events == [
+        "synchronize",
+        "reset_peak",
+        "memory_allocated",
+        "memory_reserved",
+        "max_memory_allocated",
+        "max_memory_reserved",
+    ]
+
+
+def test_timing_memory_windows_exclude_queries_from_timed_calls(monkeypatch):
+    from fairchem.core.scripts import validate_xpu
+
+    atoms = harmonic_atoms()
+    events = []
+    original_evaluate = evaluate
+
+    def prediction(*args):
+        events.append("evaluate")
+        return original_evaluate(*args)
+
+    def snapshot(device, *, reset_peak=False):
+        assert device == torch.device("xpu:1")
+        events.append("reset_and_read" if reset_peak else "read")
+        return {"allocated_bytes": 100, "peak_allocated_bytes": 150}
+
+    monkeypatch.setattr(validate_xpu, "_xpu_memory_snapshot", snapshot)
+    monkeypatch.setattr(validate_xpu, "evaluate", prediction)
+    monkeypatch.setattr(torch.xpu, "synchronize", lambda _: events.append("sync"))
+    monkeypatch.setattr(
+        validate_xpu.time, "perf_counter", lambda: events.append("clock") or 0.0
+    )
+    clear_cache = Mock()
+    monkeypatch.setattr(torch.xpu, "empty_cache", clear_cache)
+    report = synchronized_timings(
+        atoms, torch.device("xpu:1"), 1, 2, measure_memory=True
+    )
+    assert events == [
+        "reset_and_read",
+        "evaluate",
+        "read",
+        "reset_and_read",
+        "sync",
+        "clock",
+        "evaluate",
+        "sync",
+        "clock",
+        "sync",
+        "clock",
+        "evaluate",
+        "sync",
+        "clock",
+        "read",
+    ]
+    assert set(report["xpu_memory"]) == {"warmup", "repeated_evaluation"}
+    assert report["xpu_memory"]["repeated_evaluation"]["after"] == {
+        "allocated_bytes": 100,
+        "peak_allocated_bytes": 150,
+    }
+    clear_cache.assert_not_called()
+
+
+def test_cpu_timings_do_not_fabricate_xpu_memory(monkeypatch):
+    from fairchem.core.scripts import validate_xpu
+
+    read_memory = Mock(side_effect=AssertionError("XPU memory queried for CPU"))
+    monkeypatch.setattr(validate_xpu, "_xpu_memory_snapshot", read_memory)
+    report = synchronized_timings(
+        harmonic_atoms(), torch.device("cpu"), 0, 1, measure_memory=True
+    )
+    assert "xpu_memory" not in report
+    read_memory.assert_not_called()
 
 
 def test_stress_finite_difference_checks_shear_and_restores_cell():
@@ -194,6 +300,26 @@ def test_fp64_probe_math_on_cpu():
     assert result["gradient"] == [8.0, 4.0, 8.0]
 
 
+def test_multidimensional_fp64_probe_math_on_cpu():
+    # Known per-system sums and their squared-loss gradients verify this
+    # diagnostic's arithmetic; running on CPU does not test XPU kernels.
+    result = probe_fp64_reduction(torch.device("cpu"))["multidimensional"]
+    assert result["passed"]
+    assert result["dtype"] == "torch.float64"
+    assert result["device"] == "cpu"
+    assert result["source_shape"] == [3, 3, 2]
+    assert not result["source_contiguous"]
+    assert result["reduction"] == [
+        [[14, 20], [16, 22], [18, 24]],
+        [[7, 10], [8, 11], [9, 12]],
+    ]
+    assert result["gradient"] == [
+        [[28, 40], [32, 44], [36, 48]],
+        [[14, 20], [16, 22], [18, 24]],
+        [[28, 40], [32, 44], [36, 48]],
+    ]
+
+
 def test_case_reporting_with_synthetic_calculator(monkeypatch):
     import fairchem.core
 
@@ -221,6 +347,166 @@ def test_case_reporting_with_synthetic_calculator(monkeypatch):
     assert report["settings"]["base_precision_dtype"] == "float32"
     assert report["finite_difference"]["passed"]
     assert report["first_evaluation_seconds"] >= 0
+    assert "xpu_memory" not in report
+
+
+def _case_test_setup(monkeypatch):
+    import fairchem.core
+    from fairchem.core.scripts import validate_xpu
+
+    monkeypatch.setattr(
+        fairchem.core.pretrained_mlip,
+        "get_predict_unit",
+        lambda model, device, inference_settings: SimpleNamespace(
+            model=torch.nn.Linear(2, 1), inference_settings=inference_settings
+        ),
+    )
+    monkeypatch.setattr(
+        fairchem.core, "FAIRChemCalculator", lambda *a, **kw: HarmonicCalculator()
+    )
+    monkeypatch.setattr(validate_xpu, "model_tensor_inventory", lambda *a: {})
+    monkeypatch.setattr(torch.xpu, "synchronize", lambda _: None)
+    monkeypatch.setattr(torch.xpu, "device", lambda _: nullcontext())
+    return SimpleNamespace(
+        model="synthetic",
+        compile=False,
+        fd_step=0.005,
+        fd_tolerance=1e-9,
+        warmup=1,
+        repeats=2,
+    )
+
+
+def test_case_reports_distinct_load_first_warmup_and_repeated_memory(monkeypatch):
+    from fairchem.core.scripts import validate_xpu
+
+    args = _case_test_setup(monkeypatch)
+    snapshots = []
+
+    def snapshot(device, *, reset_peak=False):
+        assert device == torch.device("xpu:1")
+        snapshots.append(reset_peak)
+        return {"allocated_bytes": len(snapshots)}
+
+    monkeypatch.setattr(validate_xpu, "_xpu_memory_snapshot", snapshot)
+    clear_cache = Mock()
+    monkeypatch.setattr(torch.xpu, "empty_cache", clear_cache)
+    atoms = harmonic_atoms()
+    original_calculator = atoms.calc
+    _, report = run_case(args, atoms, "omol", torch.device("xpu:1"), False)
+    assert atoms.calc is original_calculator
+    assert snapshots == [True, False] * 4
+    windows = report["xpu_memory"]["windows"]
+    assert list(windows) == [
+        "load_model",
+        "first_evaluation",
+        "warmup",
+        "repeated_evaluation",
+    ]
+    assert windows["load_model"]["after"]["allocated_bytes"] == 2
+    assert windows["first_evaluation"]["after"]["allocated_bytes"] == 4
+    assert windows["warmup"]["after"]["allocated_bytes"] == 6
+    assert windows["repeated_evaluation"]["after"]["allocated_bytes"] == 8
+    assert "xpu_memory" not in report["timing"]
+    assert "excludes CPU and non-PyTorch allocations" in report["xpu_memory"]["scope"]
+    clear_cache.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "failure_stage",
+    ["load_model", "first_evaluation", "force_finite_difference", "timing"],
+)
+def test_case_failure_releases_owned_calculator_and_runs_cleanup(
+    monkeypatch, failure_stage
+):
+    import fairchem.core
+    from fairchem.core.scripts import validate_xpu
+
+    args = _case_test_setup(monkeypatch)
+    monkeypatch.setattr(validate_xpu, "_xpu_memory_snapshot", lambda *a, **kw: {})
+    clear_cache = Mock()
+    monkeypatch.setattr(torch.xpu, "empty_cache", clear_cache)
+    collected = Mock()
+    monkeypatch.setattr(validate_xpu.gc, "collect", collected)
+    copied_structures = []
+    original_evaluate = evaluate
+
+    def prediction(atoms, *args):
+        copied_structures.append(atoms)
+        if failure_stage == "first_evaluation":
+            raise RuntimeError("synthetic failure")
+        return original_evaluate(atoms, *args)
+
+    monkeypatch.setattr(validate_xpu, "evaluate", prediction)
+    failing = Mock(side_effect=RuntimeError("synthetic failure"))
+    if failure_stage == "load_model":
+        monkeypatch.setattr(fairchem.core.pretrained_mlip, "get_predict_unit", failing)
+    elif failure_stage == "force_finite_difference":
+        monkeypatch.setattr(validate_xpu, "finite_difference_check", failing)
+    elif failure_stage == "timing":
+        monkeypatch.setattr(validate_xpu, "synchronized_timings", failing)
+    atoms = harmonic_atoms()
+    original_calculator = atoms.calc
+    progress = {}
+    with pytest.raises(RuntimeError, match="synthetic failure"):
+        run_case(args, atoms, "omol", torch.device("xpu:1"), False, progress=progress)
+    assert atoms.calc is original_calculator
+    assert all(structure.calc is None for structure in copied_structures)
+    assert progress["stage"] == failure_stage
+    clear_cache.assert_called_once_with()
+    collected.assert_called_once_with()
+
+
+def test_cleanup_failure_preserves_original_error_and_stage(monkeypatch):
+    import fairchem.core
+    from fairchem.core.scripts import validate_xpu
+
+    args = _case_test_setup(monkeypatch)
+    monkeypatch.setattr(validate_xpu, "_xpu_memory_snapshot", lambda *a, **kw: {})
+    monkeypatch.setattr(
+        fairchem.core.pretrained_mlip,
+        "get_predict_unit",
+        Mock(side_effect=RuntimeError("original load error")),
+    )
+    monkeypatch.setattr(
+        torch.xpu, "empty_cache", Mock(side_effect=RuntimeError("cleanup failure"))
+    )
+    progress = {}
+    with pytest.raises(RuntimeError, match="original load error"):
+        run_case(
+            args,
+            harmonic_atoms(),
+            "omol",
+            torch.device("xpu:1"),
+            False,
+            progress=progress,
+        )
+    assert progress["stage"] == "load_model"
+    assert progress["cleanup_error"] == {
+        "type": "RuntimeError",
+        "message": "cleanup failure",
+    }
+
+
+def test_cleanup_failure_after_success_is_reported_as_cleanup(monkeypatch):
+    from fairchem.core.scripts import validate_xpu
+
+    args = _case_test_setup(monkeypatch)
+    monkeypatch.setattr(validate_xpu, "_xpu_memory_snapshot", lambda *a, **kw: {})
+    monkeypatch.setattr(
+        torch.xpu, "empty_cache", Mock(side_effect=RuntimeError("cleanup failure"))
+    )
+    progress = {}
+    with pytest.raises(RuntimeError, match="cleanup failure"):
+        run_case(
+            args,
+            harmonic_atoms(),
+            "omol",
+            torch.device("xpu:1"),
+            False,
+            progress=progress,
+        )
+    assert progress["stage"] == "cleanup"
 
 
 def test_periodic_case_reports_stress_finite_differences(monkeypatch):

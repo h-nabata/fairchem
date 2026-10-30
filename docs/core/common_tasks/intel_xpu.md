@@ -86,10 +86,10 @@ and their gradients rather than silently reducing their precision. The
 validation script probes FP64 `index_add` and its backward operation as well
 as reporting the device's `has_fp64` property when available.
 
-This is not an end-to-end FP64 network implementation. In particular, existing
-MoLE merge constructors create new layers at the default dtype; selecting an
-FP64 base dtype does not establish full FP64 fidelity during merging. The
-FP32 network path and its intentional FP64 accumulations are the target here.
+MoLE merging now preserves the loaded parameter and buffer dtypes, including
+mixed FP32/FP64 buffers. Synthetic CPU FP64 merged/unmerged calculations are
+covered by regression tests. The supported XPU network precision remains
+FP32; those CPU checks do not establish full FP64 network support on Intel GPUs.
 
 ## Hardware acceptance test
 
@@ -116,6 +116,21 @@ Warmup and repeated timings are separate. Tolerances are numerical acceptance
 criteria for these small tests, not the model's error relative to DFT.
 The JSON records command options and, on an exception, `active_check` identifies
 the structure, device, merge setting and failing stage.
+
+Each XPU case also records `xpu_memory.windows` for model loading, first
+evaluation, warmup and repeated evaluation. Synchronized snapshots give
+allocated/reserved bytes and their peaks, with peaks reset before each window.
+These counters cover this process's PyTorch allocator on the selected GPU,
+including allocations already present at the window's start. They exclude
+CPU memory, other processes and non-PyTorch allocations. Model preparation and
+the first GPU transfer are lazy, so the first-evaluation window can be much
+larger than the loading window. Counter reads are outside the timed interval;
+the cache is not flushed between timed repetitions.
+
+On failure the tool releases its own calculator/predictor references and
+attempts to release unused cached blocks. It records cleanup errors separately
+from the original failure. Live tensors retained by exception tracebacks are
+not guaranteed to be freed until those exceptions are handled.
 
 The default cases are a molecule and a small distorted periodic crystal.
 They do not establish production suitability for large slabs, long molecular
@@ -183,6 +198,30 @@ required. FakeTensor checks test device/shape/dtype propagation, not Intel
 kernel execution. Real-XPU tests are skipped on CPU-only hosts.
 The [source-audit validation record](intel_xpu_validation.md) lists the exact
 test selections, results and remaining coverage gaps.
+
+## Portable performance and memory changes
+
+The general PyTorch path now gathers Wigner coefficients directly instead of
+multiplying by two dense permutation matrices. Graph v2 stores occupied cells
+and expands actual candidate counts rather than padding every cell to the
+densest cell. Compact grids use a bounded direct lookup; sparse grids use a
+search over occupied cell IDs.
+Neighbor limiting sorts only atoms above the configured cap, avoiding a
+distance table padded to the maximum degree for every atom in an unequal batch.
+The existing strict/non-strict and degeneracy rules are preserved.
+
+Unmerged MoLE checkpoint chunks mix only the systems they touch. Single-system
+outputs avoid redundant concatenation, and dataset routing reuses masks on the
+output device. Input tensors are privately copied with device/dtype conversion
+in one operation, without moving the caller's batch in place. Recoverable
+fallbacks release failed-model references before allocating a replacement.
+
+The merged `xpu` preset bypasses unmerged MoLE work during ordinary repeated
+evaluation; chunk-specific gains apply to unmerged/batched or checkpointed
+paths. These changes remove identified allocations and operations, but their
+combined B70 latency and peak-memory effect still require hardware measurement.
+The [performance audit](intel_xpu_performance.md) documents allocation metrics,
+regression coverage and derivative fixes.
 
 ## Upstream scope
 

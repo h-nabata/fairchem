@@ -4,6 +4,9 @@ Date: 2026-10-30. This second audit builds on fork commit
 `3b071a757edc8ceb9f27ded0322f384b87d8c781` and upstream source
 `1d408a1138ddfb76e0a9d64e2e055d73339fbeba`.
 
+The subsequent [performance and memory audit](intel_xpu_performance.md)
+records later changes and validation, including the CPU FP64 merge-fidelity fix.
+
 The test host used Python 3.12.14 and PyTorch 2.15.0+cpu. No Intel or NVIDIA
 GPU execution, downloaded UMA checkpoint, or B70 timing is represented below.
 See [the XPU guide](intel_xpu.md) for setup, hardware acceptance commands and
