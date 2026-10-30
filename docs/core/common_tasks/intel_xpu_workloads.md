@@ -27,7 +27,10 @@ frames = read("structures.xyz", index=":")
 for atoms in frames:
     atoms.info.setdefault("charge", 0)
     atoms.info.setdefault("spin", 1)
-structures = [AtomicData.from_ase(atoms, task_name="omol") for atoms in frames]
+structures = [
+    AtomicData.from_ase(atoms, task_name="omol", r_data_keys=["charge", "spin"])
+    for atoms in frames
+]
 predictor = pretrained_mlip.get_predict_unit(
     "uma-s-1p2", device="xpu:0", inference_settings="batch"
 )
@@ -56,11 +59,17 @@ estimate. Supplying `max_edges` without counts in this case raises an error.
 Estimated counts are planning hints, not a guarantee of model peak memory. Peak
 memory also depends on channels, derivatives, checkpointing and actual graphs.
 
-The default output layouts cover energy, force, stress, charges, magnetic moments
-and Hessian-vector products. Additional outputs require an explicit mapping,
-for example `property_levels={"descriptor": "atom"}`. A whole-batch dense
-Hessian must not be represented as independent per-system output without an
-appropriate model API.
+The default output layouts cover energy, force, stress, charges, magnetic moments,
+embeddings, dense Hessians and Hessian-vector products. Explicit dense-Hessian
+requests are scheduled one structure at a time because the conservative UMA head
+supports one system per full Hessian. Hessian-vector inputs remain attached to
+their own structures when batches are assembled. Additional outputs require an
+explicit mapping, for example `property_levels={"descriptor": "atom"}`.
+
+The runner owns private input copies for singleton and multi-structure calls, so
+a wrapped predictor cannot overwrite the caller's coordinates or metadata.
+Calls through one runner are serialized. Per-input requested properties remain
+separate; an explicit runner-level request overrides those input requests.
 
 ## Reusable input staging
 
@@ -84,7 +93,12 @@ can therefore reserve up to four times that amount across host and device.
 Staging preserves input dtypes. It rejects differentiable or GPU-resident inputs;
 those should use the normal/resident prediction path. The predictor can still
 compute conservative forces because it creates private differentiable inputs.
-Each worker needs its own stager. The stager is not a concurrent shared queue.
+Each worker needs its own stager. Lifecycle operations are serialized, but leases
+still have explicit ownership: callers must release every lease before closing.
+Copying or pickling an idle stager transfers its configuration and creates fresh
+locks, streams and empty buffer slots; copying an active lease is rejected.
+The predictor and any custom metadata must themselves support the chosen transfer
+mechanism when copying a whole runner.
 
 When using `stage()` directly, consume it with a context manager and retain only
 outputs that own their storage:
@@ -130,8 +144,10 @@ with IndependentDevicePool(
 
 Outputs remain on the worker's device. Two 32 GB devices do not become one 64 GB
 allocation. For asynchronous jobs, use `future = pool.submit(structures)` and
-`future.result()`. Input objects must remain unchanged until their future is
-complete. Worker completion waits for its GPU event, so returned tensors are
+`future.result()`. Submission takes an owned snapshot of coordinates, tensors
+and metadata before returning; later caller edits cannot alter a queued job.
+Queued snapshots consume memory, so callers should bound outstanding futures.
+Worker completion waits for its GPU event, so returned tensors are
 ready even when the caller selects another stream. Different devices still
 compute concurrently. Exceptions propagate to the caller; cancelled queued jobs release
 their scheduling load. The context manager waits for running work and releases

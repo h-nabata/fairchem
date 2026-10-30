@@ -120,11 +120,26 @@ def test_model_spec_rejects_unknown_preset_at_construction():
         ModelSpec(checkpoint="x", inference_settings="nonsense")
 
 
-def test_model_spec_model_id_is_stable():
-    # model_id hashes every InferenceSettings field, so this value changes
-    # intentionally whenever a setting or the default preset changes (here:
-    # ModelSpec's default became the batch preset).
-    assert ModelSpec("x").model_id == "x-7c7bf9215488"
+def test_model_spec_model_id_is_stable_across_order_and_sensitive_to_config():
+    # Identity must track the complete current configuration, including future
+    # settings, rather than a digest tied to one historical set of defaults.
+    overrides = {"backbone": {"max_neighbors": 64, "otf_graph": True}}
+    reordered = {"backbone": {"otf_graph": True, "max_neighbors": 64}}
+    changed = {"backbone": {"otf_graph": True, "max_neighbors": 128}}
+    first = ModelSpec("x", overrides=overrides, source="registry")
+
+    assert (
+        first.model_id
+        == ModelSpec("x", overrides=reordered, source="registry").model_id
+    )
+    assert first.model_id == pickle.loads(pickle.dumps(first)).model_id
+    assert (
+        first.model_id != ModelSpec("x", overrides=changed, source="registry").model_id
+    )
+    assert (
+        first.model_id
+        != ModelSpec("y", overrides=overrides, source="registry").model_id
+    )
 
 
 def test_model_spec_auto_source_does_not_alias_registry_model():

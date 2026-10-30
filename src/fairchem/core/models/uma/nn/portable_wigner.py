@@ -107,6 +107,7 @@ class CSRTopology:
     offsets: torch.Tensor
     index32: bool
     ready_event: object | None = None
+    owner_snapshot: torch.Tensor | None = None
 
     def wait_on_current_stream(self):
         if self.ready_event is None:
@@ -123,8 +124,10 @@ class CSRTopologyCache:
     Bounded cache whose source ownership prevents allocator-address reuse hits.
 
     Only integer topology is cached. In-place Tensor operations invalidate
-    entries through the version counter. As with autograd, writes through
-    ``.data`` or foreign memory that bypass version tracking are unsupported.
+    entries through the version counter. CPU topology also owns a value snapshot
+    because a NumPy view can change integer indices without updating that counter.
+    Foreign writes to accelerator memory still require caller synchronization and
+    the normal PyTorch mutation/version protocol.
     Inference tensors without a version counter are deliberately not cached.
     """
 
@@ -149,7 +152,9 @@ class CSRTopologyCache:
                 topology.order,
                 topology.lengths,
                 topology.offsets,
+                topology.owner_snapshot,
             )
+            if t is not None
         )
 
     def get(self, target, num_nodes):
@@ -173,11 +178,15 @@ class CSRTopologyCache:
         )
         with self._lock:
             if version is not None and key in self._entries:
-                self.hits += 1
-                self._entries.move_to_end(key)
                 topology = self._entries[key]
-                topology.wait_on_current_stream()
-                return topology
+                if topology.owner_snapshot is None or torch.equal(
+                    topology.owner_snapshot, target
+                ):
+                    self.hits += 1
+                    self._entries.move_to_end(key)
+                    topology.wait_on_current_stream()
+                    return topology
+                del self._entries[key]
             self.misses += 1
             if target.numel() and not bool(
                 ((target >= 0) & (target < num_nodes)).all()
@@ -191,6 +200,8 @@ class CSRTopologyCache:
                 order = order.to(torch.int32)
                 offsets = offsets.to(torch.int32)
             topology = CSRTopology(target, order, lengths, offsets, index32)
+            if target.device.type == "cpu":
+                topology.owner_snapshot = target.detach().clone()
             if target.device.type in {"cuda", "xpu"}:
                 accelerator = getattr(torch, target.device.type)
                 topology.ready_event = accelerator.Event()
@@ -253,6 +264,10 @@ def segmented_sum(values, target, num_nodes):
     """
     Sum existing dtype values by target without a global-prefix subtraction.
     """
+    if target.ndim != 1 or values.ndim < 1 or values.shape[0] != target.numel():
+        raise ValueError(
+            "Segment values and target indices must have the same leading length"
+        )
     if torch.compiler.is_compiling() or values.device.type == "xpu":
         # segment_reduce kernel coverage varies across XPU releases. The XPU
         # fused consumer below owns CSR rows; this reference retains index_add.
@@ -263,7 +278,11 @@ def segmented_sum(values, target, num_nodes):
     if not values.shape[0]:
         return values.new_zeros((num_nodes,) + values.shape[1:]) + values.sum() * 0
     return _SegmentSum.apply(
-        values, target, topology.order, topology.lengths, num_nodes
+        values,
+        topology.owner_snapshot if topology.owner_snapshot is not None else target,
+        topology.order,
+        topology.lengths,
+        num_nodes,
     )
 
 

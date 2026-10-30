@@ -44,9 +44,12 @@ def test_cached_metadata_refreshes_geometry_without_revalidation(periodic, monke
     def forbidden(*args, **kwargs):
         raise AssertionError("Static metadata was unnecessarily reconstructed")
 
-    monkeypatch.setattr(torchsim_interface, "_simstate_to_atomicdata_batch", forbidden)
-    monkeypatch.setattr(torch, "bincount", forbidden)
-    second = converter(state, "omol", torch.float32)
+    with monkeypatch.context() as conversion_patch:
+        conversion_patch.setattr(
+            torchsim_interface, "_simstate_to_atomicdata_batch", forbidden
+        )
+        conversion_patch.setattr(torch, "bincount", forbidden)
+        second = converter(state, "omol", torch.float32)
     torch.testing.assert_close(second.pos, expected.pos)
     torch.testing.assert_close(second.cell, expected.cell)
     torch.testing.assert_close(first.pos, first_position)

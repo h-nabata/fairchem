@@ -10,6 +10,8 @@ from __future__ import annotations
 import copy
 from contextlib import nullcontext
 from dataclasses import dataclass, field
+from numbers import Integral
+from threading import RLock
 from typing import TYPE_CHECKING
 
 import torch
@@ -27,15 +29,18 @@ def device_scope(device: torch.device):
     return getattr(torch, device.type).device(device)
 
 
-def _tensors(value, path=()):
+def _tensors(value, path=(), seen=None):
+    if seen is None:
+        seen = set()
     if isinstance(value, torch.Tensor):
         yield path, value
-    elif isinstance(value, dict):
-        for key, item in value.items():
-            yield from _tensors(item, (*path, key))
-    elif isinstance(value, (list, tuple)):
-        for index, item in enumerate(value):
-            yield from _tensors(item, (*path, index))
+    elif isinstance(value, (dict, list, tuple)):
+        if id(value) in seen:
+            return
+        seen.add(id(value))
+        items = value.items() if isinstance(value, dict) else enumerate(value)
+        for key, item in items:
+            yield from _tensors(item, (*path, key), seen)
 
 
 @dataclass
@@ -65,6 +70,10 @@ class StagedBatch:
         self._consumer_streams = []
 
     def wait(self) -> AtomicData:
+        with self._owner._lock:
+            return self._wait()
+
+    def _wait(self):
         if self._released:
             raise RuntimeError("The staged batch has already been released")
         if self._owner.device.type != "cpu":
@@ -81,6 +90,10 @@ class StagedBatch:
         return self._batch
 
     def release(self) -> None:
+        with self._owner._lock:
+            self._release()
+
+    def _release(self):
         if self._released:
             return
         # Also order release after the copy when the caller never entered/waited.
@@ -106,7 +119,12 @@ class StagedBatch:
         return self.wait()
 
     def __exit__(self, exc_type, exc_value, traceback):
-        self.release()
+        try:
+            self.release()
+        except Exception as error:
+            if exc_value is None:
+                raise
+            exc_value.add_note(f"Staged batch release failed: {error}")
 
 
 class DeviceBatchStager:
@@ -142,10 +160,14 @@ class DeviceBatchStager:
             raise ValueError("Staging supports CPU, CUDA and XPU devices")
         if self.device.type != "cpu" and self.device.index is None:
             raise ValueError("Specify an explicit accelerator ordinal, e.g. xpu:0")
-        if slots < 1 or max_batch_bytes < 1:
-            raise ValueError("slots and max_batch_bytes must be positive")
-        self.max_batch_bytes = max_batch_bytes
-        self._slots = [_Slot() for _ in range(slots)]
+        if any(
+            isinstance(v, bool) or not isinstance(v, Integral) or v < 1
+            for v in (slots, max_batch_bytes)
+        ):
+            raise ValueError("slots and max_batch_bytes must be positive integers")
+        self.max_batch_bytes = int(max_batch_bytes)
+        self._slots = [_Slot() for _ in range(int(slots))]
+        self._lock = RLock()
         self._next = 0
         self._backend = None
         self._copy_stream = None
@@ -160,14 +182,32 @@ class DeviceBatchStager:
     def slots(self) -> int:
         return len(self._slots)
 
+    def __getstate__(self):
+        with self._lock:
+            if any(slot.leased for slot in self._slots):
+                raise RuntimeError(
+                    "Release all staged batches before copying staging configuration"
+                )
+            # Streams, events and reusable storage belong to the originating
+            # worker. A copied/pickled stager starts with independent slots.
+            return {
+                "device": self.device,
+                "slots": self.slots,
+                "max_batch_bytes": self.max_batch_bytes,
+            }
+
+    def __setstate__(self, state):
+        self.__init__(**state)
+
     @property
     def allocated_bytes(self) -> int:
-        return sum(
-            tensor.numel() * tensor.element_size()
-            for slot in self._slots
-            for buffers in (slot.host, slot.target)
-            for tensor in buffers.values()
-        )
+        with self._lock:
+            return sum(
+                tensor.numel() * tensor.element_size()
+                for slot in self._slots
+                for buffers in (slot.host, slot.target)
+                for tensor in buffers.values()
+            )
 
     def _slot(self) -> _Slot:
         for offset in range(len(self._slots)):
@@ -186,6 +226,10 @@ class DeviceBatchStager:
         """
         Own the CPU input and enqueue its transfer without changing its dtype.
         """
+        with self._lock:
+            return self._stage(batch)
+
+    def _stage(self, batch):
         unique = {}
         for path, tensor in _tensors(vars(batch)):
             unique.setdefault(id(tensor), (path, tensor))
@@ -259,23 +303,34 @@ class DeviceBatchStager:
                 if self._backend is not None:
                     slot.ready = self._backend.Event()
                     slot.ready.record(self._copy_stream)
-        except Exception:
+        except BaseException:
             if self._copy_stream is not None:
                 try:
                     self._copy_stream.synchronize()
-                except Exception:
+                    slot.ready = None
+                except BaseException:
                     # A failed stream cannot establish safe reuse. Quarantine
                     # this slot rather than overwriting an in-flight input.
                     slot.leased = True
             raise
-        result = copy.deepcopy(batch, memo)
         slot.leased = True
+        try:
+            result = copy.deepcopy(batch, memo)
+        except BaseException:
+            # A failed metadata copy has no consumer. Keep the ready event so
+            # later reuse still waits for the already queued transfer.
+            slot.leased = False
+            raise
         return StagedBatch(self, slot, result)
 
     def close(self) -> None:
         """
         Wait for pending consumers and release cached buffer capacity.
         """
+        with self._lock:
+            self._close()
+
+    def _close(self):
         if any(slot.leased for slot in self._slots):
             raise RuntimeError("Release all staged batches before closing")
         for slot in self._slots:

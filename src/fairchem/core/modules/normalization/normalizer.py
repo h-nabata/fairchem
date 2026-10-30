@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import warnings
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -29,6 +29,23 @@ if TYPE_CHECKING:
     from fairchem.core.modules.normalization.element_references import LinearReferences
 
 
+def _normalization_tensor(value, name: str) -> torch.Tensor:
+    """
+    Own constant statistics without truncating floating input precision.
+    """
+    try:
+        tensor = torch.as_tensor(value)
+    except (TypeError, ValueError, RuntimeError) as error:
+        raise TypeError(f"Normalizer {name} must contain real numbers") from error
+    if tensor.dtype == torch.bool or tensor.is_complex():
+        raise TypeError(
+            f"Normalizer {name} must contain real numbers, not bool/complex"
+        )
+    if not tensor.is_floating_point():
+        tensor = tensor.to(torch.get_default_dtype())
+    return tensor.detach().clone()
+
+
 class Normalizer(nn.Module):
     """Normalize/denormalize a tensor and optionally add a atom reference offset."""
 
@@ -40,13 +57,8 @@ class Normalizer(nn.Module):
         """tensor is taken as a sample to calculate the mean and rmsd"""
         super().__init__()
 
-        if isinstance(mean, float):
-            mean = torch.tensor(mean)
-        if isinstance(rmsd, float):
-            rmsd = torch.tensor(rmsd)
-
-        self.register_buffer(name="mean", tensor=mean)
-        self.register_buffer(name="rmsd", tensor=rmsd)
+        self.register_buffer(name="mean", tensor=_normalization_tensor(mean, "mean"))
+        self.register_buffer(name="rmsd", tensor=_normalization_tensor(rmsd, "rmsd"))
 
     @torch.autocast(device_type="cuda", enabled=False)
     @torch.autocast(device_type="cpu", enabled=False)
@@ -64,12 +76,18 @@ class Normalizer(nn.Module):
     def load_state_dict(
         self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False
     ):
-        # check if state dict is legacy state dicts
+        # Preserve caller-owned mappings and buffers, including with assign=True.
+        metadata = getattr(state_dict, "_metadata", None)
+        state_dict = OrderedDict(state_dict)
+        if metadata is not None:
+            state_dict._metadata = metadata
         if "std" in state_dict:
-            state_dict = {
-                "mean": torch.tensor(state_dict["mean"]),
-                "rmsd": state_dict["std"],
-            }
+            if "rmsd" not in state_dict:
+                state_dict["rmsd"] = state_dict["std"]
+            del state_dict["std"]
+        for name in ("mean", "rmsd"):
+            if name in state_dict:
+                state_dict[name] = _normalization_tensor(state_dict[name], name)
 
         return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
@@ -121,12 +139,12 @@ def create_normalizer(
         extension = Path(file).suffix
         if extension == ".pt":
             # try to load a pt file
-            state_dict = torch.load(file)
+            state_dict = torch.load(file, map_location="cpu")
         elif extension == ".npz":
-            # try to load an NPZ file
-            values = np.load(file)
-            mean = values.get("mean")
-            rmsd = values.get("rmsd") or values.get("std")  # legacy files
+            with np.load(file) as values:
+                mean = values.get("mean")
+                rmsd = values.get("rmsd") if "rmsd" in values else values.get("std")
+            state_dict = None
             tensor = None  # set to None since values read from file are prioritized
         else:
             raise RuntimeError(
@@ -139,7 +157,10 @@ def create_normalizer(
             logging.warning(
                 "The state_dict provided will be used to set normalization values. All other inputs will be ignored."
             )
-        normalizer = Normalizer()
+        normalizer = Normalizer(
+            mean=state_dict.get("mean", 0.0),
+            rmsd=state_dict.get("rmsd", state_dict.get("std", 1.0)),
+        )
         normalizer.load_state_dict(state_dict)
         return normalizer
 
@@ -151,12 +172,6 @@ def create_normalizer(
             )
         mean = torch.mean(tensor)
         rmsd = torch.std(tensor)
-    elif mean is not None and rmsd is not None:
-        if not isinstance(mean, torch.Tensor):
-            mean = torch.tensor(mean)
-        if not isinstance(rmsd, torch.Tensor):
-            rmsd = torch.tensor(rmsd)
-
     # if mean and rmsd are still None than raise an error
     if mean is None or rmsd is None:
         raise ValueError(
@@ -221,6 +236,7 @@ def fit_normalizers(
         num_batches = len(data_loader)
 
     element_references = element_references or {}
+    override_values = override_values or {}
     target_vectors = defaultdict(list)
 
     logging.info(
@@ -250,11 +266,12 @@ def fit_normalizers(
                 values[name] = torch.tensor(val)
         # calculate root mean square deviation
         if "rmsd" not in values:
-            if rmsd_correction is None:
-                rmsd_correction = 0 if values["mean"] == 0.0 else 1
+            correction = rmsd_correction
+            if correction is None:
+                correction = 0 if values["mean"] == 0.0 else 1
             values["rmsd"] = (
                 ((target_vector - values["mean"]) ** 2).sum()
-                / max(len(target_vector) - rmsd_correction, 1)
+                / max(len(target_vector) - correction, 1)
             ).sqrt()
         normalizers[target] = create_normalizer(**values)
 

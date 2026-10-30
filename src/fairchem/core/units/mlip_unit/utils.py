@@ -8,7 +8,8 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from copy import deepcopy
+from copy import copy, deepcopy
+from threading import RLock
 from typing import TYPE_CHECKING
 
 import hydra
@@ -46,7 +47,11 @@ def load_inference_model(
     preloaded_checkpoint: MLIPInferenceCheckpoint | None = None,
 ) -> tuple[torch.nn.Module, MLIPInferenceCheckpoint] | torch.nn.Module:
     if preloaded_checkpoint is not None:
-        checkpoint = preloaded_checkpoint
+        # Compatibility fixups and overrides own their metadata. Parameters
+        # remain shared read-only sources, avoiding a second checkpoint-sized
+        # tensor allocation while allowing this checkpoint to be loaded again.
+        checkpoint = copy(preloaded_checkpoint)
+        checkpoint.model_config = deepcopy(preloaded_checkpoint.model_config)
     else:
         checkpoint = torch.load(
             checkpoint_location, map_location="cpu", weights_only=False
@@ -61,7 +66,7 @@ def load_inference_model(
     if use_ema:
         model = torch.optim.swa_utils.AveragedModel(model)
         model_dict = model.state_dict()
-        ema_state_dict = checkpoint.ema_state_dict
+        ema_state_dict = dict(checkpoint.ema_state_dict)
 
         n_averaged = ema_state_dict["n_averaged"]
         del model_dict["n_averaged"]
@@ -96,6 +101,9 @@ def load_tasks(checkpoint_location: str) -> list[Task]:
     ]
 
 
+_TF32_CONTEXT_LOCK = RLock()
+
+
 @contextmanager
 def tf32_context_manager(tf32: bool):
     """
@@ -104,28 +112,31 @@ def tf32_context_manager(tf32: bool):
     Args:
         tf32: Whether to enable TF32 for float32 matmul and cuDNN operations.
     """
-    original_precision = torch.get_float32_matmul_precision()
-    original_allow_tf32_cudnn = torch.backends.cudnn.allow_tf32
-    configured_precision = "high" if tf32 else "highest"
-    try:
-        torch.backends.cudnn.allow_tf32 = tf32
-        if configured_precision != original_precision:
-            torch.set_float32_matmul_precision(configured_precision)
-        yield
-    finally:
-        if configured_precision != original_precision:
-            torch.set_float32_matmul_precision(original_precision)
-        torch.backends.cudnn.allow_tf32 = original_allow_tf32_cudnn
+    with _TF32_CONTEXT_LOCK:
+        original_precision = torch.get_float32_matmul_precision()
+        original_allow_tf32_cudnn = torch.backends.cudnn.allow_tf32
+        configured_precision = "high" if tf32 else "highest"
+        try:
+            torch.backends.cudnn.allow_tf32 = tf32
+            if configured_precision != original_precision:
+                torch.set_float32_matmul_precision(configured_precision)
+            yield
+        finally:
+            if configured_precision != original_precision:
+                torch.set_float32_matmul_precision(original_precision)
+            torch.backends.cudnn.allow_tf32 = original_allow_tf32_cudnn
 
 
 def update_configs(original_config, new_config):
     updated_config = deepcopy(original_config)
     for k, v in new_config.items():
-        is_dict_config = (isinstance(v, (dict, DictConfig))) and (
-            isinstance(updated_config[k], (dict, DictConfig))
+        is_dict_config = (
+            k in updated_config
+            and (isinstance(v, (dict, DictConfig)))
+            and (isinstance(updated_config[k], (dict, DictConfig)))
         )
         if is_dict_config and k in updated_config:
             updated_config[k] = update_configs(updated_config[k], v)
         else:
-            updated_config[k] = v
+            updated_config[k] = deepcopy(v)
     return updated_config

@@ -7,7 +7,10 @@ file in the root directory of this source tree.
 
 from __future__ import annotations
 
+import math
+from collections.abc import Collection, Mapping
 from dataclasses import asdict, dataclass, field, replace
+from numbers import Integral, Real
 
 import torch  # - needed at runtime for dataclass field type resolution
 
@@ -95,7 +98,9 @@ def validate_uma_atoms_data(atoms, task_name: str, logger=None) -> None:
 
     # Validate charge range
     charge = atoms.info["charge"]
-    if not isinstance(charge, (int, np.integer)):
+    if isinstance(charge, (bool, np.bool_)) or not isinstance(
+        charge, (int, np.integer)
+    ):
         raise TypeError(
             f"Invalid type for charge: {type(charge)}. "
             "Charge must be an integer representing the total charge on the system."
@@ -108,7 +113,7 @@ def validate_uma_atoms_data(atoms, task_name: str, logger=None) -> None:
 
     # Validate spin range
     spin = atoms.info["spin"]
-    if not isinstance(spin, (int, np.integer)):
+    if isinstance(spin, (bool, np.bool_)) or not isinstance(spin, (int, np.integer)):
         raise TypeError(
             f"Invalid type for spin: {type(spin)}. "
             "Spin must be an integer representing the spin multiplicity."
@@ -259,6 +264,21 @@ class InferenceSettings:
     max_atoms: int | None = None
 
     def __post_init__(self):
+        for name in (
+            "tf32",
+            "activation_checkpointing",
+            "merge_mole",
+            "compile",
+            "compile_dynamic",
+            "xpu_graph",
+            "external_graph_gen",
+            "use_quaternion_wigner",
+            "nitro",
+            "hessian_vmap",
+            "auto_add_default_untrained_tasks",
+        ):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be a boolean")
         if self.compile_scope not in {"model", "blocks"}:
             raise ValueError("compile_scope must be 'model' or 'blocks'")
         for name in (
@@ -266,24 +286,50 @@ class InferenceSettings:
             "neighbor_cache_entries",
             "hessian_chunk_size",
         ):
-            if not isinstance(getattr(self, name), int) or getattr(self, name) < 1:
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, Integral) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
-        if not isinstance(self.mole_cache_size, int) or self.mole_cache_size < 0:
+            setattr(self, name, int(value))
+        if (
+            isinstance(self.mole_cache_size, bool)
+            or not isinstance(self.mole_cache_size, Integral)
+            or self.mole_cache_size < 0
+        ):
             raise ValueError("mole_cache_size must be a nonnegative integer")
-        if self.mole_cache_max_bytes is not None and self.mole_cache_max_bytes < 1:
-            raise ValueError("mole_cache_max_bytes must be positive")
-        if self.neighbor_skin < 0:
-            raise ValueError("neighbor_skin must be nonnegative")
+        self.mole_cache_size = int(self.mole_cache_size)
+        for name in (
+            "mole_cache_max_bytes",
+            "edge_chunk_size",
+            "torch_num_threads",
+            "max_atoms",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, Integral)
+                    or value < 1
+                ):
+                    raise ValueError(f"{name} must be a positive integer")
+                setattr(self, name, int(value))
+        if (
+            isinstance(self.neighbor_skin, bool)
+            or not isinstance(self.neighbor_skin, Real)
+            or not math.isfinite(self.neighbor_skin)
+            or self.neighbor_skin < 0
+        ):
+            raise ValueError("neighbor_skin must be finite and nonnegative")
+        self.neighbor_skin = float(self.neighbor_skin)
         if self.graph_search_method == "allpairs":
             self.graph_search_method = "all_pairs"
         if self.graph_search_method not in {"cell", "auto", "all_pairs", "bvh"}:
             raise ValueError("Unsupported graph_search_method")
         if self.graph_edge_order not in {"original", "spatial"}:
             raise ValueError("graph_edge_order must be 'original' or 'spatial'")
-        if self.edge_chunk_size is not None and self.edge_chunk_size < 1:
-            raise ValueError("edge_chunk_size must be positive")
         if self.requested_properties is not None:
-            if isinstance(self.requested_properties, str):
+            if isinstance(
+                self.requested_properties, (str, bytes, Mapping)
+            ) or not isinstance(self.requested_properties, Collection):
                 raise ValueError(
                     "requested_properties must be a sequence of names, not a string"
                 )
@@ -294,10 +340,27 @@ class InferenceSettings:
             ):
                 raise ValueError("requested_properties must contain property names")
         if isinstance(self.base_precision_dtype, str):
-            self.base_precision_dtype = getattr(torch, self.base_precision_dtype)
-            assert (
-                self.base_precision_dtype in ALLOWED_DTYPES
-            ), f"base_precision_dtype must be one of {ALLOWED_DTYPES}, got {self.base_precision_dtype}"
+            self.base_precision_dtype = getattr(torch, self.base_precision_dtype, None)
+        if (
+            not isinstance(self.base_precision_dtype, torch.dtype)
+            or self.base_precision_dtype not in ALLOWED_DTYPES
+        ):
+            raise ValueError(
+                f"base_precision_dtype must be one of {ALLOWED_DTYPES}, got {self.base_precision_dtype}"
+            )
+        for name in (
+            "predict_untrained_forces",
+            "predict_untrained_stress",
+            "predict_untrained_hessian",
+        ):
+            value = getattr(self, name)
+            if (
+                isinstance(value, (str, bytes, Mapping))
+                or not isinstance(value, Collection)
+                or any(not isinstance(dataset, str) or not dataset for dataset in value)
+            ):
+                raise ValueError(f"{name} must be a collection of dataset names")
+            setattr(self, name, set(value))
 
     def to_omegaconf(self) -> dict:
         """

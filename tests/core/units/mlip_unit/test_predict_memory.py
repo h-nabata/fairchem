@@ -73,8 +73,11 @@ def test_transfer_copies_each_tensor_once_without_scalar_validation(dtype):
     assert current.calls[torch.ops.aten._to_copy.default] == len(tensors)
     assert not current.calls[torch.ops.aten.clone.default]
     assert not current.calls[torch.ops.aten._local_scalar_dense.default]
-    assert legacy.calls[torch.ops.aten._local_scalar_dense.default] > 0
-    assert current.copy_bytes < legacy.copy_bytes
+    # AtomicData.clone now also avoids validation and repeated tensor copies.
+    # Fusing the dtype conversion still saves the intermediate FP64 allocation.
+    assert current.copy_bytes <= legacy.copy_bytes
+    if dtype == torch.float32:
+        assert current.copy_bytes < legacy.copy_bytes
 
 
 def test_transfer_preserves_nested_aliases_metadata_and_second_derivatives():

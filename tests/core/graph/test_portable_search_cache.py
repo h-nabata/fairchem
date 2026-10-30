@@ -322,7 +322,7 @@ def test_boundary_pruning_omits_unneeded_images_and_integer_tables_stay_immutabl
     assert len(all_sources[0]) == 54
     assert len(pruned[0]) == 2
     torch.testing.assert_close(table, saved)
-    assert integer_cartesian_table(1, 1, 1, pos.device).data_ptr() == table.data_ptr()
+    assert integer_cartesian_table(1, 1, 1, pos.device).data_ptr() != table.data_ptr()
 
 
 def test_spatial_edge_order_preserves_geometry_system_groups_and_gradients():

@@ -16,8 +16,11 @@ import math
 import os
 import random
 import sys
+import threading
+import weakref
 from collections import defaultdict
-from contextlib import nullcontext
+from collections.abc import Collection, Mapping
+from contextlib import contextmanager, nullcontext
 from functools import cached_property, wraps
 from typing import TYPE_CHECKING, ClassVar, Protocol
 
@@ -47,7 +50,11 @@ from fairchem.core.common.distutils import (
 )
 from fairchem.core.common.utils import get_commit_hash_for_repo
 from fairchem.core.components.serve_utils import get_app_handle_with_retry
-from fairchem.core.datasets.atomic_data import AtomicData, warn_if_upcasting
+from fairchem.core.datasets.atomic_data import (
+    AtomicData,
+    _clone_tensor_tree,
+    warn_if_upcasting,
+)
 from fairchem.core.models.uma.compat import get_uma_version
 from fairchem.core.models.uma.nn.execution_backends import (
     ExecutionMode,
@@ -95,21 +102,167 @@ _AUXILIARY_LEVELS = {
     "embeddings": "atom",
 }
 
+_PREDICTOR_STATES = weakref.WeakKeyDictionary()
+_PREDICTOR_STATE_LOCK = threading.RLock()
+_MODEL_CONSTRUCTION_LOCK = threading.RLock()
+
+
+def _predictor_state(predictor):
+    with _PREDICTOR_STATE_LOCK:
+        return _PREDICTOR_STATES.setdefault(predictor, [threading.RLock(), None])
+
+
+def _validation_info_snapshot(value, active=None):
+    """
+    Snapshot small immutable metadata; mutable arrays require fresh validation.
+    """
+    if value is None or isinstance(value, (str, bytes, bool, int, float, np.generic)):
+        if isinstance(value, np.generic):
+            scalar = value.item()
+            return (
+                (type(value), scalar)
+                if scalar is None
+                or type(scalar) in (str, bytes, bool, int, float, complex)
+                else None
+            )
+        return (type(value), value)
+    if isinstance(value, (list, tuple, dict)):
+        active = set() if active is None else active
+        if id(value) in active:
+            return None
+        active.add(id(value))
+        try:
+            if isinstance(value, dict):
+                children = [
+                    (
+                        _validation_info_snapshot(key, active),
+                        _validation_info_snapshot(item, active),
+                    )
+                    for key, item in value.items()
+                ]
+                return (
+                    None
+                    if any(key is None or item is None for key, item in children)
+                    else (dict, tuple(children))
+                )
+            children = [_validation_info_snapshot(item, active) for item in value]
+            return (
+                None
+                if any(item is None for item in children)
+                else (type(value), tuple(children))
+            )
+        finally:
+            active.remove(id(value))
+    return None
+
+
+def _isolated_model_initialization(initialize):
+    @wraps(initialize)
+    def isolated(*args, **kwargs):
+        # Checkpoints and their newly created parameters are initialized on CPU.
+        # Do not seed an accelerator here: manual_seed() would enqueue lazy
+        # seed changes even on devices this predictor never uses.
+        with _MODEL_CONSTRUCTION_LOCK, torch.random.fork_rng(devices=[]):
+            python_state, numpy_state = random.getstate(), np.random.get_state()
+            prior_device = os.environ.get(CURRENT_DEVICE_TYPE_STR)
+            try:
+                return initialize(*args, **kwargs)
+            finally:
+                random.setstate(python_state)
+                np.random.set_state(numpy_state)
+                if prior_device is None:
+                    os.environ.pop(CURRENT_DEVICE_TYPE_STR, None)
+                else:
+                    os.environ[CURRENT_DEVICE_TYPE_STR] = prior_device
+
+    return isolated
+
+
+@contextmanager
+def _serialized_prediction(predictor):
+    """
+    Serialize mutable predictor state through postprocessing and GPU submission.
+
+    Locks/events live outside predictor objects so copying or pickling a model
+    does not copy a lock or an event associated with another model's execution.
+    """
+    if not isinstance(predictor, MLIPPredictUnit):
+        yield
+        return
+    state = _predictor_state(predictor)
+    with state[0]:
+        device = torch.device(predictor.device)
+        accelerator = getattr(torch, device.type, None)
+        stream = None
+        if device.type in {"cuda", "xpu"} and accelerator.is_available():
+            stream = accelerator.current_stream(device)
+            if state[1] is not None:
+                if isinstance(state[1], str):
+                    raise RuntimeError(
+                        f"Previous prediction's GPU completion could not be established; construct a new predictor ({state[1]})"
+                    )
+                stream.wait_event(state[1])
+        try:
+            yield
+        finally:
+            # A failed call may have enqueued work before raising. Subsequent
+            # calls still must not overwrite buffers used by that submission.
+            if stream is not None:
+                failed = sys.exc_info()[0] is not None
+                try:
+                    event = accelerator.Event()
+                    event.record(stream)
+                    state[1] = event
+                except Exception as error:
+                    state[1] = f"{type(error).__name__}: {error}"
+                    if not failed:
+                        raise
+                    logging.warning(
+                        "Unable to record failed prediction's completion: %s", error
+                    )
+
 
 def collate_predictions(predict_fn):
     @wraps(predict_fn)
     def collated_predict(
         predict_unit, data: AtomicData, undo_element_references: bool = True, **kwargs
     ):
+        with _serialized_prediction(predict_unit):
+            return _collated_predict(
+                predict_unit, data, undo_element_references, **kwargs
+            )
+
+    def _collated_predict(
+        predict_unit, data: AtomicData, undo_element_references: bool = True, **kwargs
+    ):
         # Get the full prediction dictionary from the original predict method
         preds = predict_fn(predict_unit, data, undo_element_references, **kwargs)
         collated_preds = defaultdict(list)
         batch_by_device = {}
+        provided = [set() for _ in data.dataset]
+
+        def validate_output(name, value, level):
+            if not torch.is_tensor(value) or value.ndim == 0:
+                raise ValueError(
+                    f"Prediction {name!r} must be a tensor with a {level} dimension"
+                )
+            expected = len(data.dataset) if level == "system" else data.batch.numel()
+            if value.shape[0] != expected:
+                raise ValueError(
+                    f"Prediction {name!r} has {value.shape[0]} {level} rows; expected {expected}"
+                )
+
         for i, dataset in enumerate(data.dataset):
+            if dataset not in predict_unit.dataset_to_tasks:
+                raise ValueError(
+                    f"Unknown prediction dataset {dataset!r} at system {i}"
+                )
             for task in predict_unit.dataset_to_tasks[dataset]:
                 if task.name not in preds:
                     continue
                 prediction = preds[task.name]
+                validate_output(task.name, prediction, task.level)
+                provided[i].add(task.property)
                 if task.level == "system":
                     collated_preds[task.property].append(prediction[i].unsqueeze(0))
                 elif task.level == "atom":
@@ -145,6 +298,8 @@ def collate_predictions(predict_fn):
                     if prop in task_properties or name not in preds:
                         continue
                     value = preds[name]
+                    validate_output(name, value, level)
+                    provided[i].add(prop)
                     if level == "system":
                         value = value[i].unsqueeze(0)
                     elif len(data.dataset) > 1:
@@ -152,6 +307,20 @@ def collate_predictions(predict_fn):
                             batch_by_device[value.device] = data.batch.to(value.device)
                         value = value[batch_by_device[value.device] == i]
                     collated_preds[prop].append(value)
+
+        requested = kwargs.get("requested_properties")
+        if requested is None:
+            requested = getattr(
+                getattr(predict_unit, "inference_settings", None),
+                "requested_properties",
+                None,
+            )
+        if requested is not None:
+            for i, properties in enumerate(provided):
+                if missing := set(requested) - properties:
+                    raise ValueError(
+                        f"Requested properties {sorted(missing)} are unavailable for system {i} (dataset={data.dataset[i]!r})"
+                    )
 
         return {
             prop: values[0]
@@ -171,26 +340,14 @@ def _copy_data_to_device(
     Deep-copying with a tensor memo preserves metadata and non-leaf autograd
     inputs without re-running AtomicData's scalar validation on an accelerator.
     """
-    memo = {}
-
-    def copy_tensors(value):
-        if torch.is_tensor(value):
-            if id(value) not in memo:
-                memo[id(value)] = value.to(
-                    device=device,
-                    dtype=dtype if value.is_floating_point() else value.dtype,
-                    copy=True,
-                )
-        elif isinstance(value, (tuple, list)):
-            for item in value:
-                copy_tensors(item)
-        elif isinstance(value, dict):
-            for item in value.values():
-                copy_tensors(item)
-
-    for _, value in data:
-        copy_tensors(value)
-    return copy.deepcopy(data, memo)
+    return _clone_tensor_tree(
+        data,
+        tensor_transform=lambda value: value.to(
+            device=device,
+            dtype=dtype if value.is_floating_point() else value.dtype,
+            copy=True,
+        ),
+    )
 
 
 def _prepare_inference_gradients(backbone, data: AtomicData) -> None:
@@ -318,6 +475,7 @@ class MLIPPredictUnitProtocol(Protocol):
 class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
     supports_requested_properties = True
 
+    @_isolated_model_initialization
     def __init__(
         self,
         inference_model_path: str,
@@ -330,22 +488,29 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         assert_on_nans: bool = False,
     ):
         super().__init__()
+        device = str(device)
         os.environ[CURRENT_DEVICE_TYPE_STR] = device
         # Fail before loading a potentially large checkpoint if the requested
         # accelerator is unavailable; never silently substitute CPU inference.
         self._setup_device(device)
         os.environ[CURRENT_DEVICE_TYPE_STR] = self.device
 
-        self.set_seed(seed)
+        self._seed = seed
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.random.default_generator.manual_seed(seed)
         self._setup_refs(atom_refs, form_elem_refs)
 
         if inference_settings is None:
             inference_settings = InferenceSettings()
+        if not isinstance(inference_settings, InferenceSettings):
+            raise ValueError("inference_settings must be an InferenceSettings instance")
 
         # Named inference modes (e.g., default, multigpu) are shared module-level
         # instances. We keep a private copy so a change driven by a contract break
         # does not alter other predictors.
         self.inference_settings = copy.deepcopy(inference_settings)
+        self.inference_settings.__post_init__()
         self._inference_model_path = inference_model_path
         self._overrides = copy.deepcopy(overrides)
         self._requested_device = device
@@ -380,6 +545,14 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
                 "This is a direct-force model. Direct force predictions may lead to "
                 "discontinuities in the potential energy surface and energy conservation errors."
             )
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # Cache signatures describe original tensor identities and generations.
+        # Copies must establish their own observations and prepared-model LRU.
+        for name in ("_prepared_models", "_active_mole_key", "_active_model_signature"):
+            state[name] = None
+        return state
 
     def _load_model(self) -> None:
         """Load a fresh, unprepared model from the inference checkpoint."""
@@ -552,6 +725,7 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
                 self._fall_back(error)
         self._lazy_init(data)
 
+    @_isolated_model_initialization
     def _load_hydra_model(self, checkpoint: MLIPInferenceCheckpoint) -> None:
         """Build the composable HydraModel from the checkpoint."""
         # if the model is uma-s and the execution mode is not explicitly set, default to the optimized uma-s gpu execution mode.
@@ -570,7 +744,8 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         # buffers (SO3_Grid matrices, CoefficientMapping) are created at the
         # requested precision rather than being cast from float32 later.
         prev_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(self.inference_settings.base_precision_dtype)
+        if prev_dtype != self.inference_settings.base_precision_dtype:
+            torch.set_default_dtype(self.inference_settings.base_precision_dtype)
 
         try:
             # Load model with overrides, passing pre-loaded checkpoint
@@ -584,7 +759,8 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
             # Model sets up tasks
             self.model.module.setup_tasks(checkpoint.tasks_config)
         finally:
-            torch.set_default_dtype(prev_dtype)
+            if torch.get_default_dtype() != prev_dtype:
+                torch.set_default_dtype(prev_dtype)
 
     @property
     def dataset_to_tasks(self) -> dict[str, list]:
@@ -610,30 +786,47 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         Setup element references.
         """
         self.atom_refs = (
-            {task.replace("_elem_refs", ""): refs for task, refs in atom_refs.items()}
+            {
+                task.replace("_elem_refs", ""): copy.deepcopy(refs)
+                for task, refs in atom_refs.items()
+            }
             if atom_refs
             else {}
         )
-        self.form_elem_refs = form_elem_refs or {}
+        self.form_elem_refs = copy.deepcopy(form_elem_refs) if form_elem_refs else {}
 
     def _setup_threads(self, settings: InferenceSettings) -> None:
         """
         Configure thread settings.
         """
         if settings.torch_num_threads is not None:
-            torch.set_num_threads(settings.torch_num_threads)
-            torch.set_num_interop_threads(settings.torch_num_threads)
+            if torch.get_num_interop_threads() != settings.torch_num_threads:
+                torch.set_num_interop_threads(settings.torch_num_threads)
+            if torch.get_num_threads() != settings.torch_num_threads:
+                torch.set_num_threads(settings.torch_num_threads)
 
     def _setup_device(self, device: str) -> None:
         """
         Setup inference device.
         """
+        device = str(device)
         if device in ("cpu", "cuda"):
             self.device = get_device_for_local_rank() if device == "cuda" else "cpu"
             return
         requested = torch.device(device)
+        if requested.type == "cuda":
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    f"Requested CUDA device {requested}, but CUDA is unavailable"
+                )
+            if requested.index is None or requested.index >= torch.cuda.device_count():
+                raise ValueError(f"CUDA device index {requested.index} is unavailable")
+            self.device = str(requested)
+            return
         if requested.type != "xpu":
-            raise ValueError("device must be 'cpu', 'cuda', 'xpu', or 'xpu:<index>'")
+            raise ValueError(
+                "device must be 'cpu', 'cuda', 'cuda:<index>', 'xpu', or 'xpu:<index>'"
+            )
         self.device = resolve_xpu_device(requested)
 
     def _validate_xpu_settings(self) -> None:
@@ -667,14 +860,15 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         Keep the template for subsequent exact re-preparation by default.
         Reload paths discard it because their settings can change.
         """
-        cache = getattr(self, "_prepared_models", None)
-        if cache is not None:
-            cache.clear()
-        self._prepared_models = None
-        if release_template:
-            self._mole_template = None
-        self._active_mole_key = None
-        self._active_model_signature = None
+        with _predictor_state(self)[0]:
+            cache = getattr(self, "_prepared_models", None)
+            if cache is not None:
+                cache.clear()
+            self._prepared_models = None
+            if release_template:
+                self._mole_template = None
+            self._active_mole_key = None
+            self._active_model_signature = None
 
     def _mole_key(self, data):
         return mole_composition_key(
@@ -928,7 +1122,10 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         undo_element_references: bool = True,
         requested_properties: tuple[str, ...] | list[str] | None = None,
     ) -> dict[str, torch.tensor]:
-        if isinstance(requested_properties, str):
+        if requested_properties is not None and (
+            isinstance(requested_properties, (str, bytes, Mapping))
+            or not isinstance(requested_properties, Collection)
+        ):
             raise ValueError(
                 "requested_properties must be a sequence of names, not a string"
             )
@@ -1092,11 +1289,8 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
             logging.warning(
                 "Model is being compiled. This might take a while the first time."
             )
-            torch._dynamo.config.recompile_limit = 32
-            # Bake float literals in as constants rather than symbolic floats.
-            # The model's scalars are fixed at inference, so this skips dynamo's
-            # TensorifyScalarRestartAnalysis retrace during compile.
-            torch._dynamo.config.specialize_float = True
+            # Dynamo configuration is process-global and may be shared with
+            # other models/jobs. Keep the caller's compiler policy unchanged.
             self.model = torch.compile(
                 self.model, dynamic=self.inference_settings.compile_dynamic
             )
@@ -1167,7 +1361,7 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         # Leave global backend state unchanged when an Intel predictor runs.
         precision_context = (
             nullcontext()
-            if device_type == "xpu"
+            if device_type != "cuda"
             else tf32_context_manager(self.inference_settings.tf32)
         )
         # FP32 is the supported XPU contract even inside a caller's autocast
@@ -1644,12 +1838,15 @@ class BatchServerPredictUnit(MLIPPredictUnitProtocol):
                 Its derived ``model_id`` is bound to the handle for routing, and
                 the full spec is sent with each remote call.
         """
+        self._request_timeout_s = _resolve_batch_server_timeout()
         if model_spec is not None:
             if not isinstance(model_spec, ModelSpec):
                 raise TypeError(
                     f"model_spec must be a ModelSpec, got {type(model_spec).__name__}"
                 )
-            if not server_handle.is_multiplexed.remote().result():
+            if not server_handle.is_multiplexed.remote().result(
+                timeout_s=self._request_timeout_s
+            ):
                 raise ValueError(
                     f"model_spec={model_spec!r} was provided but the deployment "
                     "is not a multiplexed server. Use "
@@ -1660,23 +1857,16 @@ class BatchServerPredictUnit(MLIPPredictUnitProtocol):
             )
         self.server_handle = server_handle
         self._model_spec = model_spec
-        # Identity-based cache for ``validate_atoms_data``.
-        # ``ase_calculator.calculate()`` calls validate on every
-        # optimizer step with the same ``atoms.info`` dict object;
-        # validation only mutates that dict in place to add defaults
-        # (charge, spin, ...). After the first call the dict is
-        # saturated, so any subsequent call on the same dict is
-        # guaranteed redundant. We key on ``(id(info), task_name)``;
-        # since this unit holds no reference to the dict itself, this
-        # is purely a fast-path skip and cannot extend its lifetime.
-        self._validated_info_keys: set[tuple[int, str]] = set()
+        # A bounded, owned snapshot detects in-place metadata edits and prevents
+        # a newly allocated dictionary from matching an old id. Array/tensor
+        # metadata bypasses this optimization because external writes can occur.
+        self._validated_info = None
         # Per-call ``.result()`` timeout (seconds). Sourced from
         # ``FAIRCHEM_BATCH_SERVER_TIMEOUT_S`` so callers can override
         # without code changes (tests can shrink it to fail fast;
         # users on slow CPUs can lengthen it). ``None`` disables the
         # bound entirely so behavior matches the pre-timeout default
         # if someone needs it.
-        self._request_timeout_s = _resolve_batch_server_timeout()
 
     @property
     def model_spec(self) -> ModelSpec | None:
@@ -1754,22 +1944,28 @@ class BatchServerPredictUnit(MLIPPredictUnitProtocol):
         ``predict_unit.validate_atoms_data`` on a stub ``Atoms`` and
         returns the mutated ``atoms.info`` dict which is applied locally.
 
-        Skips the Ray Serve round-trip when the same ``atoms.info``
-        dict object has already been validated for this task: the
-        server's validation is purely defaulting and was applied to
-        the dict in place on the first call, so subsequent calls
-        with the same dict are no-ops. ``ase_calculator.calculate()``
-        calls this on every optimizer step — without the skip, each
-        step pays a network hop.
+        Reuse validation only for the same dictionary, task and immutable
+        metadata values. Charge/spin edits and mutable array values must be
+        revalidated; validation can reject values, not just install defaults.
         """
-        key = (id(atoms.info), task_name)
-        if key in self._validated_info_keys:
+        snapshot = _validation_info_snapshot(atoms.info)
+        cached = self._validated_info
+        if (
+            snapshot is not None
+            and cached is not None
+            and cached[0] is atoms.info
+            and cached[1] == task_name
+            and cached[2] == snapshot
+        ):
             return
         updated_info = self.server_handle.validate_atoms_data.remote(
-            dict(atoms.info), task_name, spec=self._model_spec
+            copy.deepcopy(atoms.info), task_name, spec=self._model_spec
         ).result(timeout_s=self._request_timeout_s)
-        atoms.info.update(updated_info)
-        self._validated_info_keys.add(key)
+        atoms.info.update(copy.deepcopy(updated_info))
+        snapshot = _validation_info_snapshot(atoms.info)
+        self._validated_info = (
+            (atoms.info, task_name, snapshot) if snapshot is not None else None
+        )
 
     @cached_property
     def dataset_to_tasks(self) -> dict:

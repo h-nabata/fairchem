@@ -11,8 +11,9 @@ from __future__ import annotations
 
 import copy
 import logging
-import re
+import types
 from collections.abc import Sequence
+from numbers import Integral
 from typing import Union
 
 import ase
@@ -64,6 +65,40 @@ _REQUIRED_KEYS = [
 ]
 
 _OPTIONAL_KEYS = ["energy", "forces", "stress", "dataset"]
+
+
+def _clone_tensor_tree(value, tensor_transform=None):
+    """
+    Deep-copy nested data with differentiable clones of all referenced tensors.
+    """
+    memo, visited = {}, set()
+
+    def remember(item):
+        if id(item) in visited:
+            return
+        visited.add(id(item))
+        if torch.is_tensor(item):
+            memo[id(item)] = (
+                item.clone() if tensor_transform is None else tensor_transform(item)
+            )
+        elif isinstance(item, dict):
+            for child in item:
+                remember(child)
+            for child in item.values():
+                remember(child)
+        elif isinstance(item, (tuple, list)):
+            for child in item:
+                remember(child)
+        elif (
+            hasattr(item, "__dict__")
+            and not isinstance(item, (type, types.ModuleType))
+            and not callable(item)
+        ):
+            remember(vars(item))
+
+    remember(value.__dict__ if isinstance(value, AtomicData) else value)
+    return copy.deepcopy(value, memo)
+
 
 # TODO: potential future keys
 # ["virials", "atom_attr", "edge_attr"]
@@ -263,6 +298,10 @@ class AtomicData:
 
     def validate(self):
         # shape checks
+        if self.natoms.numel() == 0 or bool((self.natoms <= 0).any()):
+            raise ValueError("AtomicData requires at least one atom per system")
+        if not torch.isfinite(self.pos).all() or not torch.isfinite(self.cell).all():
+            raise ValueError("Atomic positions and cell must contain finite values")
         assert (
             self.pos.shape[0]
             == self.atomic_numbers.shape[0]
@@ -284,6 +323,10 @@ class AtomicData:
         assert self.tags.shape[0] == self.pos.shape[0]
         assert self.batch.shape == self.atomic_numbers.shape
         assert int(self.batch.max()) + 1 == self.num_graphs
+        assert bool((self.batch >= 0).all()), "batch indices must be nonnegative"
+        assert torch.equal(
+            torch.bincount(self.batch, minlength=self.num_graphs), self.natoms
+        ), "natoms must match batch membership"
         assert len(self.sid) == self.num_graphs
 
         if "dataset" in self.__keys__:
@@ -303,6 +346,24 @@ class AtomicData:
         assert self.pbc.dtype == torch.bool
         assert self.fixed.dtype == self.tags.dtype == torch.long
         assert self.batch.dtype == torch.long
+        if not torch.equal(
+            self.batch,
+            torch.repeat_interleave(
+                torch.arange(self.num_graphs, device=self.batch.device), self.natoms
+            ),
+        ):
+            raise ValueError("Batch atoms must be grouped contiguously in system order")
+        for name in _REQUIRED_KEYS:
+            if getattr(self, name).device != self.pos.device:
+                raise ValueError(
+                    f"AtomicData field '{name}' must be on the positions device"
+                )
+        for name in ("natoms", "nedges", "charge", "spin"):
+            value = getattr(self, name)
+            assert value.dtype == torch.long, f"{name} must be an int64 tensor"
+            assert value.shape == (
+                self.num_graphs,
+            ), f"{name} must have one entry per system"
         assert isinstance(self.num_nodes, int)
         assert isinstance(self.num_graphs, int)
 
@@ -344,13 +405,15 @@ class AtomicData:
         r_energy: bool = True,  # deprecated
         r_forces: bool = True,
         r_stress: bool = True,
-        r_data_keys: list[str] | None = None,  # NOT USED, compat for now
+        r_data_keys: list[str] | None = None,  # Explicitly select charge/spin metadata.
         task_name: str | None = None,
         target_dtype: torch.dtype = torch.float32,
         external_graph_method: ExternalGraphMethod | str = ExternalGraphMethod.PYMATGEN,
     ) -> AtomicData:
         atoms = input_atoms.copy()
         calc = input_atoms.calc
+        if np.all(atoms.pbc) and atoms.cell.volume == 0:
+            raise ValueError("A fully periodic structure requires a nonsingular cell")
         # TODO: maybe compute a safe cell size if not provided.
         if molecule_cell_size is not None:
             assert (
@@ -470,24 +533,17 @@ class AtomicData:
         )
 
         # TODO another way to specify this is to specify a key. maybe total_charge
-        charge = torch.LongTensor(
-            [
-                (
-                    atoms.info.get("charge", 0)
-                    if r_data_keys is not None and "charge" in r_data_keys
-                    else 0
-                )
-            ]
-        )
-        spin = torch.LongTensor(
-            [
-                (
-                    atoms.info.get("spin", 0)
-                    if r_data_keys is not None and "spin" in r_data_keys
-                    else 0
-                )
-            ]
-        )
+        def integer_metadata(name):
+            value = (
+                atoms.info.get(name, 0)
+                if r_data_keys is not None and name in r_data_keys
+                else 0
+            )
+            if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral):
+                raise TypeError(f"atoms.info['{name}'] must be an integer")
+            return torch.tensor([int(value)], dtype=torch.long)
+
+        charge, spin = integer_metadata("charge"), integer_metadata("spin")
 
         # NOTE: code assumes these are ints.. not tensors
         # charge = atoms.info.get("charge", 0)
@@ -519,8 +575,8 @@ class AtomicData:
 
         atoms = ase.Atoms(
             numbers=self.atomic_numbers.cpu().numpy(),
-            positions=self.pos.cpu().numpy(),
-            cell=self.cell.squeeze().cpu().numpy(),
+            positions=self.pos.detach().cpu().numpy(),
+            cell=self.cell.detach().squeeze().cpu().numpy(),
             pbc=self.pbc.squeeze().tolist(),
             constraint=FixAtoms(mask=self.fixed.bool().tolist()),
             tags=self.tags.cpu().numpy(),
@@ -529,16 +585,17 @@ class AtomicData:
         if self.__keys__.intersection(["energy", "forces", "stress"]):
             fields = {}
             if hasattr(self, "energy") and self.energy is not None:
-                fields["energy"] = self.energy.cpu().numpy()
+                fields["energy"] = self.energy.detach().item()
             if hasattr(self, "forces") and self.forces is not None:
-                fields["forces"] = self.forces.cpu().numpy()
+                fields["forces"] = self.forces.detach().cpu().numpy()
             if hasattr(self, "stress") and self.stress is not None:
-                if self.stress.shape == (3, 3):
-                    fields["stress"] = full_3x3_to_voigt_6_stress(
-                        self.stress.squeeze().cpu().numpy()
-                    )
-                elif self.stress.shape == (6,):
-                    fields["stress"] = self.stress.squeeze().numpy()
+                stress = self.stress.detach().cpu().numpy()
+                if stress.size == 9:
+                    fields["stress"] = full_3x3_to_voigt_6_stress(stress.reshape(3, 3))
+                elif stress.size == 6:
+                    fields["stress"] = stress.reshape(6)
+                else:
+                    raise ValueError("A single-system stress must have 6 or 9 values")
             atoms.calc = SinglePointCalculator(atoms=atoms, **fields)
 
         atoms.info = {
@@ -547,7 +604,7 @@ class AtomicData:
         }
 
         if self.sid is not None:
-            atoms.info["sid"] = self.sid
+            atoms.info["sid"] = copy.deepcopy(self.sid)
 
         return atoms
 
@@ -614,12 +671,12 @@ class AtomicData:
     @property
     def num_graphs(self) -> int:
         """Returns the number of graphs in the batch."""
-        return int(self.batch.max()) + 1
+        return self.natoms.numel()
 
     def __len__(self):
         return self.num_graphs
 
-    def get(self, key, default):
+    def get(self, key, default=None):
         if key in self:
             return self[key]
         return default
@@ -689,7 +746,7 @@ class AtomicData:
             if the batch concatenation process is corrupted for a specific data
             attribute.
         """
-        if bool(re.search("index", key)):
+        if key == "edge_index":
             return -1
         return 0
 
@@ -703,27 +760,41 @@ class AtomicData:
             if the batch concatenation process is corrupted for a specific data
             attribute.
         """
-        # Only the `*index*` attribute should be cumulatively summed
-        # up when creating batches.
+        # Only known atom indices are shifted; job IDs can also contain "index".
         assert self.num_graphs == 1
-        return self.natoms.item() if bool(re.search("index", key)) else 0
+        return self.natoms.item() if key == "edge_index" else 0
 
-    def __apply__(self, item, func):
+    def __apply__(self, item, func, memo=None):
+        if memo is None:
+            memo = {}
+        if id(item) in memo:
+            return memo[id(item)]
         if torch.is_tensor(item):
-            return func(item)
-        elif isinstance(item, (tuple, list)):
-            return [self.__apply__(v, func) for v in item]
+            result = func(item)
+        elif isinstance(item, list):
+            result = []
+            memo[id(item)] = result
+            result.extend(self.__apply__(v, func, memo) for v in item)
+        elif isinstance(item, tuple):
+            values = [self.__apply__(v, func, memo) for v in item]
+            # A mutable child may have recursively completed this same tuple.
+            if id(item) in memo:
+                return memo[id(item)]
+            result = type(item)(*values) if hasattr(item, "_fields") else tuple(values)
         elif isinstance(item, dict):
-            return {k: self.__apply__(v, func) for k, v in item.items()}
+            result = {}
+            memo[id(item)] = result
+            result.update((k, self.__apply__(v, func, memo)) for k, v in item.items())
         else:
             return item
+        memo[id(item)] = result
+        return result
 
     def apply(self, func):
         r"""Applies the function :obj:`func` to all tensor attributes"""
+        memo = {}
         for key in self.__keys__:
-            self[key] = self.__apply__(self[key], func)
-
-        self["batch"] = self.__apply__(self["batch"], func)
+            self[key] = self.__apply__(self[key], func, memo)
 
         return self
 
@@ -731,9 +802,29 @@ class AtomicData:
         r"""Ensures a contiguous memory layout for all tensor attributes"""
         return self.apply(lambda x: x.contiguous())
 
-    def to(self, device, **kwargs):
-        r"""Performs tensor dtype and/or device conversion for all tensor attributes"""
-        return self.apply(lambda x: x.to(device, **kwargs))
+    def to(self, device=None, **kwargs):
+        """
+        Move tensors and convert floating fields while preserving index types.
+
+        This mutates the object, as the existing device methods do. Clone first
+        when another job must retain the original data.
+        """
+        dtype = kwargs.pop("dtype", None)
+        if isinstance(device, torch.dtype):
+            if dtype is not None:
+                raise TypeError("dtype was specified twice")
+            dtype, device = device, None
+        elif isinstance(device, torch.Tensor):
+            if dtype is not None:
+                raise TypeError("dtype cannot accompany a reference tensor")
+            dtype, device = device.dtype, device.device
+        if dtype is not None and dtype not in (torch.float32, torch.float64):
+            raise ValueError("AtomicData floating fields require float32 or float64")
+        return self.apply(
+            lambda x: x.to(
+                device=device, dtype=dtype if x.is_floating_point() else None, **kwargs
+            )
+        )
 
     def cpu(self):
         r"""Copies all tensor attributes to CPU memory."""
@@ -744,24 +835,10 @@ class AtomicData:
         return self.apply(lambda x: x.cuda(device=device, non_blocking=non_blocking))
 
     def clone(self):
-        r"""Performs a deep-copy of the data object."""
-        data_dict = {}
-        for key in self.__keys__:
-            if torch.is_tensor(self[key]):
-                data_dict[key] = self[key].clone()
-            else:
-                # TODO: with this we should stop making sid special.
-                data_dict[key] = copy.deepcopy(self[key])
-                # ""
-                # print(key)
-                # raise ValueError("keys must correspond to torch tensors.")
-        data_dict["sid"] = copy.deepcopy(self.sid)
-        data_dict["batch"] = self.batch.clone()
-        batch_stats = copy.deepcopy(self.get_batch_stats())
-        cloned = AtomicData.from_dict(data_dict)
-        cloned.assign_batch_stats(*batch_stats)
-
-        return cloned
+        """
+        Own all data while preserving aliases and non-leaf autograd links.
+        """
+        return _clone_tensor_tree(self)
 
     def __repr__(self):
         cls = str(self.__class__.__name__)
@@ -783,11 +860,17 @@ class AtomicData:
         Reconstructs the :class:`AtomicData` object at index
         :obj:`idx` from a batched AtomicData object.
         """
-        if self.num_graphs == 1 and (idx == 0 or idx == -1):
-            return self
+        if not isinstance(idx, Integral) or isinstance(idx, bool):
+            raise TypeError("AtomicData example index must be an integer")
+        idx = self.num_graphs + idx if idx < 0 else idx
+        if not 0 <= idx < self.num_graphs:
+            raise IndexError("AtomicData example index out of range")
+        if self.num_graphs == 1:
+            return self.clone()
+        if self.__slices__ is None:
+            raise ValueError("Unbatching requires stored batch slice metadata")
 
         data_dict = {}
-        idx = self.num_graphs + idx if idx < 0 else idx
         for key in self.__slices__:
             item = self[key]
             if self.__cat_dims__[key] is None:
@@ -804,18 +887,24 @@ class AtomicData:
                 else:
                     start = self.__slices__[key][idx]
                     end = self.__slices__[key][idx + 1]
-                    item = item[start:end]
-                    item = item[0] if len(item) == 1 else item
+                    if self.__cat_dims__[key] in ("list", "tuple"):
+                        item = item[start:end]
+                        if self.__cat_dims__[key] == "tuple":
+                            item = tuple(item)
+                    else:
+                        item = item[start:end]
+                        item = item[0] if len(item) == 1 else item
+                    item = _clone_tensor_tree(item)
 
             # Decrease its value by `cumsum` value:
             cum = self.__cumsum__[key][idx]
             if isinstance(item, torch.Tensor):
                 if not isinstance(cum, int) or cum != 0:
                     item = item - cum
-            elif isinstance(item, (int, float)):
+            elif isinstance(item, (int, float)) and cum != 0:
                 item = item - cum
 
-            data_dict[key] = item
+            data_dict[key] = item.clone() if torch.is_tensor(item) else item
 
         data_dict["batch"] = torch.zeros_like(data_dict["atomic_numbers"])
         data_dict["sid"] = [self.sid[idx]]
@@ -829,11 +918,21 @@ class AtomicData:
         if isinstance(idx, slice):
             idx = list(range(self.num_graphs)[idx])
 
-        elif isinstance(idx, torch.Tensor) and idx.dtype == torch.long:
+        elif isinstance(idx, torch.Tensor) and idx.dtype in (torch.int32, torch.int64):
             idx = idx.flatten().tolist()
 
         elif isinstance(idx, torch.Tensor) and idx.dtype == torch.bool:
+            if idx.numel() != self.num_graphs:
+                raise IndexError("Boolean selection must have one entry per system")
             idx = idx.flatten().nonzero(as_tuple=False).flatten().tolist()
+
+        elif isinstance(idx, np.ndarray) and idx.dtype.kind in "iub":
+            if idx.dtype.kind == "b":
+                if idx.size != self.num_graphs:
+                    raise IndexError("Boolean selection must have one entry per system")
+                idx = np.flatnonzero(idx).tolist()
+            else:
+                idx = idx.flatten().tolist()
 
         elif isinstance(idx, Sequence) and not isinstance(idx, str):
             pass
@@ -885,14 +984,24 @@ def atomicdata_list_to_batch(
     """
     # this does not include the sid/fids
     # arbitrary set of keys handled at set_item?
-    if exclude_keys is None:
-        exclude_keys = []
-    keys = list(set(data_list[0].keys()))
+    if not data_list:
+        raise ValueError("Cannot construct an AtomicData batch from an empty list")
+    if isinstance(exclude_keys, str):
+        raise TypeError("exclude_keys must be a sequence of field names")
+    excluded = set(exclude_keys or ())
+    if excluded.intersection(_REQUIRED_KEYS + ["batch", "sid"]):
+        raise ValueError("Cannot exclude required AtomicData fields")
+    keys = sorted(set(data_list[0].keys()) - excluded)
+    for index, data in enumerate(data_list):
+        if set(data.keys()) - excluded != set(keys):
+            raise ValueError(
+                f"AtomicData item {index} has different fields; use exclude_keys explicitly"
+            )
 
     batched_data_dict = {k: [] for k in keys}
     batch = []
 
-    device = None
+    device = data_list[0].pos.device
     slices = {key: [0] for key in keys}
     cumsum = {key: [0] for key in keys}
     cat_dims = {}
@@ -905,18 +1014,46 @@ def atomicdata_list_to_batch(
 
         for key in keys:
             item = data[key]
+            reference = data_list[0][key]
+            if torch.is_tensor(reference):
+                if (
+                    not torch.is_tensor(item)
+                    or item.dtype != reference.dtype
+                    or item.device != reference.device
+                    or item.ndim != reference.ndim
+                ):
+                    raise ValueError(
+                        f"Incompatible dtype, device or rank for batched field '{key}'"
+                    )
+                if item.device != device:
+                    raise ValueError(
+                        f"Batched tensor field '{key}' must be on the positions device"
+                    )
+            elif type(item) is not type(reference):
+                raise TypeError(
+                    f"Incompatible metadata types for batched field '{key}'"
+                )
 
             # Increase values by `cumsum` value.
             cum = cumsum[key][-1]
             if isinstance(item, torch.Tensor) and item.dtype != torch.bool:
                 if not isinstance(cum, int) or cum != 0:
                     item = item + cum
-            elif isinstance(item, (int, float)):
+            elif isinstance(item, (int, float)) and cum != 0:
                 item = item + cum
 
             # Gather the size of the `cat` dimension.
             size = 1
             cat_dim = data.__cat_dim__(key, data[key])
+            if not torch.is_tensor(item):
+                cat_dim = (
+                    "list"
+                    if isinstance(item, list)
+                    else "tuple"
+                    if type(item) is tuple
+                    else "object"
+                )
+                size = len(item) if cat_dim in ("list", "tuple") else 1
             # 0-dimensional torch.Tensors have no dimension along which to
             # concatenate, so we set `cat_dim` to `None`.
             if isinstance(item, torch.Tensor) and item.dim() == 0:
@@ -927,10 +1064,8 @@ def atomicdata_list_to_batch(
             if isinstance(item, torch.Tensor) and cat_dim is None:
                 cat_dim = 0  # Concatenate along this new batch dimension.
                 item = item.unsqueeze(0)
-                device = item.device
             elif isinstance(item, torch.Tensor):
                 size = item.size(cat_dim)
-                device = item.device
 
             batched_data_dict[key].append(item)  # Append item to the attribute list.
 
@@ -942,14 +1077,13 @@ def atomicdata_list_to_batch(
 
         natoms_list.append(data.natoms.item())
         sid_list.extend(data.sid)
-        item = torch.full((data.natoms,), i, dtype=torch.long, device=device)
+        item = torch.full((data.num_nodes,), i, dtype=torch.long, device=device)
         batch.append(item)
 
-    ref_data = data_list[0]
     for key in keys:
         items = batched_data_dict[key]
         item = items[0]
-        cat_dim = ref_data.__cat_dim__(key, item)
+        cat_dim = cat_dims[key]
         cat_dim = 0 if cat_dim is None else cat_dim
         if torch.is_tensor(item):
             batched_data_dict[key] = torch.cat(items, cat_dim)
@@ -959,13 +1093,13 @@ def atomicdata_list_to_batch(
         else:
             # For list attributes, flatten nested lists to maintain consistency
             # This handles cases where already-batched data is re-batched
-            if items and all(isinstance(item, list) for item in items):
+            if cat_dim in ("list", "tuple"):
                 flattened = []
                 for item in items:
                     flattened.extend(item)
-                batched_data_dict[key] = flattened
+                batched_data_dict[key] = _clone_tensor_tree(flattened)
             else:
-                batched_data_dict[key] = items
+                batched_data_dict[key] = _clone_tensor_tree(items)
 
     batched_data_dict["batch"] = torch.cat(batch, dim=-1)
     batched_data_dict["sid"] = sid_list
@@ -976,8 +1110,8 @@ def atomicdata_list_to_batch(
 
 
 def tensor_or_int_to_tensor(x, dtype=torch.int):
-    if isinstance(x, int):
-        return torch.Tensor(x, dtype=dtype)
+    if isinstance(x, Integral) and not isinstance(x, (bool, np.bool_)):
+        return torch.tensor([int(x)], dtype=dtype)
     elif isinstance(x, torch.Tensor):
         assert x.dtype == dtype, "Tensor is not of right dtype"
         return x

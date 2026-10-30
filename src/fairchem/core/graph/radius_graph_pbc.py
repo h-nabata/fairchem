@@ -9,13 +9,14 @@ from __future__ import annotations
 
 import logging
 import math
+import operator
 
 import numpy as np
 import torch
 
 from fairchem.core.graph.portable_search import (
+    _borrow_integer_cartesian_table,
     alternative_candidates,
-    integer_cartesian_table,
     source_cloud,
 )
 
@@ -250,6 +251,7 @@ def radius_graph_pbc(
         )
 
     device = data.pos.device
+    validate_graph_geometry(data)
     batch_size = len(data.natoms)
 
     # position of the atoms
@@ -300,6 +302,10 @@ def radius_graph_pbc(
 
     cross_a2a3 = torch.cross(data.cell[:, 1], data.cell[:, 2], dim=-1)
     cell_vol = torch.sum(data.cell[:, 0] * cross_a2a3, dim=-1, keepdim=True)
+    if any(pbc) and bool(((cell_vol == 0) | ~torch.isfinite(cell_vol)).any()):
+        raise ValueError(
+            "Periodic graph generation requires a nonsingular finite-volume cell"
+        )
 
     if pbc[0]:
         inv_min_dist_a1 = torch.norm(cross_a2a3 / cell_vol, p=2, dim=-1)
@@ -393,6 +399,110 @@ def radius_graph_pbc(
     return edge_index, unit_cell, num_neighbors_image
 
 
+def validate_graph_geometry(data):
+    """
+    Reject invalid coordinates before they can silently disappear from a graph.
+    """
+    if not data.pos.is_floating_point() or not data.cell.is_floating_point():
+        raise ValueError("Graph positions and cells must have floating-point dtypes")
+    if data.cell.device != data.pos.device:
+        raise ValueError("Graph positions and cells must be on the same device")
+    if data.pos.ndim != 2 or data.pos.shape[1] != 3:
+        raise ValueError("Graph positions must have shape [number of atoms, 3]")
+    if data.natoms.ndim != 1 or data.natoms.dtype not in (torch.int32, torch.int64):
+        raise ValueError("Graph natoms must be a one-dimensional integer tensor")
+    if data.cell.shape != (len(data.natoms), 3, 3):
+        raise ValueError("Graph cells must have shape [number of systems, 3, 3]")
+    if bool((data.natoms < 0).any()) or int(data.natoms.sum()) != len(data.pos):
+        raise ValueError("Graph natoms must be nonnegative and sum to the atom count")
+    if not bool(torch.isfinite(data.pos).all() & torch.isfinite(data.cell).all()):
+        raise ValueError("Graph positions and cells must contain only finite values")
+    if hasattr(data, "batch"):
+        batch = data.batch
+        if batch is None:
+            if len(data.natoms) > 1:
+                raise ValueError(
+                    "Multiple systems require an explicit graph batch index"
+                )
+        else:
+            if batch.shape != (len(data.pos),) or batch.dtype not in (
+                torch.int32,
+                torch.int64,
+            ):
+                raise ValueError("Graph batch must be a one-dimensional integer index")
+            if batch.device != data.pos.device:
+                raise ValueError("Graph batch and positions must be on the same device")
+            if bool(((batch < 0) | (batch >= len(data.natoms))).any()):
+                raise ValueError("Graph batch contains an out-of-range system index")
+            if bool((batch[1:] < batch[:-1]).any()) or not torch.equal(
+                torch.bincount(batch.long(), minlength=len(data.natoms)),
+                data.natoms.to(device=batch.device, dtype=torch.long),
+            ):
+                raise ValueError(
+                    "Graph batch must group atoms contiguously according to natoms"
+                )
+
+
+def system_pbc_flags(data, pbc=None):
+    """
+    Normalize per-system PBC without replacing or mutating caller metadata.
+    """
+    value = getattr(data, "pbc", None) if pbc is None else pbc
+    if value is None:
+        raise ValueError("PBC flags are required")
+    flags = torch.as_tensor(
+        value, device=getattr(getattr(data, "pos", None), "device", None)
+    )
+    systems = getattr(data, "natoms", None)
+    if (
+        flags.ndim not in (1, 2)
+        or flags.shape[-1] != 3
+        or (
+            flags.ndim == 2
+            and systems is not None
+            and flags.shape[0] not in (1, len(systems))
+        )
+    ):
+        raise ValueError("PBC must have shape [3], [1, 3] or [number of systems, 3]")
+    if flags.dtype != torch.bool and not bool(((flags == 0) | (flags == 1)).all()):
+        raise ValueError("PBC flags must be booleans or zero/one values")
+    return torch.atleast_2d(flags).to(dtype=torch.bool)
+
+
+def validate_graph_parameters(radius, max_neighbors, strict, method="cell"):
+    """
+    Validate scalars before a cache key or graph conversion can truncate them.
+    """
+    if not isinstance(method, str) or method not in {
+        "cell",
+        "auto",
+        "all_pairs",
+        "bvh",
+    }:
+        raise ValueError(f"Unknown graph search method: {method}")
+    if isinstance(radius, (bool, np.bool_, str)) or (
+        torch.is_tensor(radius) and radius.dtype == torch.bool
+    ):
+        raise ValueError("Graph radius must be finite and positive")
+    try:
+        radius = float(radius)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise ValueError("Graph radius must be finite and positive") from error
+    if not math.isfinite(radius) or radius <= 0:
+        raise ValueError("Graph radius must be finite and positive")
+    if isinstance(max_neighbors, (bool, np.bool_)) or (
+        torch.is_tensor(max_neighbors) and max_neighbors.dtype == torch.bool
+    ):
+        raise ValueError("max_neighbors must be an integer")
+    try:
+        max_neighbors = operator.index(max_neighbors)
+    except TypeError as error:
+        raise ValueError("max_neighbors must be an integer") from error
+    if not isinstance(strict, (bool, np.bool_)):
+        raise ValueError("enforce_max_neighbors_strictly must be a boolean")
+    return radius, max_neighbors, bool(strict)
+
+
 def canonical_pbc(data, pbc: torch.Tensor | None) -> list[bool]:
     """
     Resolve and normalize the periodic boundary condition (PBC) flags for a batch.
@@ -403,7 +513,7 @@ def canonical_pbc(data, pbc: torch.Tensor | None) -> list[bool]:
     Behavior:
       - If ``pbc`` is None, derive it from ``data.pbc``: a dimension is considered
         periodic only if at least one system in the batch is periodic along that
-        dimension. ``data.pbc`` is also normalized to be at least 2D in-place.
+        dimension. Caller metadata is unchanged.
       - If ``pbc`` has more than one dimension, collapse it across systems with a
         logical OR so that a dimension is periodic if any system requests it.
 
@@ -418,22 +528,7 @@ def canonical_pbc(data, pbc: torch.Tensor | None) -> list[bool]:
         A length-3 Python list of booleans ``[pbc_x, pbc_y, pbc_z]`` indicating
         which lattice directions are periodic for the batch.
     """
-    assert hasattr(data, "pbc"), "AtomicData does not have pbc set"
-
-    if pbc is None:
-        data.pbc = torch.atleast_2d(data.pbc)
-        pbc = torch.any(data.pbc, dim=0)
-
-    # If a per-system PBC tensor was passed in, collapse it via logical OR
-    # so a dimension is periodic when any system requests it.
-    if pbc.ndim > 1:
-        pbc = pbc.any(dim=0)
-
-    assert isinstance(pbc, torch.Tensor)
-    assert pbc.ndim == 1
-    assert pbc.shape[0] == 3
-
-    return pbc.tolist()
+    return system_pbc_flags(data, pbc).any(dim=0).tolist()
 
 
 def box_size_warning(cell, pos, pbc):
@@ -460,10 +555,11 @@ def radius_graph_pbc_v2(
     method: str = "cell",
     include_zero_distance: bool = False,
 ):
-    if method not in {"cell", "auto", "all_pairs", "bvh"}:
-        raise ValueError(f"Unknown graph search method: {method}")
-    if not math.isfinite(radius) or radius <= 0:
-        raise ValueError("Graph radius must be finite and positive")
+    radius, max_num_neighbors_threshold, enforce_max_neighbors_strictly = (
+        validate_graph_parameters(
+            radius, max_num_neighbors_threshold, enforce_max_neighbors_strictly, method
+        )
+    )
     # Strict tie selection is historically tied to the old cell traversal.
     # Preserve that path instead of changing which degenerate neighbors survive.
     legacy_order = enforce_max_neighbors_strictly and max_num_neighbors_threshold > 0
@@ -472,16 +568,26 @@ def radius_graph_pbc_v2(
     # Preserve the per-system flags before canonical_pbc collapses them. An
     # explicit override (including always_use_pbc) must also control image
     # repetitions, not only the global warning/check flags.
-    sys_pbc = torch.atleast_2d(data.pbc if pbc is None else pbc).to(
-        device=data.pos.device, dtype=torch.bool
-    )
-    pbc = canonical_pbc(data, pbc)
+    sys_pbc = system_pbc_flags(data, pbc)
+    pbc = sys_pbc.any(dim=0).tolist()
 
     device = data.pos.device
+    validate_graph_geometry(data)
     batch_size = len(data.natoms)
-    if len(data.pos) == 0 or (
-        hasattr(data, "node_partition") and len(data.node_partition) == 0
-    ):
+    node_partition = None
+    if hasattr(data, "node_partition"):
+        node_partition = torch.as_tensor(data.node_partition, device=device)
+        if node_partition.ndim != 1 or node_partition.dtype not in (
+            torch.int32,
+            torch.int64,
+        ):
+            raise ValueError("node_partition must be a one-dimensional integer index")
+        if bool(((node_partition < 0) | (node_partition >= len(data.pos))).any()):
+            raise ValueError("node_partition contains an out-of-range atom index")
+        if node_partition.unique().numel() != node_partition.numel():
+            raise ValueError("node_partition must not contain duplicate atom indices")
+        node_partition = node_partition.long()
+    if len(data.pos) == 0 or (node_partition is not None and len(node_partition) == 0):
         return (
             torch.empty((2, 0), device=device, dtype=torch.long),
             data.cell.new_empty((0, 3)),
@@ -510,6 +616,16 @@ def radius_graph_pbc_v2(
 
     cross_a2a3 = torch.cross(data.cell[:, 1], data.cell[:, 2], dim=-1)
     cell_vol = torch.sum(data.cell[:, 0] * cross_a2a3, dim=-1, keepdim=True)
+
+    if bool(
+        (
+            sys_pbc.any(dim=1)
+            & ((cell_vol[:, 0] == 0) | ~torch.isfinite(cell_vol[:, 0]))
+        ).any()
+    ):
+        raise ValueError(
+            "Periodic graph generation requires a nonsingular finite-volume cell"
+        )
 
     # Use per-system PBC so mixed-PBC batches are handled correctly.
     # Each system's rep (number of periodic image repetitions) is computed from
@@ -546,7 +662,9 @@ def radius_graph_pbc_v2(
     # recomputed at every call, including cache rebuilds after cell changes.
     unit_cell = torch.cat(
         [
-            integer_cartesian_table(*map(int, repetitions), device).to(data.cell.dtype)
+            _borrow_integer_cartesian_table(*map(int, repetitions), device).to(
+                data.cell.dtype
+            )
             for repetitions in rep.tolist()
         ]
     )
@@ -562,7 +680,7 @@ def radius_graph_pbc_v2(
         # Neighbor capping expects edges grouped by global target index.
         # Canonicalize a private index tensor without changing the caller's
         # partition; arbitrary input order otherwise corrupts capped graphs.
-        node_partition, _ = torch.sort(data.node_partition)
+        node_partition, _ = torch.sort(node_partition)
         target_atom_pos = atom_pos[node_partition]
         target_atom_image = data_batch_idxs[node_partition]
     else:
@@ -701,7 +819,9 @@ def radius_graph_pbc_v2(
         )
 
         padding_offsets = (
-            integer_cartesian_table(padding_size, padding_size, padding_size, device)
+            _borrow_integer_cartesian_table(
+                padding_size, padding_size, padding_size, device
+            )
             .unsqueeze(0)
             .expand(batch_size, -1, -1)
         )

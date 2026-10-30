@@ -126,7 +126,7 @@ def test_torch_dtype_input_passes_through():
 
 
 def test_invalid_string_raises():
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError):
         InferenceSettings(base_precision_dtype="int8")
 
 

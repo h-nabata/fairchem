@@ -2,6 +2,10 @@
 
 2026-10-30 / `intel-xpu-fp32`
 
+Follow-up: [library interoperability audit](intel_xpu_interoperability_audit.md)
+records the ASE/TorchSim job checks, ownership fixes, configuration-loading
+regressions, and boundaries of CPU versus physical-GPU validation.
+
 This document tracks all 33 accuracy-preserving items in the
 [optimization roadmap](intel_xpu_optimization_roadmap.md). Series B is deferred:
 this change adds no mixed precision, quantization, reduced cutoff, approximate

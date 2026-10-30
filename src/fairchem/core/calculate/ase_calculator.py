@@ -7,13 +7,19 @@ LICENSE file in the root directory of this source tree.
 
 from __future__ import annotations
 
+import copy
 import logging
 from collections import Counter
 from functools import partial
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
-from ase.calculators.calculator import Calculator, PropertyNotImplementedError
+from ase.calculators.calculator import (
+    Calculator,
+    PropertyNotImplementedError,
+    all_changes,
+    equal,
+)
 from ase.stress import full_3x3_to_voigt_6_stress
 
 from fairchem.core.calculate import pretrained_mlip
@@ -27,6 +33,80 @@ if TYPE_CHECKING:
     from ase import Atoms
 
     from fairchem.core.units.mlip_unit import MLIPPredictUnit
+
+
+def _metadata_equal(first, second):
+    """
+    Compare ASE metadata without ndarray truth-value coercion.
+    """
+    if isinstance(first, dict) and isinstance(second, dict):
+        return first.keys() == second.keys() and all(
+            _metadata_equal(first[key], second[key]) for key in first
+        )
+    if isinstance(first, (list, tuple)) and isinstance(second, (list, tuple)):
+        return len(first) == len(second) and all(
+            _metadata_equal(a, b) for a, b in zip(first, second)
+        )
+    try:
+        return equal(first, second)
+    except (TypeError, ValueError, RuntimeError):
+        return False
+
+
+def _owned_prediction_array(value, name):
+    """
+    Copy prediction storage across the Tensor/NumPy calculator boundary.
+    """
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().numpy()
+    array = np.array(value, copy=True)
+    if array.dtype.kind not in "biuf" or not np.isfinite(array).all():
+        raise ValueError(f"Prediction {name!r} must contain finite real numbers")
+    return array
+
+
+def _calculator_predictions(pred, properties, natoms):
+    """
+    Normalize ASE output shapes without exposing predictor buffers.
+    """
+    results = {}
+    for name in properties:
+        if name not in pred:
+            continue
+        value = _owned_prediction_array(pred[name], name)
+        if name == "energy":
+            if value.size != 1:
+                raise ValueError(
+                    f"Energy must contain one value, got shape {value.shape}"
+                )
+            results["energy"] = results["free_energy"] = float(value.item())
+        elif name == "forces":
+            if value.shape != (natoms, 3):
+                raise ValueError(
+                    f"Forces must have shape ({natoms}, 3), got {value.shape}"
+                )
+            results[name] = value
+        elif name == "stress":
+            if value.shape in ((6,), (1, 6)):
+                results[name] = value.reshape(6)
+            elif value.shape in ((9,), (1, 9), (3, 3), (1, 3, 3)):
+                results[name] = full_3x3_to_voigt_6_stress(value.reshape(3, 3))
+            else:
+                raise ValueError(
+                    f"Stress must be a 3x3 tensor or six Voigt components, got {value.shape}"
+                )
+        elif name == "hessian":
+            expected = (3 * natoms, 3 * natoms)
+            if value.shape == (1, *expected):
+                value = value[0]
+            if value.shape != expected:
+                raise ValueError(
+                    f"Hessian must have shape {expected}, got {value.shape}"
+                )
+            results[name] = value
+        else:
+            results[name] = value.item() if value.ndim == 0 else value
+    return results
 
 
 class FAIRChemCalculator(Calculator):
@@ -170,7 +250,7 @@ class FAIRChemCalculator(Calculator):
             list: A list of changes detected in the system.
         """
         state = super().check_state(atoms, tol=tol)
-        if (not state) and (self.atoms.info != atoms.info):
+        if not state and not _metadata_equal(self.atoms.info, atoms.info):
             state.append("info")
         return state
 
@@ -183,7 +263,7 @@ class FAIRChemCalculator(Calculator):
             msg = str(exc)
             if name in ("forces", "stress", "hessian"):
                 msg += (
-                    f"\n {name} prediction can be enabled by setting `predict_untrained_{name}=set('{self.task_name}')` "
+                    f"\n {name} prediction can be enabled by setting `predict_untrained_{name}={{{self.task_name!r}}}` "
                     f"in the InferenceSettings."
                 )
             raise PropertyNotImplementedError(msg) from exc
@@ -191,7 +271,10 @@ class FAIRChemCalculator(Calculator):
         return result
 
     def calculate(
-        self, atoms: Atoms, properties: list[str], system_changes: list[str]
+        self,
+        atoms: Atoms | None = None,
+        properties: list[str] | tuple[str, ...] = ("energy",),
+        system_changes: list[str] = all_changes,
     ) -> None:
         """
         Perform the calculation for the given atomic structure.
@@ -210,6 +293,18 @@ class FAIRChemCalculator(Calculator):
               It is only set for ASE routines/optimizers that are hard-coded to use this rather than the `energy` key.
         """
 
+        atoms = self.atoms if atoms is None else atoms
+        if atoms is None:
+            raise ValueError("No atoms supplied to the calculator")
+        try:
+            self._calculate(atoms, properties, system_changes)
+        except BaseException:
+            # Direct calculate_properties() bypasses get_property()'s normal
+            # invalidation. Never leave old results on a new Atoms snapshot.
+            self.reset()
+            raise
+
+    def _calculate(self, atoms, properties, system_changes):
         # Our calculators won't work if natoms=0
         if len(atoms) == 0:
             raise ValueError("Atoms object has no atoms inside.")
@@ -223,6 +318,8 @@ class FAIRChemCalculator(Calculator):
 
         # Standard call to check system_changes etc
         Calculator.calculate(self, atoms, properties, system_changes)
+        # ASE's Atoms.copy() shallow-copies info; own nested metadata too.
+        self.atoms.info = copy.deepcopy(atoms.info)
 
         # Convert using the current a2g object
         data = self.a2g(atoms)
@@ -241,27 +338,11 @@ class FAIRChemCalculator(Calculator):
         else:
             pred = self.predictor.predict(data)
 
-        # Collect the results into self.results
-        self.results = {} if system_changes else dict(self.results)
-        for calc_key in self.implemented_properties:
-            if calc_key not in pred:
-                continue
-            if calc_key == "energy":
-                energy = float(pred[calc_key].detach().cpu().numpy()[0])
-
-                self.results["energy"] = self.results["free_energy"] = (
-                    energy  # Free energy is a copy of energy
-                )
-            if calc_key == "forces":
-                forces = pred[calc_key].detach().cpu().numpy()
-                self.results["forces"] = forces
-            if calc_key == "stress":
-                stress = pred[calc_key].detach().cpu().numpy().reshape(3, 3)
-                stress_voigt = full_3x3_to_voigt_6_stress(stress)
-                self.results["stress"] = stress_voigt
-            if calc_key == "hessian":
-                hessian = pred[calc_key].detach().cpu().numpy().squeeze()
-                self.results["hessian"] = hessian
+        results = {} if system_changes else dict(self.results)
+        results.update(
+            _calculator_predictions(pred, self.implemented_properties, len(atoms))
+        )
+        self.results = results
 
     def _check_atoms_pbc(self, atoms) -> None:
         """
@@ -301,7 +382,8 @@ class FormationEnergyCalculator(Calculator):
                 ]
             else:
                 raise ValueError("element_references must be provided")
-        self.element_references = element_references
+        self.element_references = copy.deepcopy(element_references)
+        self._reference_snapshot = None
 
         if apply_corrections is True:
             if isinstance(calculator, FAIRChemCalculator):
@@ -328,10 +410,26 @@ class FormationEnergyCalculator(Calculator):
         self._correction_type = correction_type
 
         if hasattr(calculator, "implemented_properties"):
-            self.implemented_properties = calculator.implemented_properties
+            self.implemented_properties = list(calculator.implemented_properties)
+
+    def check_state(self, atoms, tol=1e-15):
+        state = super().check_state(atoms, tol=tol)
+        if not state and not _metadata_equal(self.atoms.info, atoms.info):
+            state.append("info")
+        configuration = (
+            self.element_references,
+            self.apply_corrections,
+            self._correction_type,
+        )
+        if not state and not _metadata_equal(self._reference_snapshot, configuration):
+            state.append("parameters")
+        return state
 
     def calculate(
-        self, atoms: Atoms, properties: list[str], system_changes: list[str]
+        self,
+        atoms: Atoms | None = None,
+        properties: list[str] | tuple[str, ...] = ("energy",),
+        system_changes: list[str] = all_changes,
     ) -> None:
         """
         Calculate formation energy by wrapping the base calculator.
@@ -341,12 +439,24 @@ class FormationEnergyCalculator(Calculator):
             properties (list[str]): The list of properties to calculate.
             system_changes (list[str]): The list of changes in the system.
         """
+        atoms = self.atoms if atoms is None else atoms
+        if atoms is None:
+            raise ValueError("No atoms supplied to the calculator")
+        try:
+            self._calculate(atoms, properties, system_changes)
+        except BaseException:
+            self.reset()
+            raise
+
+    def _calculate(self, atoms, properties, system_changes):
+        Calculator.calculate(self, atoms, properties, system_changes)
+        self.atoms.info = copy.deepcopy(atoms.info)
         self.calculator.calculate(atoms, properties, system_changes)
 
-        self.results = self.calculator.results.copy()
+        results = copy.deepcopy(self.calculator.results)
 
-        if "energy" in self.results:
-            total_energy = self.results["energy"]
+        if "energy" in results:
+            total_energy = results["energy"]
 
             if self.apply_corrections:
                 try:
@@ -379,10 +489,14 @@ class FormationEnergyCalculator(Calculator):
 
             formation_energy = total_energy - total_ref_energy
 
-            self.results["energy"] = formation_energy
+            results["energy"] = formation_energy
 
-            if "free_energy" in self.results:
-                self.results["free_energy"] = formation_energy
+            if "free_energy" in results:
+                results["free_energy"] = formation_energy
+        self.results = results
+        self._reference_snapshot = copy.deepcopy(
+            (self.element_references, self.apply_corrections, self._correction_type)
+        )
 
 
 class AllZeroUnitCellError(ValueError):

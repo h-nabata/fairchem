@@ -208,15 +208,23 @@ def test_charge_spin_handling(direct_checkpoint, charge: float, spin: float) -> 
     assert torch.isfinite(result["forces"]).all()
 
 
-def _add_default_charge_spin(state: ts.SimState) -> ts.SimState:
-    """Inject zero charge and spin extras for UMA models that require them."""
-    if not state.has_extras("charge"):
-        state.charge = torch.zeros(
-            state.n_systems, dtype=state.dtype, device=state.device
+def _prepare_validation_state(state: ts.SimState) -> ts.SimState:
+    """
+    Supply explicit metadata and a reference volume for molecular stress.
+
+    TorchSim's validator includes a benzene molecule with a zero cell. Stress
+    is undefined without a volume; choose a finite nonperiodic box explicitly
+    in this test rather than asking production code to invent one.
+    """
+    for name in ("charge", "spin"):
+        state.system_extras.setdefault(
+            name,
+            torch.zeros(state.n_systems, dtype=torch.long, device=state.device),
         )
-    if not state.has_extras("spin"):
-        state.spin = torch.zeros(
-            state.n_systems, dtype=state.dtype, device=state.device
+    if not state.pbc.any():
+        missing_cell = torch.linalg.det(state.cell) == 0
+        state.cell[missing_cell] = 10 * torch.eye(
+            3, dtype=state.dtype, device=state.device
         )
     return state
 
@@ -231,7 +239,7 @@ def test_model_output_validation(
     """Test that a model implementation follows the ModelInterface contract."""
     model: ModelInterface = request.getfixturevalue(model_fixture_name)
     validate_model_outputs(
-        model, DEVICE, DTYPE, state_modifier=_add_default_charge_spin
+        model, DEVICE, DTYPE, state_modifier=_prepare_validation_state
     )
 
 
@@ -242,7 +250,7 @@ def test_model_output_validation_with_stress(conserving_mole_checkpoint) -> None
         model=checkpoint_path, task_name="oc20", device=DEVICE, compute_stress=True
     )
     validate_model_outputs(
-        model, DEVICE, DTYPE, state_modifier=_add_default_charge_spin
+        model, DEVICE, DTYPE, state_modifier=_prepare_validation_state
     )
 
 

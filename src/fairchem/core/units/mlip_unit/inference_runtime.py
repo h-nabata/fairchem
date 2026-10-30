@@ -8,11 +8,32 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 import logging
+import threading
 from collections import OrderedDict
 from dataclasses import dataclass
+from numbers import Integral
+from types import MethodType
 
 import torch
 from torch.utils import _pytree
+
+
+@dataclass(eq=False)
+class _TensorIdentity:
+    """
+    Retain replaced tensors so a recycled Python id cannot match old weights.
+    """
+
+    tensor: torch.Tensor
+
+    def __eq__(self, other):
+        return isinstance(other, _TensorIdentity) and self.tensor is other.tensor
+
+
+def _positive_integer(value, name):
+    if isinstance(value, bool) or not isinstance(value, Integral) or value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return int(value)
 
 
 def model_tensor_signature(model):
@@ -29,7 +50,17 @@ def model_tensor_signature(model):
                 "Cached/compiled models require parameter mutation counters. "
                 "Construct the predictor outside torch.inference_mode()."
             )
-        signature.append((name, id(value), value._version, value.device, value.dtype))
+        signature.append(
+            (
+                name,
+                _TensorIdentity(value),
+                value._version,
+                value.device,
+                value.dtype,
+                tuple(value.shape),
+                value.requires_grad,
+            )
+        )
     return tuple(signature)
 
 
@@ -53,6 +84,10 @@ class ModelStreamGuard:
     """
 
     def __init__(self, model):
+        self._restore = False
+        self._initialize(model)
+
+    def _initialize(self, model):
         devices = {
             tensor.device
             for tensor in list(model.parameters()) + list(model.buffers())
@@ -66,6 +101,19 @@ class ModelStreamGuard:
             self.ready[device] = (stream, event)
 
     def wait_and_record(self, model):
+        if self._restore:
+            # Copy/load can change device or creation stream. Original events
+            # must not be reused with restored tensors. Order all prior copies
+            # once before establishing the new immutable-weight event.
+            devices = {
+                tensor.device
+                for tensor in list(model.parameters()) + list(model.buffers())
+                if tensor.device.type == "xpu"
+            }
+            for device in devices:
+                torch.xpu.synchronize(device)
+            self._initialize(model)
+            self._restore = False
         streams = {}
         for device, (origin, ready) in self.ready.items():
             stream = torch.xpu.current_stream(device)
@@ -76,6 +124,13 @@ class ModelStreamGuard:
             for tensor in list(model.parameters()) + list(model.buffers()):
                 if tensor.device in streams:
                     tensor.record_stream(streams[tensor.device])
+
+    def __getstate__(self):
+        return {}
+
+    def __setstate__(self, state):
+        self.ready = {}
+        self._restore = True
 
 
 def mole_composition_key(data, *, device, dtype, model_id, settings_key):
@@ -120,10 +175,10 @@ class PreparedModelCache:
     """
 
     def __init__(self, max_entries, max_bytes=None):
-        if max_entries < 1 or (max_bytes is not None and max_bytes < 1):
-            raise ValueError("Prepared model cache limits must be positive")
-        self.max_entries = max_entries
-        self.max_bytes = max_bytes
+        self.max_entries = _positive_integer(max_entries, "max_entries")
+        self.max_bytes = (
+            None if max_bytes is None else _positive_integer(max_bytes, "max_bytes")
+        )
         self._entries = OrderedDict()
         self.bytes = 0
         self.hits = 0
@@ -167,6 +222,20 @@ class PreparedModelCache:
         return len(self._entries)
 
 
+class _OwnedGraphInput(torch.autograd.Function):
+    """
+    Keep captured backward workspaces out of externally returned gradients.
+    """
+
+    @staticmethod
+    def forward(ctx, value):
+        return value
+
+    @staticmethod
+    def backward(ctx, gradient):
+        return None if gradient is None else gradient.clone()
+
+
 class NumericCoreRuntime:
     """
     Compile or capture a tensor-only numeric block, keeping an eager reference.
@@ -188,23 +257,63 @@ class NumericCoreRuntime:
         graph_cache_size=1,
     ):
         self.function = function
+        self._compile_enabled = compile
+        self._dynamic = dynamic
         self.compiled = torch.compile(function, dynamic=dynamic) if compile else None
         self.xpu_graph = xpu_graph
-        self.graph_cache_size = graph_cache_size
+        self.graph_cache_size = _positive_integer(graph_cache_size, "graph_cache_size")
         self.higher_order = False
         self._graphs = OrderedDict()
         self._failed_captures = OrderedDict()
         owner = getattr(function, "__self__", None)
         self.owner = owner if isinstance(owner, torch.nn.Module) else None
-        self._owner_signature = (
-            model_tensor_signature(self.owner) if self.owner is not None else None
-        )
+        self._owner_signature = self._execution_signature()
+        self._lock = threading.RLock()
         self.capture_count = 0
         self.replay_count = 0
 
     def clear(self):
-        self._graphs.clear()
-        self._failed_captures.clear()
+        with self._lock:
+            self._graphs.clear()
+            self._failed_captures.clear()
+
+    def _execution_signature(self):
+        if self.owner is None:
+            return None
+        return (
+            model_tensor_signature(self.owner),
+            tuple(
+                (name, module.training) for name, module in self.owner.named_modules()
+            ),
+        )
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # Capture closures and compiled bound methods can refer to the original
+        # module. Recreate them against the copied function on its first call.
+        state.update(
+            compiled=None,
+            _graphs=OrderedDict(),
+            _failed_captures=OrderedDict(),
+            _owner_signature=None,
+            capture_count=0,
+            replay_count=0,
+            higher_order=False,
+        )
+        state.pop("_lock", None)
+        if isinstance(self.function, MethodType) and self.owner is not None:
+            # Pickling a bound method by name would look up the replacement
+            # ``module.forward`` and bind the runtime recursively to itself.
+            state["_method_function"] = self.function.__func__
+            state["function"] = None
+        return state
+
+    def __setstate__(self, state):
+        method_function = state.pop("_method_function", None)
+        self.__dict__.update(state)
+        if method_function is not None:
+            self.function = MethodType(method_function, self.owner)
+        self._lock = threading.RLock()
 
     def _graph_arguments(self, args, kwargs):
         if not (
@@ -216,7 +325,8 @@ class NumericCoreRuntime:
         # parameters. In inference these are frozen; a trainable owner must use
         # the ordinary callable so parameter gradients are never lost.
         if self.owner is not None and any(
-            parameter.requires_grad for parameter in self.owner.parameters()
+            tensor.requires_grad
+            for tensor in list(self.owner.parameters()) + list(self.owner.buffers())
         ):
             return None
         leaves, spec = _pytree.tree_flatten((args, kwargs))
@@ -253,8 +363,14 @@ class NumericCoreRuntime:
         )
 
     def __call__(self, *args, **kwargs):
+        # The Python submission and output clone must form one transaction:
+        # otherwise another thread can replay into a shared output in between.
+        with self._lock:
+            return self._call_locked(*args, **kwargs)
+
+    def _call_locked(self, *args, **kwargs):
         if self.owner is not None:
-            signature = model_tensor_signature(self.owner)
+            signature = self._execution_signature()
             if signature != self._owner_signature:
                 self.clear()
                 self._owner_signature = signature
@@ -263,6 +379,8 @@ class NumericCoreRuntime:
         )()
         if self.higher_order or transforms_active:
             return self.function(*args, **kwargs)
+        if self._compile_enabled and self.compiled is None:
+            self.compiled = torch.compile(self.function, dynamic=self._dynamic)
         function = self.compiled if self.compiled is not None else self.function
         arguments = self._graph_arguments(args, kwargs) if self.xpu_graph else None
         if arguments is not None:
@@ -271,7 +389,7 @@ class NumericCoreRuntime:
             if entry is not None and entry.busy:
                 # A caller may delay backward. Replaying here would overwrite
                 # the saved static inputs needed by that earlier backward.
-                return function(*args, **kwargs)
+                return self._run_uncaptured(*args, **kwargs)
             if entry is None and key not in self._failed_captures:
                 indices = [
                     index
@@ -289,7 +407,13 @@ class NumericCoreRuntime:
                     for index, value in zip(indices, values):
                         current[index] = value
                     positional, named = _pytree.tree_unflatten(current, spec)
-                    return function(*positional, **named)
+                    output = function(*positional, **named)
+                    output_leaves = _pytree.tree_leaves(output)
+                    if not output_leaves or any(
+                        not torch.is_tensor(value) for value in output_leaves
+                    ):
+                        raise TypeError("XPU graph outputs must contain only tensors")
+                    return output
 
                 samples = tuple(
                     t.detach().clone().requires_grad_(t.requires_grad) for t in tensors
@@ -331,8 +455,18 @@ class NumericCoreRuntime:
                 grad_inputs = tuple(t for t in tensors if t.requires_grad)
                 entry.busy = bool(grad_inputs) and torch.is_grad_enabled()
                 try:
+                    # PyTorch's graphed backward returns views of its static
+                    # gradient buffers. Clone at the input's backward boundary
+                    # so a subsequent replay cannot overwrite autograd.grad's
+                    # previously returned tensors.
+                    owned_inputs = tuple(
+                        _OwnedGraphInput.apply(value)
+                        if value.requires_grad and torch.is_grad_enabled()
+                        else value
+                        for value in tensors
+                    )
                     output = _pytree.tree_map(
-                        lambda value: value.clone(), entry.function(*tensors)
+                        lambda value: value.clone(), entry.function(*owned_inputs)
                     )
                 except Exception:
                     entry.busy = False
@@ -351,10 +485,11 @@ class NumericCoreRuntime:
 
                         def release():
                             if not retained:
-                                entry.busy = False
-                                for handle in entry.hooks:
-                                    handle.remove()
-                                entry.hooks.clear()
+                                with self._lock:
+                                    entry.busy = False
+                                    for handle in entry.hooks:
+                                        handle.remove()
+                                    entry.hooks.clear()
 
                         torch.autograd.Variable._execution_engine.queue_callback(
                             release
@@ -369,6 +504,10 @@ class NumericCoreRuntime:
                 else:
                     entry.busy = False
                 return output
+        return self._run_uncaptured(*args, **kwargs)
+
+    def _run_uncaptured(self, *args, **kwargs):
+        function = self.compiled if self.compiled is not None else self.function
         try:
             return function(*args, **kwargs)
         except (
@@ -382,6 +521,7 @@ class NumericCoreRuntime:
                 error,
             )
             self.compiled = None
+            self._compile_enabled = False
             self.clear()
             return self.function(*args, **kwargs)
 
@@ -398,14 +538,15 @@ def configure_numeric_runtime(backbone, settings):
     Install per-block runtimes without changing parameter names or state_dict.
     """
     enabled_compile = settings.compile and settings.compile_scope == "blocks"
-    if not (enabled_compile or settings.xpu_graph):
-        return []
+    enabled = enabled_compile or settings.xpu_graph
     blocks = getattr(backbone, "blocks", None)
     if blocks is None:
+        if not enabled:
+            return []
         raise ValueError(
             "Numeric-block compile/graph execution requires a block-based backbone"
         )
-    if settings.activation_checkpointing:
+    if enabled and settings.activation_checkpointing:
         raise ValueError(
             "Numeric-block compile/graph execution requires activation_checkpointing=False"
         )
@@ -422,14 +563,39 @@ def configure_numeric_runtime(backbone, settings):
         if hasattr(radial, "forward_decomposed"):
             targets.append((radial, "forward_decomposed"))
     runtimes = []
+    replacements = []
     for module, method_name in targets:
+        current = getattr(module, method_name)
+        if (
+            enabled
+            and isinstance(current, NumericCoreRuntime)
+            and not isinstance(current.function, NumericCoreRuntime)
+            and current._compile_enabled == enabled_compile
+            and current._dynamic == settings.compile_dynamic
+            and current.xpu_graph == settings.xpu_graph
+            and current.graph_cache_size == settings.xpu_graph_cache_size
+        ):
+            runtimes.append(current)
+            continue
+        function = current
+        while isinstance(function, NumericCoreRuntime):
+            function = function.function
+        if not enabled:
+            replacements.append((module, method_name, current, function))
+            continue
         runtime = NumericCoreRuntime(
-            getattr(module, method_name),
+            function,
             compile=enabled_compile,
             dynamic=settings.compile_dynamic,
             xpu_graph=settings.xpu_graph,
             graph_cache_size=settings.xpu_graph_cache_size,
         )
-        setattr(module, method_name, runtime)
+        replacements.append((module, method_name, current, runtime))
         runtimes.append(runtime)
+    # Construct every replacement first. A failing compile configuration must
+    # not leave only a subset of the backbone wrapped.
+    for module, method_name, previous, replacement in replacements:
+        if isinstance(previous, NumericCoreRuntime):
+            previous.clear()
+        setattr(module, method_name, replacement)
     return runtimes

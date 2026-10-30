@@ -15,8 +15,10 @@ import time
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import asdict, dataclass, field
 from multiprocessing import cpu_count
+from numbers import Integral, Real
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
 from monty.dev import requires
 
@@ -147,6 +149,26 @@ class BatchConfig:
     batch_wait_timeout_s: float = DEFAULT_BATCH_WAIT_TIMEOUT_S
     split_oom_batch: bool = False
 
+    def __post_init__(self):
+        if (
+            isinstance(self.max_batch_size, bool)
+            or not isinstance(self.max_batch_size, Integral)
+            or self.max_batch_size < 1
+        ):
+            raise ValueError("max_batch_size must be a positive integer")
+        if (
+            isinstance(self.batch_wait_timeout_s, bool)
+            or not isinstance(self.batch_wait_timeout_s, Real)
+            or not math.isfinite(self.batch_wait_timeout_s)
+            or self.batch_wait_timeout_s < 0
+        ):
+            raise ValueError("batch_wait_timeout_s must be a finite nonnegative number")
+        if not isinstance(self.split_oom_batch, (bool, np.bool_)):
+            raise ValueError("split_oom_batch must be a boolean")
+        self.max_batch_size = int(self.max_batch_size)
+        self.batch_wait_timeout_s = float(self.batch_wait_timeout_s)
+        self.split_oom_batch = bool(self.split_oom_batch)
+
     def to_init_kwargs(self) -> dict[str, Any]:
         """Return ``{name: value}`` for fields that were explicitly set (non-None)."""
         return {k: v for k, v in asdict(self).items() if v is not None}
@@ -187,8 +209,9 @@ class BatchPredictServerMixin:
             max_batch_size: Maximum number of atoms in a batch.
             batch_wait_timeout_s: Timeout in seconds to wait for a full batch.
         """
-        self.predict.set_max_batch_size(max_batch_size)
-        self.predict.set_batch_wait_timeout_s(batch_wait_timeout_s)
+        config = BatchConfig(max_batch_size, batch_wait_timeout_s)
+        self.predict.set_max_batch_size(config.max_batch_size)
+        self.predict.set_batch_wait_timeout_s(config.batch_wait_timeout_s)
 
     def reconfigure(self, user_config: dict) -> None:
         """
@@ -212,12 +235,22 @@ class BatchPredictServerMixin:
         batch_wait_timeout_s = user_config.get("batch_wait_timeout_s")
         split_oom_batch = user_config.get("split_oom_batch")
 
+        config = BatchConfig(
+            max_batch_size=max_batch_size
+            if max_batch_size is not None
+            else DEFAULT_MAX_BATCH_SIZE,
+            batch_wait_timeout_s=batch_wait_timeout_s
+            if batch_wait_timeout_s is not None
+            else DEFAULT_BATCH_WAIT_TIMEOUT_S,
+            split_oom_batch=split_oom_batch if split_oom_batch is not None else False,
+        )
+
         if max_batch_size is not None:
-            self.predict.set_max_batch_size(max_batch_size)
+            self.predict.set_max_batch_size(config.max_batch_size)
         if batch_wait_timeout_s is not None:
-            self.predict.set_batch_wait_timeout_s(batch_wait_timeout_s)
+            self.predict.set_batch_wait_timeout_s(config.batch_wait_timeout_s)
         if split_oom_batch is not None:
-            self.split_oom_batch = bool(split_oom_batch)
+            self.split_oom_batch = config.split_oom_batch
 
         logging.info(
             f"Reconfigured batching: max_batch_size={max_batch_size} "
@@ -277,6 +310,28 @@ class BatchPredictServerMixin:
         """
         Run batched inference with OOM splitting.
         """
+        if not items:
+            return []
+        groups = defaultdict(list)
+        for index, data in enumerate(items):
+            if data.num_graphs != 1:
+                raise ValueError("Each server request must contain exactly one system")
+            # A property need not exist for every dataset. Mixing datasets can
+            # produce a shortened collated tensor that cannot be assigned back
+            # to the right request by its shape alone.
+            key = (tuple(data.dataset), data.pos.device, data.pos.dtype)
+            groups[key].append(index)
+        if len(groups) > 1:
+            ordered = [None] * len(items)
+            for indices in groups.values():
+                outputs = self._run_batched_inference(
+                    [items[index] for index in indices],
+                    predict_unit,
+                    undo_element_references,
+                )
+                for index, output in zip(indices, outputs, strict=True):
+                    ordered[index] = output
+            return ordered
         data_deque: deque[list[AtomicData]] = deque([items])
         results: list[dict] = []
         while data_deque:
@@ -287,8 +342,10 @@ class BatchPredictServerMixin:
                 preds = predict_unit.predict(
                     batch, undo_element_references=undo_element_references
                 )
-                results.extend(self._split_predictions(preds, batch))
+                results.extend(self._split_predictions(preds, batch, predict_unit))
+                preds = None
             except torch.OutOfMemoryError as err:
+                preds = None
                 if not self.split_oom_batch:
                     raise torch.OutOfMemoryError(
                         "Out of memory during batched inference. "
@@ -307,8 +364,17 @@ class BatchPredictServerMixin:
                     "Caught out of memory error. Splitting batch and retrying."
                 )
                 oom = True
-                torch.cuda.empty_cache()
+                from fairchem.core.units.mlip_unit.predict import (
+                    _clear_exception_tracebacks,
+                )
+
+                _clear_exception_tracebacks(err)
             if oom:
+                device = torch.device(getattr(predict_unit, "device", batch.pos.device))
+                if device.type in {"cuda", "xpu"}:
+                    accelerator = getattr(torch, device.type)
+                    with accelerator.device(device):
+                        accelerator.empty_cache()
                 mid = len(current) // 2
                 data_deque.appendleft(current[mid:])
                 data_deque.appendleft(current[:mid])
@@ -349,8 +415,12 @@ class BatchPredictServerMixin:
                     f"{len(undo_element_references)} but the batch contains "
                     f"{num_requests} request(s)."
                 )
-            return list(undo_element_references)
-        return [undo_element_references] * num_requests
+            flags = list(undo_element_references)
+        else:
+            flags = [undo_element_references] * num_requests
+        if any(not isinstance(flag, (bool, np.bool_)) for flag in flags):
+            raise TypeError("undo_element_references must contain boolean values")
+        return [bool(flag) for flag in flags]
 
     def _run_grouped_inference(
         self,
@@ -373,6 +443,7 @@ class BatchPredictServerMixin:
         Returns:
             List of prediction dictionaries, one per input, in original order.
         """
+        undo_flags = self._normalize_undo_flags(undo_flags, len(data_list))
         results: list[dict | None] = [None] * len(data_list)
 
         groups: dict[bool, list[int]] = defaultdict(list)
@@ -383,7 +454,7 @@ class BatchPredictServerMixin:
             group_results = self._run_batched_inference(
                 [data_list[index] for index in indices], predict_unit, flag
             )
-            for index, prediction in zip(indices, group_results):
+            for index, prediction in zip(indices, group_results, strict=True):
                 results[index] = prediction
 
         return results
@@ -411,6 +482,7 @@ class BatchPredictServerMixin:
         self,
         predictions: dict,
         batch: AtomicData,
+        predict_unit=None,
     ) -> list[dict]:
         """
         Split batched predictions back into individual system predictions.
@@ -422,30 +494,54 @@ class BatchPredictServerMixin:
         Returns:
             List of prediction dictionaries, one per system
         """
+        levels = {}
+        for dataset, tasks in getattr(predict_unit, "dataset_to_tasks", {}).items():
+            if dataset not in batch.dataset:
+                continue
+            for task in tasks:
+                if task.level not in {"atom", "system"}:
+                    continue
+                if task.property in levels and levels[task.property] != task.level:
+                    raise ValueError(
+                        f"Conflicting prediction levels for {task.property!r}"
+                    )
+                levels[task.property] = task.level
+        system_count = batch.num_graphs
+        atom_count = batch.num_nodes
+        batch_by_device = {}
         split_preds = []
-        for i in range(len(batch)):
+        for i in range(system_count):
             system_predictions = {}
 
             for key, pred in predictions.items():
-                if pred.shape[0] == len(batch):
+                if not torch.is_tensor(pred) or pred.ndim == 0:
+                    raise TypeError(
+                        f"Prediction {key!r} must be a tensor with a leading batch dimension"
+                    )
+                level = levels.get(key)
+                if pred.shape[0] == system_count and level != "atom":
                     # Per-system prediction
                     system_predictions[key] = pred[i : i + 1]
-                elif pred.shape[0] == len(batch.batch):
+                elif pred.shape[0] == atom_count and level != "system":
                     # Per-atom prediction
-                    mask = batch.batch == i
+                    if pred.device not in batch_by_device:
+                        batch_by_device[pred.device] = batch.batch.to(pred.device)
+                    mask = batch_by_device[pred.device] == i
                     system_predictions[key] = pred[mask]
                 else:
                     raise ValueError(
                         f"Cannot split prediction for key '{key}': "
-                        f"unexpected shape {pred.shape} for batch size {len(batch)} "
-                        f"and num_atoms {batch.num_atoms}"
+                        f"unexpected shape {pred.shape} for batch size {system_count} "
+                        f"and num_atoms {atom_count}"
                     )
 
                 # Move to CPU before returning so the caller (which may be a
                 # CPU-only Ray worker) can deserialize the result without
                 # requiring CUDA.
                 if hasattr(system_predictions[key], "detach"):
-                    system_predictions[key] = system_predictions[key].detach().cpu()
+                    system_predictions[key] = (
+                        system_predictions[key].detach().to("cpu", copy=True)
+                    )
 
             split_preds.append(system_predictions)
 

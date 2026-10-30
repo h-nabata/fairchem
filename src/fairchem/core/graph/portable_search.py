@@ -8,8 +8,10 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 import math
+import operator
 from functools import lru_cache
 
+import numpy as np
 import torch
 
 
@@ -31,10 +33,29 @@ def _integer_cartesian_entry(x: int, y: int, z: int, device: torch.device):
     return table, event
 
 
-def integer_cartesian_table(x: int, y: int, z: int, device: torch.device):
+def _borrow_integer_cartesian_table(x: int, y: int, z: int, device: torch.device):
     """
-    Read an immutable table with cross-stream readiness and lifetime tracking.
+    Borrow immutable storage for internal graph operations that never mutate it.
     """
+    dimensions = []
+    for value in (x, y, z):
+        if isinstance(value, (bool, np.bool_)) or (
+            torch.is_tensor(value) and value.dtype == torch.bool
+        ):
+            raise ValueError("Image repetitions must be nonnegative integers")
+        try:
+            dimension = operator.index(value)
+        except TypeError as error:
+            raise ValueError(
+                "Image repetitions must be nonnegative integers"
+            ) from error
+        if dimension < 0:
+            raise ValueError("Image repetitions must be nonnegative integers")
+        dimensions.append(dimension)
+    x, y, z = dimensions
+    device = torch.device(device)
+    if device.type in {"cuda", "xpu"} and device.index is None:
+        device = torch.device(device.type, getattr(torch, device.type).current_device())
     # Entry count alone does not bound memory for tiny periodic cells with
     # millions of images. Large tables are valid, but are not retained.
     builder = _integer_cartesian_entry
@@ -46,6 +67,13 @@ def integer_cartesian_table(x: int, y: int, z: int, device: torch.device):
         stream.wait_event(event)
         table.record_stream(stream)
     return table
+
+
+def integer_cartesian_table(x: int, y: int, z: int, device: torch.device):
+    """
+    Return owned storage so an external NumPy/in-place consumer cannot poison it.
+    """
+    return _borrow_integer_cartesian_table(x, y, z, device).clone()
 
 
 def source_cloud(
@@ -127,6 +155,11 @@ def alternative_candidates(
     Return exact candidates from tiled all-pairs or a balanced bounding-volume tree.
     """
     device = source_pos.device
+    if method not in {"all_pairs", "bvh"}:
+        raise ValueError(f"Unsupported alternative search method: {method}")
+    if not len(source_pos) or not len(target_pos):
+        empty = torch.empty(0, dtype=torch.long, device=device)
+        return empty, empty
     if method == "all_pairs":
         source_parts, target_parts = [], []
         tile = max(1, 262144 // max(1, len(source_pos)))

@@ -7,6 +7,7 @@ LICENSE file in the root directory of this source tree.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import torch
@@ -14,6 +15,7 @@ import torch
 from fairchem.core.graph.radius_graph_pbc import (
     radius_graph_pbc,
     radius_graph_pbc_v2,
+    validate_graph_parameters,
 )
 
 if TYPE_CHECKING:
@@ -222,12 +224,32 @@ def generate_graph(
             - 'offset_distances' (torch.Tensor): Distances between the atoms connected by the edges, including the cell offsets.
             - 'neighbors' (torch.Tensor): Number of neighbors for each atom.
     """
+    cutoff, max_neighbors, enforce_max_neighbors_strictly = validate_graph_parameters(
+        cutoff, max_neighbors, enforce_max_neighbors_strictly, graph_search_method
+    )
     if radius_pbc_version == 1:
         radius_graph_pbc_fn = radius_graph_pbc
     elif radius_pbc_version == 2:
         radius_graph_pbc_fn = radius_graph_pbc_v2
-        if node_partition is not None:
-            data["node_partition"] = node_partition
+        if node_partition is not None or hasattr(data, "node_partition"):
+            # A per-call partition must never become persistent metadata on a
+            # shared AtomicData (or a PyG-style attribute/store wrapper).
+            data = SimpleNamespace(
+                **{
+                    name: getattr(data, name)
+                    for name in (
+                        "pos",
+                        "cell",
+                        "natoms",
+                        "batch",
+                        "pbc",
+                        "atomic_numbers",
+                    )
+                    if hasattr(data, name)
+                }
+            )
+            if node_partition is not None:
+                data.node_partition = node_partition
     elif radius_pbc_version == 3:
         if data.pos.device.type not in {"cpu", "cuda"}:
             raise ValueError(

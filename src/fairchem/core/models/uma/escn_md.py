@@ -836,7 +836,7 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
         # (edge_index[1]). This keeps downstream code (SO2Conv scatter,
         # edge-degree scatter, ForceHead reindex) uniform across GP and
         # non-GP paths.
-        if "scatter_target" not in data_dict:
+        if not gp_utils.initialized():
             data_dict["scatter_target"] = graph_dict["edge_index"][1]
 
         return graph_dict

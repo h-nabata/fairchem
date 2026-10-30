@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import copy
 from contextlib import nullcontext
-from threading import Event, Lock
+from threading import Event, Lock, RLock
 from types import SimpleNamespace
 
 import pytest
@@ -32,7 +32,9 @@ def _structure(name="H2O", offset=0, task="omol", dtype=torch.float32):
     atoms = molecule(name)
     atoms.positions += offset
     atoms.info.update(charge=0, spin=1)
-    return AtomicData.from_ase(atoms, task_name=task, target_dtype=dtype)
+    return AtomicData.from_ase(
+        atoms, task_name=task, target_dtype=dtype, r_data_keys=["charge", "spin"]
+    )
 
 
 class HarmonicPredictor:
@@ -376,7 +378,9 @@ def test_staged_lease_records_allocator_lifetime_and_joins_consumer_streams(
     )
     current = first
     backend = SimpleNamespace(current_stream=lambda device: current, Event=Completion)
-    owner = SimpleNamespace(device=torch.device("xpu:1"), _backend=backend)
+    owner = SimpleNamespace(
+        device=torch.device("xpu:1"), _backend=backend, _lock=RLock()
+    )
     recorded = []
     slot = device_buffers._Slot(
         target={"pos": SimpleNamespace(record_stream=recorded.append)},

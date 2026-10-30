@@ -16,6 +16,8 @@ import torch
 from fairchem.core.graph.radius_graph_pbc import (
     get_max_neighbors_mask,
     radius_graph_pbc_v2,
+    system_pbc_flags,
+    validate_graph_parameters,
 )
 
 
@@ -128,8 +130,15 @@ class VerletNeighborCache:
         """
         from fairchem.core.graph.compute import edge_cell_offsets
 
+        cutoff, max_neighbors, strict = validate_graph_parameters(
+            cutoff, max_neighbors, strict, method
+        )
+        pbc = system_pbc_flags(data, pbc)
         with self._lock:
+            if not math.isfinite(self.skin) or self.skin <= 0:
+                raise ValueError("neighbor skin must be finite and positive")
             key = (
+                float(self.skin),
                 float(cutoff),
                 int(max_neighbors),
                 bool(strict),
