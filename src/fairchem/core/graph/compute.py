@@ -7,12 +7,87 @@ LICENSE file in the root directory of this source tree.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 
 from fairchem.core.graph.radius_graph_pbc import (
     radius_graph_pbc,
     radius_graph_pbc_v2,
 )
+
+if TYPE_CHECKING:
+    from fairchem.core.graph.neighbor_cache import VerletNeighborCache
+
+
+def edge_cell_offsets(cell, cell_offsets, neighbors):
+    """
+    Apply each system's cell without materializing one 3x3 matrix per edge.
+
+    The operations remain differentiable with respect to the cell, including
+    double backward. The single-system path uses one ordinary matrix product.
+    """
+    coefficients = cell_offsets.to(dtype=cell.dtype, device=cell.device)
+    if len(cell) == 1:
+        return coefficients @ cell[0]
+    systems = torch.repeat_interleave(
+        torch.arange(len(cell), device=cell.device),
+        neighbors.to(cell.device),
+        output_size=len(cell_offsets),
+    )
+    return (
+        coefficients[:, 0:1] * cell[:, 0].index_select(0, systems)
+        + coefficients[:, 1:2] * cell[:, 1].index_select(0, systems)
+        + coefficients[:, 2:3] * cell[:, 2].index_select(0, systems)
+    )
+
+
+def spatially_order_graph(data, graph):
+    """
+    Order selected edges spatially without changing atom IDs or cap decisions.
+
+    Ten-bit Morton coordinates are only sorting keys: physical positions and
+    floating point computations are unchanged. Systems remain contiguous so
+    the per-system edge counts still describe the returned tensors.
+    """
+    edges = graph["edge_index"]
+    if edges.shape[1] < 2:
+        return graph
+    with torch.no_grad():
+        systems = data.batch
+        if systems is None:
+            systems = torch.zeros(
+                len(data.pos), device=data.pos.device, dtype=torch.long
+            )
+        lower = data.pos.new_zeros((len(data.natoms), 3))
+        upper = torch.zeros_like(lower)
+        indices = systems[:, None].expand(-1, 3)
+        lower.scatter_reduce_(0, indices, data.pos, reduce="amin", include_self=False)
+        upper.scatter_reduce_(0, indices, data.pos, reduce="amax", include_self=False)
+        extent = (upper - lower).clamp_min(torch.finfo(data.pos.dtype).tiny)
+        coordinates = (
+            ((data.pos - lower[systems]) / extent[systems] * 1023).clamp(0, 1023).long()
+        )
+        # Vectorized bit spreading avoids thirty per-coordinate/per-bit loops.
+        spread = (coordinates | (coordinates << 16)) & 0x030000FF
+        spread = (spread | (spread << 8)) & 0x0300F00F
+        spread = (spread | (spread << 4)) & 0x030C30C3
+        spread = (spread | (spread << 2)) & 0x09249249
+        morton = spread[:, 0] | (spread[:, 1] << 1) | (spread[:, 2] << 2)
+        order = torch.argsort(morton[edges[0]], stable=True)
+        order = order[torch.argsort(morton[edges[1, order]], stable=True)]
+        order = order[torch.argsort(systems[edges[1, order]], stable=True)]
+    result = dict(graph)
+    result["edge_index"] = edges[:, order]
+    for key in (
+        "edge_distance",
+        "edge_distance_vec",
+        "cell_offsets",
+        "offset_distances",
+    ):
+        if key in result:
+            result[key] = result[key][order]
+    return result
 
 
 def filter_edges_by_node_partition(
@@ -85,9 +160,7 @@ def get_pbc_distances(
     distance_vectors = pos[row] - pos[col]
 
     # correct for pbc
-    neighbors = neighbors.to(cell.device)
-    cell = torch.repeat_interleave(cell, neighbors, dim=0)
-    offsets = cell_offsets.to(dtype=cell.dtype).view(-1, 1, 3).bmm(cell).view(-1, 3)
+    offsets = edge_cell_offsets(cell, cell_offsets, neighbors)
     distance_vectors += offsets
 
     # compute distances
@@ -122,6 +195,8 @@ def generate_graph(
     radius_pbc_version: int,
     pbc: torch.Tensor,
     node_partition: torch.Tensor | None = None,
+    neighbor_cache: VerletNeighborCache | None = None,
+    graph_search_method: str = "cell",
 ) -> dict:
     """Generate a graph representation from atomic structure data.
 
@@ -165,13 +240,36 @@ def generate_graph(
     else:
         raise ValueError(f"Invalid radius_pbc version {radius_pbc_version}")
 
-    edge_index, cell_offsets, neighbors = radius_graph_pbc_fn(
-        data,
-        cutoff,
-        max_neighbors,
-        enforce_max_neighbors_strictly,
-        pbc=pbc,
-    )
+    if neighbor_cache is not None:
+        if radius_pbc_version != 2:
+            raise ValueError("Verlet caching requires graph version 2")
+        edge_index, cell_offsets, neighbors = neighbor_cache.get_graph(
+            data,
+            cutoff,
+            max_neighbors,
+            enforce_max_neighbors_strictly,
+            pbc=pbc,
+            method=graph_search_method,
+        )
+    elif radius_pbc_version == 2:
+        edge_index, cell_offsets, neighbors = radius_graph_pbc_fn(
+            data,
+            cutoff,
+            max_neighbors,
+            enforce_max_neighbors_strictly,
+            pbc=pbc,
+            method=graph_search_method,
+        )
+    else:
+        if graph_search_method != "cell":
+            raise ValueError("Graph search method selection requires graph version 2")
+        edge_index, cell_offsets, neighbors = radius_graph_pbc_fn(
+            data,
+            cutoff,
+            max_neighbors,
+            enforce_max_neighbors_strictly,
+            pbc=pbc,
+        )
 
     # for v2 it is still faster right now to not do this post filtering, need to investigate further
     if node_partition is not None and radius_pbc_version != 2:

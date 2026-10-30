@@ -227,12 +227,25 @@ class FAIRChemCalculator(Calculator):
         # Convert using the current a2g object
         data = self.a2g(atoms)
 
-        # Batch and predict
-        pred = self.predictor.predict(data)
+        # Compute requested derivatives only. Energy is cheap once forces have
+        # been evaluated and retaining it avoids a second optimizer evaluation.
+        if getattr(self.predictor, "supports_requested_properties", False):
+            requested = {
+                "energy" if name == "free_energy" else name for name in properties
+            }
+            if "energy" in self.implemented_properties:
+                requested.add("energy")
+            pred = self.predictor.predict(
+                data, requested_properties=tuple(sorted(requested))
+            )
+        else:
+            pred = self.predictor.predict(data)
 
         # Collect the results into self.results
-        self.results = {}
+        self.results = {} if system_changes else dict(self.results)
         for calc_key in self.implemented_properties:
+            if calc_key not in pred:
+                continue
             if calc_key == "energy":
                 energy = float(pred[calc_key].detach().cpu().numpy()[0])
 

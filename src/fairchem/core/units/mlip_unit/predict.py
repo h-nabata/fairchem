@@ -62,6 +62,13 @@ from fairchem.core.units.mlip_unit.api.inference import (
     describe_inference_settings,
 )
 from fairchem.core.units.mlip_unit.api.model_spec import ModelSpec
+from fairchem.core.units.mlip_unit.inference_runtime import (
+    ModelStreamGuard,
+    PreparedModelCache,
+    configure_numeric_runtime,
+    model_tensor_signature,
+    mole_composition_key,
+)
 from fairchem.core.units.mlip_unit.mlip_unit import OutputSpec, Task
 from fairchem.core.units.mlip_unit.single_atom_patch import (
     single_atom_prediction_from_lookup,
@@ -80,17 +87,28 @@ if TYPE_CHECKING:
     from fairchem.core.units.mlip_unit.api.inference import MLIPInferenceCheckpoint
 
 
+_AUXILIARY_LEVELS = {
+    "forces": "atom",
+    "stress": "system",
+    "hessian": "system",
+    "hessian_vector_product": "atom",
+    "embeddings": "atom",
+}
+
+
 def collate_predictions(predict_fn):
     @wraps(predict_fn)
     def collated_predict(
-        predict_unit, data: AtomicData, undo_element_references: bool = True
+        predict_unit, data: AtomicData, undo_element_references: bool = True, **kwargs
     ):
         # Get the full prediction dictionary from the original predict method
-        preds = predict_fn(predict_unit, data, undo_element_references)
+        preds = predict_fn(predict_unit, data, undo_element_references, **kwargs)
         collated_preds = defaultdict(list)
         batch_by_device = {}
         for i, dataset in enumerate(data.dataset):
             for task in predict_unit.dataset_to_tasks[dataset]:
+                if task.name not in preds:
+                    continue
                 prediction = preds[task.name]
                 if task.level == "system":
                     collated_preds[task.property].append(prediction[i].unsqueeze(0))
@@ -113,6 +131,27 @@ def collate_predictions(predict_fn):
                     raise RuntimeError(
                         f"Unrecognized task level={task.level} found in data batch at position {i}"
                     )
+
+            # Requested derivatives/embeddings need not be learned checkpoint
+            # tasks. Their energy task supplies the head prefix and dataset.
+            task_properties = {
+                task.property for task in predict_unit.dataset_to_tasks[dataset]
+            }
+            for task in predict_unit.dataset_to_tasks[dataset]:
+                if task.property != "energy":
+                    continue
+                for prop, level in _AUXILIARY_LEVELS.items():
+                    name = task.name.removesuffix("energy") + prop
+                    if prop in task_properties or name not in preds:
+                        continue
+                    value = preds[name]
+                    if level == "system":
+                        value = value[i].unsqueeze(0)
+                    elif len(data.dataset) > 1:
+                        if value.device not in batch_by_device:
+                            batch_by_device[value.device] = data.batch.to(value.device)
+                        value = value[batch_by_device[value.device] == i]
+                    collated_preds[prop].append(value)
 
         return {
             prop: values[0]
@@ -158,9 +197,16 @@ def _prepare_inference_gradients(backbone, data: AtomicData) -> None:
     regress_config = getattr(backbone, "regress_config", None)
     if regress_config is None or regress_config.direct_forces:
         return
-    if regress_config.forces or regress_config.stress:
+    requested = data.get("_requested_properties", None)
+    derivatives = {"forces", "stress", "hessian", "hessian_vector_product"}
+    need_derivatives = (
+        bool(derivatives.intersection(requested))
+        if requested is not None
+        else any(getattr(regress_config, name, False) for name in derivatives)
+    )
+    if need_derivatives:
         data["pos"].requires_grad_(True)
-    if regress_config.stress:
+    if regress_config.stress and (requested is None or "stress" in requested):
         data["cell"].requires_grad_(True)
 
 
@@ -270,6 +316,8 @@ class MLIPPredictUnitProtocol(Protocol):
 
 
 class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
+    supports_requested_properties = True
+
     def __init__(
         self,
         inference_model_path: str,
@@ -321,6 +369,11 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         self.assert_on_nans = assert_on_nans
         self._warned_upcast = False
         self._nitro_announced = False
+        self._prepared_models = None
+        self._mole_template = None
+        self._active_mole_key = None
+        self._active_model_signature = None
+        self._numeric_runtimes = []
 
         if self.model.module.backbone.regress_config.direct_forces:
             logging.warning(
@@ -429,6 +482,7 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         before = copy.deepcopy(self.inference_settings)
         for name, value in changes.items():
             setattr(self.inference_settings, name, value)
+        self.clear_prepared_model_cache(release_template=True)
         release = getattr(self.model.module, "release_inference_resources", None)
         if release is not None:
             release()
@@ -605,6 +659,68 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
             )
         if settings.execution_mode is None:
             settings.execution_mode = ExecutionMode.GENERAL
+
+    def clear_prepared_model_cache(self, *, release_template: bool = False) -> None:
+        """
+        Release cached models, optionally also the CPU preparation template.
+
+        Keep the template for subsequent exact re-preparation by default.
+        Reload paths discard it because their settings can change.
+        """
+        cache = getattr(self, "_prepared_models", None)
+        if cache is not None:
+            cache.clear()
+        self._prepared_models = None
+        if release_template:
+            self._mole_template = None
+        self._active_mole_key = None
+        self._active_model_signature = None
+
+    def _mole_key(self, data):
+        return mole_composition_key(
+            data,
+            device=self.device,
+            dtype=self.inference_settings.base_precision_dtype,
+            model_id=getattr(self.model.module, "model_id", None),
+            settings_key=repr(self.inference_settings),
+        )
+
+    def _select_prepared_model(self, data) -> None:
+        """
+        Select or prepare an exact-composition model without disabling merging.
+        """
+        settings = self.inference_settings
+        if not settings.mole_cache_size or not settings.merge_mole or settings.nitro:
+            return
+        if getattr(self, "_prepared_models", None) is None:
+            self._prepared_models = PreparedModelCache(
+                settings.mole_cache_size, settings.mole_cache_max_bytes
+            )
+        signature = getattr(self, "_active_model_signature", None)
+        if signature is not None and signature != model_tensor_signature(self.model):
+            self.clear_prepared_model_cache(release_template=True)
+            raise RuntimeError(
+                "Prepared model weights/buffers changed after MoLE caching. "
+                "Construct a predictor from the updated checkpoint before reusing merged models."
+            )
+        key = self._mole_key(data)
+        if key == getattr(self, "_active_mole_key", None):
+            return
+        cached = self._prepared_models.get(key)
+        if cached is not None:
+            self.model = cached
+            self.lazy_model_intialized = True
+            self._active_mole_key = key
+            self._active_model_signature = model_tensor_signature(self.model)
+            self._numeric_runtimes = getattr(self.model.module, "_numeric_runtimes", [])
+            return
+        template = getattr(self, "_mole_template", None)
+        if self.lazy_model_intialized and template is not None:
+            self.model = copy.deepcopy(template)
+            self.lazy_model_intialized = False
+            self._numeric_runtimes = []
+            self._active_model_signature = None
+        self._active_mole_key = key
 
     def _build_overrides_from_settings(
         self,
@@ -807,16 +923,50 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
 
     @collate_predictions
     def predict(
-        self, data: AtomicData, undo_element_references: bool = True
+        self,
+        data: AtomicData,
+        undo_element_references: bool = True,
+        requested_properties: tuple[str, ...] | list[str] | None = None,
     ) -> dict[str, torch.tensor]:
+        if isinstance(requested_properties, str):
+            raise ValueError(
+                "requested_properties must be a sequence of names, not a string"
+            )
+        requested = (
+            self.inference_settings.requested_properties
+            if requested_properties is None
+            else tuple(requested_properties)
+        )
+        if requested is not None and (
+            not requested
+            or any(not isinstance(prop, str) or not prop for prop in requested)
+        ):
+            raise ValueError("requested_properties must contain property names")
+        if requested is not None:
+            supported = {"energy", *_AUXILIARY_LEVELS}
+            supported.update(task.property for task in self.tasks.values())
+            if unknown := set(requested) - supported:
+                raise ValueError(f"Unknown requested properties: {sorted(unknown)}")
+        self._select_prepared_model(data)
         regress_config = getattr(self.model.module.backbone, "regress_config", None)
         if (
             torch.is_inference_mode_enabled()
             and regress_config is not None
             and not regress_config.direct_forces
-            and any(
-                getattr(regress_config, property_name, False)
-                for property_name in ("forces", "stress", "hessian")
+            and (
+                bool(
+                    {
+                        "forces",
+                        "stress",
+                        "hessian",
+                        "hessian_vector_product",
+                    }.intersection(requested)
+                )
+                if requested is not None
+                else any(
+                    getattr(regress_config, property_name, False)
+                    for property_name in ("forces", "stress", "hessian")
+                )
             )
         ):
             raise RuntimeError(
@@ -842,6 +992,20 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
                 device=self.device,
             )
             if single_atom_result is not None:
+                if requested is not None:
+                    single_atom_result = {
+                        name: value
+                        for name, value in single_atom_result.items()
+                        if self.tasks[name].property in requested
+                    }
+                    available = {
+                        self.tasks[name].property for name in single_atom_result
+                    }
+                    if missing := set(requested) - available:
+                        raise ValueError(
+                            "Single-atom reference lookup cannot provide requested "
+                            f"properties: {sorted(missing)}"
+                        )
                 return single_atom_result
 
         dtype = self.inference_settings.base_precision_dtype
@@ -850,6 +1014,8 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         # Keep the caller isolated from graph-parallel/MOLE mutations without
         # first retaining another full copy on the accelerator.
         data_device = _copy_data_to_device(data, self.device, dtype)
+        if requested is not None:
+            data_device["_requested_properties"] = tuple(requested)
 
         _prepare_inference_gradients(self.model.module.backbone, data_device)
 
@@ -871,6 +1037,7 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
             self._initialize(data)
             return self._run_inference(data_device, undo_element_references)
 
+    @torch.inference_mode(False)
     def _lazy_init(self, data: AtomicData) -> None:
         """
         Lazy initialization on first predict call.
@@ -881,6 +1048,13 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         # gets a chance to cast them. Prepare from a private CPU copy at the
         # loaded model's precision, preserving the caller's batch and placement.
         # The final requested precision is applied after preparation, as before.
+        if (
+            self.inference_settings.mole_cache_size
+            and self.inference_settings.merge_mole
+            and not self.inference_settings.nitro
+            and getattr(self, "_mole_template", None) is None
+        ):
+            self._mole_template = copy.deepcopy(self.model).cpu()
         dtype = next(
             (
                 parameter.dtype
@@ -902,9 +1076,19 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         self.model.to(self.inference_settings.base_precision_dtype)
 
         self.move_to_device()
+        self.model.module._inference_stream_guard = ModelStreamGuard(self.model)
+
+        self._numeric_runtimes = configure_numeric_runtime(
+            self.model.module.backbone, self.inference_settings
+        )
+        self.model.module._numeric_runtimes = self._numeric_runtimes
 
         # torch.compile is for the HydraModel; Nitro has its own kernels.
-        if self.inference_settings.compile and not self.inference_settings.nitro:
+        if (
+            self.inference_settings.compile
+            and self.inference_settings.compile_scope == "model"
+            and not self.inference_settings.nitro
+        ):
             logging.warning(
                 "Model is being compiled. This might take a while the first time."
             )
@@ -913,9 +1097,17 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
             # The model's scalars are fixed at inference, so this skips dynamo's
             # TensorifyScalarRestartAnalysis retrace during compile.
             torch._dynamo.config.specialize_float = True
-            self.model = torch.compile(self.model, dynamic=True)
+            self.model = torch.compile(
+                self.model, dynamic=self.inference_settings.compile_dynamic
+            )
 
         self.lazy_model_intialized = True
+        cache = getattr(self, "_prepared_models", None)
+        if cache is not None and self.inference_settings.merge_mole:
+            key = self._mole_key(data)
+            cache.put(key, self.model)
+            self._active_mole_key = key
+            self._active_model_signature = model_tensor_signature(self.model)
 
     def _run_inference(self, data: AtomicData, undo_refs: bool) -> dict:
         """
@@ -927,8 +1119,52 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
             else torch.enable_grad()
         )
         device_type = torch.device(getattr(self, "device", "cpu")).type
-        # PyTorch's TF32 controls affect CUDA only. Leave that backend's global
-        # state untouched when an independent Intel predictor is running.
+        if device_type == "xpu" and getattr(torch.backends.mkldnn, "allow_tf32", False):
+            raise ValueError(
+                "Strict FP32 XPU inference requires torch.backends.mkldnn.allow_tf32=False. "
+                "The predictor does not change this process-global setting."
+            )
+        if device_type == "xpu" and self.inference_settings.compile:
+            from torch._inductor import config as inductor_config
+
+            # Inductor's live setting can differ from its import-time env var;
+            # Intel Triton also has a separate live knob/environment override.
+            intel_knobs = getattr(
+                getattr(sys.modules.get("triton"), "knobs", None), "intel", None
+            )
+            intel_fast_math = (
+                bool(intel_knobs.fast_math)
+                if intel_knobs is not None and hasattr(intel_knobs, "fast_math")
+                else os.environ.get(
+                    "TRITON_INTEL_FAST_MATH",
+                    os.environ.get("TORCHINDUCTOR_USE_FAST_MATH", "0"),
+                ).lower()
+                in {"1", "true", "on", "yes"}
+            )
+            if inductor_config.use_fast_math or intel_fast_math:
+                raise ValueError(
+                    "Strict FP32 XPU compilation requires Inductor use_fast_math=False "
+                    "and Intel Triton fast_math=False. The predictor does not change "
+                    "these process-global settings."
+                )
+        stream_guard = getattr(self.model.module, "_inference_stream_guard", None)
+        if stream_guard is not None:
+            stream_guard.wait_and_record(self.model)
+        requested = (
+            data.get("_requested_properties", None) if hasattr(data, "get") else None
+        )
+        higher_order = (
+            bool({"hessian", "hessian_vector_product"}.intersection(requested))
+            if requested is not None
+            else getattr(self.model.module.backbone.regress_config, "hessian", False)
+        )
+        for runtime in getattr(self, "_numeric_runtimes", ()):
+            runtime.higher_order = higher_order
+        inference_model = (
+            getattr(self.model, "_orig_mod", self.model) if higher_order else self.model
+        )
+        # XPU's oneDNN precision control is separate from CUDA TF32 controls.
+        # Leave global backend state unchanged when an Intel predictor runs.
         precision_context = (
             nullcontext()
             if device_type == "xpu"
@@ -946,7 +1182,7 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
             precision_context,
             autocast_context,
         ):
-            output = self.model(data)
+            output = inference_model(data)
             predictions = self._process_outputs(data, output, undo_refs)
 
         if self.inference_settings.nitro and not self._nitro_announced:
@@ -959,21 +1195,73 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         Denormalize and post-process model outputs.
         """
         pred_output = {}
-        for task_name, task in self.model.module.tasks.items():
+        datasets = set(data.dataset)
+        active_tasks = [
+            task
+            for task in self.model.module.tasks.values()
+            if datasets.intersection(getattr(task, "datasets", datasets))
+        ]
+
+        def check_finite(task, value, prop, level):
+            if not self.assert_on_nans:
+                return
+            selected = [
+                dataset in getattr(task, "datasets", datasets)
+                for dataset in data.dataset
+            ]
+            if not all(selected):
+                mask = torch.tensor(selected, dtype=torch.bool, device=value.device)
+                if level == "atom":
+                    mask = mask[data.batch.to(value.device)]
+                value = value[mask]
+            assert torch.isfinite(
+                value
+            ).all(), f"NaNs/Infs found in prediction for task {task.name}.{prop}"
+
+        for task in active_tasks:
+            task_name = task.name
+            requested = data.get("_requested_properties", None)
+            if requested is not None and task.property not in requested:
+                continue
             # A model may omit tasks for datasets outside the current batch.
             if task_name not in output:
                 continue
-            pred_output[task_name] = task.normalizer.denorm(
-                output[task_name][task.property]
+            value = output[task_name][task.property]
+            pred_output[task_name] = (
+                value * task.normalizer.rmsd
+                if getattr(task, "inference_only", False)
+                and task.property in _AUXILIARY_LEVELS.keys() - {"embeddings"}
+                else task.normalizer.denorm(value)
             )
-            if self.assert_on_nans:
-                assert (
-                    torch.isfinite(pred_output[task_name]).all()
-                ), f"NaNs/Infs found in prediction for task {task_name}.{task.property}"
+            check_finite(task, pred_output[task_name], task.property, task.level)
             if undo_refs and task.element_references is not None:
                 pred_output[task_name] = task.element_references.undo_refs(
                     data, pred_output[task_name]
                 )
+        requested = data.get("_requested_properties", None)
+        for task in active_tasks:
+            if task.property != "energy":
+                continue
+            for prop in _AUXILIARY_LEVELS:
+                key = task.name.removesuffix("energy") + prop
+                source = (
+                    "embeddings" if prop == "embeddings" and key not in output else key
+                )
+                if key in pred_output or source not in output:
+                    continue
+                if prop != "hessian_vector_product" and (
+                    requested is None or prop not in requested
+                ):
+                    continue
+                value = output[source]
+                if isinstance(value, dict):
+                    value = value[prop]
+                # Derivatives scale by rmsd only; the energy mean and element
+                # reference constants have zero coordinate derivative.
+                pred_output[key] = (
+                    value if prop == "embeddings" else value * task.normalizer.rmsd
+                )
+                check_finite(task, pred_output[key], prop, _AUXILIARY_LEVELS[prop])
         return pred_output
 
 

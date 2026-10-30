@@ -17,15 +17,78 @@ We run one batched first layer, then each tail:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 import torch.nn as nn
 
+from .radial import layer_norm_silu
+
 if TYPE_CHECKING:
     from .radial import RadialMLP
 
-__all__ = ["UnifiedRadialMLP", "create_unified_radial_mlp"]
+__all__ = ["RadialProjection", "UnifiedRadialMLP", "create_unified_radial_mlp"]
+
+
+class RadialProjection(NamedTuple):
+    """
+    Deferred final radial linear, consumed one angular-order block at a time.
+
+    The payload retains the smaller hidden activation instead of materializing
+    every radial coefficient. All fields remain differentiable tensors.
+    """
+
+    hidden: torch.Tensor
+    weight: torch.Tensor
+    bias: torch.Tensor
+
+    def block(self, start: int, width: int) -> torch.Tensor:
+        return torch.nn.functional.linear(
+            self.hidden,
+            self.weight.narrow(0, start, width),
+            self.bias.narrow(0, start, width),
+        )
+
+    def materialize(self) -> torch.Tensor:
+        return torch.nn.functional.linear(self.hidden, self.weight, self.bias)
+
+    def split(self, split_size: int, dim: int = 0) -> tuple[RadialProjection, ...]:
+        if dim != 0:
+            raise ValueError("RadialProjection can only be split along edges")
+        return tuple(
+            type(self)(h, self.weight, self.bias)
+            for h in self.hidden.split(split_size, dim=0)
+        )
+
+
+def _tensor_cache_key(tensor: torch.Tensor) -> tuple | None:
+    # The owners are retained separately: id/storage reuse must never hit a
+    # previous tensor's cache entry. Inference tensors have no version counter.
+    try:
+        version = tensor._version
+    except RuntimeError:
+        return None
+    return (id(tensor), version, tensor.device, tensor.dtype, tuple(tensor.shape))
+
+
+def _record_cache_event(tensor: torch.Tensor):
+    if tensor.device.type not in {"cuda", "xpu"}:
+        return None
+    backend = getattr(torch, tensor.device.type)
+    event = backend.Event()
+    event.record(backend.current_stream(tensor.device))
+    return event
+
+
+def _wait_cache_event(event, *tensors: torch.Tensor):
+    if event is None:
+        return
+    device = tensors[0].device
+    stream = getattr(torch, device.type).current_stream(device)
+    stream.wait_event(event)
+    for tensor in tensors:
+        tensor.record_stream(stream)
+
 
 # Expected structure of RadialMLP.net Sequential
 _EXPECTED_NET_STRUCTURE = (
@@ -102,79 +165,190 @@ class UnifiedRadialMLP(nn.Module):
         self.num_layers = len(radial_mlps)
         self.hidden_features = radial_mlps[0].net[0].out_features
         self.ln_eps = radial_mlps[0].net[1].eps
+        self.ln1_eps = tuple(mlp.net[1].eps for mlp in radial_mlps)
+        self.ln2_eps = tuple(mlp.net[4].eps for mlp in radial_mlps)
+        self.hidden2_features = radial_mlps[0].net[3].out_features
+        self.register_buffer("_source_table", None, persistent=False)
+        self.register_buffer("_target_table", None, persistent=False)
+        self._element_cache_key = None
+        self._element_cache_owners = ()
+        self._element_cache_event = None
 
         # First layer: concatenated for single GEMM
         self.register_buffer(
             "W1_cat",
-            torch.cat([mlp.net[0].weight.data for mlp in radial_mlps], dim=0),
+            torch.cat([mlp.net[0].weight.detach() for mlp in radial_mlps], dim=0),
         )
         self.register_buffer(
             "b1_cat",
-            torch.cat([mlp.net[0].bias.data for mlp in radial_mlps], dim=0),
+            torch.cat([mlp.net[0].bias.detach() for mlp in radial_mlps], dim=0),
         )
 
         # Remaining layers: stacked [N, ...] for indexed access
         self.register_buffer(
             "ln1_weight",
-            torch.stack([mlp.net[1].weight.data for mlp in radial_mlps], dim=0),
+            torch.stack([mlp.net[1].weight.detach() for mlp in radial_mlps], dim=0),
         )
         self.register_buffer(
             "ln1_bias",
-            torch.stack([mlp.net[1].bias.data for mlp in radial_mlps], dim=0),
+            torch.stack([mlp.net[1].bias.detach() for mlp in radial_mlps], dim=0),
         )
         self.register_buffer(
             "fc2_weight",
-            torch.stack([mlp.net[3].weight.data for mlp in radial_mlps], dim=0),
+            torch.stack([mlp.net[3].weight.detach() for mlp in radial_mlps], dim=0),
         )
         self.register_buffer(
             "fc2_bias",
-            torch.stack([mlp.net[3].bias.data for mlp in radial_mlps], dim=0),
+            torch.stack([mlp.net[3].bias.detach() for mlp in radial_mlps], dim=0),
         )
         self.register_buffer(
             "ln2_weight",
-            torch.stack([mlp.net[4].weight.data for mlp in radial_mlps], dim=0),
+            torch.stack([mlp.net[4].weight.detach() for mlp in radial_mlps], dim=0),
         )
         self.register_buffer(
             "ln2_bias",
-            torch.stack([mlp.net[4].bias.data for mlp in radial_mlps], dim=0),
+            torch.stack([mlp.net[4].bias.detach() for mlp in radial_mlps], dim=0),
         )
         self.register_buffer(
             "fc3_weight",
-            torch.stack([mlp.net[6].weight.data for mlp in radial_mlps], dim=0),
+            torch.stack([mlp.net[6].weight.detach() for mlp in radial_mlps], dim=0),
         )
         self.register_buffer(
             "fc3_bias",
-            torch.stack([mlp.net[6].bias.data for mlp in radial_mlps], dim=0),
+            torch.stack([mlp.net[6].bias.detach() for mlp in radial_mlps], dim=0),
         )
 
-    def umas_radial_mlp(self, h: torch.Tensor, i: int) -> torch.Tensor:
-        """Apply layers 2+ (LN -> SiLU -> Linear -> LN -> SiLU -> Linear)."""
-        H = self.hidden_features
-        h = torch.nn.functional.layer_norm(
-            h, (H,), self.ln1_weight[i], self.ln1_bias[i], self.ln_eps
-        )
-        h = torch.nn.functional.silu(h)
-        h = torch.nn.functional.linear(h, self.fc2_weight[i], self.fc2_bias[i])
-        h = torch.nn.functional.layer_norm(
-            h, (H,), self.ln2_weight[i], self.ln2_bias[i], self.ln_eps
-        )
-        h = torch.nn.functional.silu(h)
-        return torch.nn.functional.linear(h, self.fc3_weight[i], self.fc3_bias[i])
+    def _apply(self, fn, recurse=True):
+        # Do not retain references to tensors on the old device after .to().
+        self._clear_element_cache()
+        return super()._apply(fn, recurse=recurse)
 
-    def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
+    def __getstate__(self):
+        # Accelerator events cannot be pickled/deep-copied. Derived tables
+        # belong to the live instance and are rebuilt in the copied model.
+        state = super().__getstate__()
+        state["_buffers"] = dict(state["_buffers"])
+        state["_buffers"]["_source_table"] = None
+        state["_buffers"]["_target_table"] = None
+        state["_element_cache_key"] = None
+        state["_element_cache_owners"] = ()
+        state["_element_cache_event"] = None
+        return state
+
+    def _clear_element_cache(self) -> None:
+        self._source_table = None
+        self._target_table = None
+        self._element_cache_key = None
+        self._element_cache_owners = ()
+        self._element_cache_event = None
+
+    def umas_radial_mlp(
+        self, h: torch.Tensor, i: int, lazy: bool = False
+    ) -> torch.Tensor | RadialProjection:
         """
-        Compute all N radial outputs.
-
-        Args:
-            x: Input tensor of shape [E, in_features]
-
-        Returns:
-            List of N tensors, each of shape [E, out_features]
+        Apply each layer's own normalization and activation specifications.
         """
-        # Single batched GEMM for first layer, then split into per-layer chunks
-        h_all = torch.nn.functional.linear(x, self.W1_cat, self.b1_cat)
+        h = layer_norm_silu(
+            h,
+            self.ln1_weight[i],
+            self.ln1_bias[i],
+            self.ln1_eps[i],
+        )
+        fused = None
+        if h.device.type == "xpu":
+            from .xpu_radial_kernels import xpu_fused_linear_norm_silu
+
+            fused = xpu_fused_linear_norm_silu(
+                h,
+                self.fc2_weight[i],
+                self.fc2_bias[i],
+                self.ln2_weight[i],
+                self.ln2_bias[i],
+                self.ln2_eps[i],
+            )
+        if fused is None:
+            h = torch.nn.functional.linear(h, self.fc2_weight[i], self.fc2_bias[i])
+            h = layer_norm_silu(
+                h,
+                self.ln2_weight[i],
+                self.ln2_bias[i],
+                self.ln2_eps[i],
+            )
+        else:
+            h = fused
+        projection = RadialProjection(h, self.fc3_weight[i], self.fc3_bias[i])
+        return projection if lazy else projection.materialize()
+
+    def _tails(self, h_all, lazy):
         h_per_layer = h_all.split(self.hidden_features, dim=1)
-        return [self.umas_radial_mlp(h_per_layer[i], i) for i in range(self.num_layers)]
+        return [self.umas_radial_mlp(h, i, lazy) for i, h in enumerate(h_per_layer)]
+
+    def forward(self, x: torch.Tensor, lazy: bool = False) -> list:
+        """
+        Compute all radial functions, optionally deferring the final linear.
+        """
+        h_all = torch.nn.functional.linear(x, self.W1_cat, self.b1_cat)
+        return self._tails(h_all, lazy)
+
+    def forward_decomposed(
+        self,
+        distance_features: torch.Tensor,
+        source_indices: torch.Tensor,
+        target_indices: torch.Tensor,
+        source_embedding: torch.Tensor,
+        target_embedding: torch.Tensor,
+        lazy: bool = False,
+    ) -> list:
+        """
+        Precompute the fixed elemental parts of the first radial linear.
+
+        Only frozen embeddings and frozen first-layer weights are cached. The
+        cache is owned, versioned and device/dtype-specific; differentiable
+        weights take a fresh path, so no autograd graph survives between calls.
+        """
+        D = distance_features.shape[1]
+        S = source_embedding.shape[1]
+        T = target_embedding.shape[1]
+        if self.W1_cat.shape[1] != D + S + T:
+            raise ValueError("Radial distance and element feature widths do not match")
+        if (
+            source_indices.shape != target_indices.shape
+            or source_indices.numel() != distance_features.shape[0]
+        ):
+            raise ValueError("Radial element indices must have one entry per edge")
+        owners = (self.W1_cat, source_embedding, target_embedding)
+        cacheable = not torch.compiler.is_compiling() and not any(
+            t.requires_grad for t in owners
+        )
+        key = tuple(_tensor_cache_key(t) for t in owners) if cacheable else None
+        cacheable = cacheable and all(k is not None for k in key)
+        key = (key, D, S, T)
+        if not cacheable or key != self._element_cache_key:
+            source_table = torch.nn.functional.linear(
+                source_embedding,
+                self.W1_cat[:, D : D + S],
+            )
+            target_table = torch.nn.functional.linear(
+                target_embedding,
+                self.W1_cat[:, D + S :],
+            )
+            if cacheable:
+                self._source_table = source_table
+                self._target_table = target_table
+                self._element_cache_key = key
+                self._element_cache_owners = owners
+                self._element_cache_event = _record_cache_event(source_table)
+        else:
+            source_table, target_table = self._source_table, self._target_table
+            _wait_cache_event(self._element_cache_event, source_table, target_table)
+        h_all = torch.nn.functional.linear(
+            distance_features,
+            self.W1_cat[:, :D],
+            self.b1_cat,
+        )
+        h_all = h_all + source_table.index_select(0, source_indices)
+        h_all = h_all + target_table.index_select(0, target_indices)
+        return self._tails(h_all, lazy)
 
 
 def create_unified_radial_mlp(radial_mlps: list) -> UnifiedRadialMLP:

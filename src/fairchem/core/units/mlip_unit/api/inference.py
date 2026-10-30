@@ -160,6 +160,22 @@ class InferenceSettings:
     # Flag to enable or disable the compilation of the inference model.
     compile: bool = False
 
+    # Compile numerical geometry, radial and message-passing cores when graph
+    # construction and derivative heads should remain eager. Neither scope
+    # enables reduced-precision options.
+    compile_scope: str = "model"
+    compile_dynamic: bool = True
+
+    # Opt-in, shape-specific XPU graph replay of tensor-only numerical blocks.
+    # Higher-order derivative requests always use the eager callable.
+    xpu_graph: bool = False
+    xpu_graph_cache_size: int = 1
+
+    # Prepared models are independent copies keyed by exact elemental counts,
+    # charge/spin/task and runtime configuration. Zero disables this cache.
+    mole_cache_size: int = 0
+    mole_cache_max_bytes: int | None = None
+
     # Deprecated
     # Flag to enable or disable the use of CUDA Graphs for compute
     # This flag is no longer used and will be removed in future versions
@@ -173,6 +189,13 @@ class InferenceSettings:
     # version 2 is the an internal implementation that is optimized for gpu.
     # version 3 uses Nvidia alchemi library's neighbor list.
     internal_graph_gen_version: int = 2
+
+    # Exact graph acceleration: skin caches candidate topology only. Distances,
+    # physical cutoff filtering and neighbor limits are evaluated every call.
+    neighbor_skin: float = 0.0
+    neighbor_cache_entries: int = 1
+    graph_search_method: str = "cell"
+    graph_edge_order: str = "original"
 
     # Number of internal torch threads to use for inference
     torch_num_threads: int | None = None
@@ -201,6 +224,8 @@ class InferenceSettings:
     # Execution backend mode for the backbone.
     # Set to "general" for the default execution mode that works across all models and hardware.
     # Set to "umas_fast_pytorch" to enable block-diagonal SO2 GEMM conversion for faster inference.
+    # "umas_portable" uses compact PyTorch blocks; "umas_fast_portable" also
+    # enables compact geometry and lazy radial projection across accelerators.
     # Set to "umas_fast_gpu" to enable highly optimized backend with triton kernels for maximum speed.
     # If None, the predictor will decide the best execution mode based on the model and hardware capabilities (e.g., will choose "umas_fast_gpu" for uma-s if running on compatible Nvidia GPU).
     execution_mode: str | None = None
@@ -217,6 +242,11 @@ class InferenceSettings:
     # Disable for backends whose custom backward operators lack vmap rules.
     # The loop uses less memory but performs one backward pass per force component.
     hessian_vmap: bool = True
+    hessian_chunk_size: int = 64
+
+    # None preserves all checkpoint/default outputs. A per-call request can
+    # override this tuple without mutating the predictor's shared settings.
+    requested_properties: tuple[str, ...] | None = None
 
     # When True, allow backbones to add their default untrained tasks
     # (e.g., eSCNMDBackbone adds stress for all energy tasks by default)
@@ -229,6 +259,40 @@ class InferenceSettings:
     max_atoms: int | None = None
 
     def __post_init__(self):
+        if self.compile_scope not in {"model", "blocks"}:
+            raise ValueError("compile_scope must be 'model' or 'blocks'")
+        for name in (
+            "xpu_graph_cache_size",
+            "neighbor_cache_entries",
+            "hessian_chunk_size",
+        ):
+            if not isinstance(getattr(self, name), int) or getattr(self, name) < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        if not isinstance(self.mole_cache_size, int) or self.mole_cache_size < 0:
+            raise ValueError("mole_cache_size must be a nonnegative integer")
+        if self.mole_cache_max_bytes is not None and self.mole_cache_max_bytes < 1:
+            raise ValueError("mole_cache_max_bytes must be positive")
+        if self.neighbor_skin < 0:
+            raise ValueError("neighbor_skin must be nonnegative")
+        if self.graph_search_method == "allpairs":
+            self.graph_search_method = "all_pairs"
+        if self.graph_search_method not in {"cell", "auto", "all_pairs", "bvh"}:
+            raise ValueError("Unsupported graph_search_method")
+        if self.graph_edge_order not in {"original", "spatial"}:
+            raise ValueError("graph_edge_order must be 'original' or 'spatial'")
+        if self.edge_chunk_size is not None and self.edge_chunk_size < 1:
+            raise ValueError("edge_chunk_size must be positive")
+        if self.requested_properties is not None:
+            if isinstance(self.requested_properties, str):
+                raise ValueError(
+                    "requested_properties must be a sequence of names, not a string"
+                )
+            self.requested_properties = tuple(self.requested_properties)
+            if not self.requested_properties or any(
+                not isinstance(prop, str) or not prop
+                for prop in self.requested_properties
+            ):
+                raise ValueError("requested_properties must contain property names")
         if isinstance(self.base_precision_dtype, str):
             self.base_precision_dtype = getattr(torch, self.base_precision_dtype)
             assert (

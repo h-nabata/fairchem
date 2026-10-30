@@ -23,6 +23,8 @@ from ase.stress import full_3x3_to_voigt_6_stress
 from fairchem.core.scripts.validate_xpu import (
     _json_safe,
     _xpu_memory_snapshot,
+    build_parser,
+    case_settings,
     compare_predictions,
     evaluate,
     finite_difference_check,
@@ -75,6 +77,40 @@ def periodic_harmonic_atoms():
     )
     atoms.calc = HarmonicStressCalculator()
     return atoms
+
+
+@pytest.mark.parametrize("stress", [False, True])
+def test_evaluate_requests_all_outputs_in_one_forward(stress):
+    class SelectiveCalculator(HarmonicStressCalculator):
+        def calculate(self, atoms, properties, system_changes):
+            super().calculate(atoms, properties, system_changes)
+            self.requested = properties
+            self.results = {name: self.results[name] for name in properties}
+
+    atoms = periodic_harmonic_atoms()
+    atoms.calc = SelectiveCalculator()
+    result = evaluate(atoms, stress)
+    assert atoms.calc.calls == 1
+    assert set(atoms.calc.requested) == {
+        "energy",
+        "forces",
+        *(["stress"] if stress else []),
+    }
+    assert set(result) == set(atoms.calc.requested)
+
+
+def test_evaluate_converts_full_stress_tensor_to_ase_voigt_order():
+    class MatrixStressCalculator(HarmonicStressCalculator):
+        def calculate(self, atoms, properties, system_changes):
+            super().calculate(atoms, properties, system_changes)
+            self.results["stress"] = (
+                atoms.positions.T @ atoms.positions / atoms.get_volume()
+            )
+
+    atoms = periodic_harmonic_atoms()
+    expected = evaluate(atoms, True)["stress"]
+    atoms.calc = MatrixStressCalculator()
+    np.testing.assert_allclose(evaluate(atoms, True)["stress"], expected)
 
 
 def test_finite_difference_uses_energy_and_restores_structure():
@@ -628,6 +664,87 @@ def test_no_xpu_fails_before_loading_model_and_writes_json(tmp_path, monkeypatch
     assert not report["passed"]
     assert "CPU fallback is not permitted" in report["error"]["message"]
     assert report["cases"] == {}
+
+
+def test_series_a_options_preserve_cpu_reference_and_scope_merged_operations():
+    args = build_parser().parse_args(
+        [
+            "--neighbor-skin",
+            "0.4",
+            "--neighbor-cache-entries",
+            "2",
+            "--graph-search-method",
+            "bvh",
+            "--graph-edge-order",
+            "spatial",
+            "--edge-chunk-size",
+            "128",
+            "--compile",
+            "--compile-scope",
+            "blocks",
+            "--execution-mode",
+            "umas_fast_portable",
+            "--compare-merged",
+            "--xpu-graph",
+            "--xpu-graph-cache-size",
+            "2",
+        ]
+    )
+    cpu = case_settings(args, torch.device("cpu"), False, True)
+    unmerged = case_settings(args, torch.device("xpu:1"), False, True)
+    merged = case_settings(args, torch.device("xpu:1"), True, True)
+    for settings in (cpu, unmerged, merged):
+        assert settings.base_precision_dtype == torch.float32
+        assert not settings.tf32
+        assert not settings.nitro
+        assert settings.requested_properties == ("energy", "forces", "stress")
+    assert cpu.execution_mode == unmerged.execution_mode == "general"
+    assert not cpu.compile
+    assert not cpu.xpu_graph
+    assert cpu.neighbor_skin == 0
+    assert cpu.graph_edge_order == "original"
+    assert cpu.graph_search_method == "cell"
+    assert cpu.edge_chunk_size is None
+    for settings in (unmerged, merged):
+        assert settings.neighbor_skin == 0.4
+        assert settings.neighbor_cache_entries == 2
+        assert settings.graph_search_method == "bvh"
+        assert settings.graph_edge_order == "spatial"
+        assert settings.edge_chunk_size == 128
+        assert settings.compile
+        assert settings.compile_scope == "blocks"
+    assert not unmerged.xpu_graph
+    assert merged.xpu_graph
+    assert merged.xpu_graph_cache_size == 2
+    assert merged.execution_mode == "umas_fast_portable"
+
+
+@pytest.mark.parametrize(
+    "options,message",
+    [
+        (["--neighbor-skin", "nan"], "finite and nonnegative"),
+        (["--neighbor-skin", "-1"], "finite and nonnegative"),
+        (["--neighbor-cache-entries", "0"], "positive integer"),
+        (["--edge-chunk-size", "0"], "positive"),
+        (["--xpu-graph-cache-size", "0"], "positive integer"),
+        (["--execution-mode", "umas_fast_portable"], "--compare-merged"),
+        (["--xpu-graph"], "--compare-merged"),
+        (["--compile-scope", "blocks"], "requires --compile"),
+    ],
+)
+def test_invalid_series_a_options_fail_before_loading(
+    tmp_path, monkeypatch, options, message
+):
+    from fairchem.core import pretrained_mlip
+
+    load = Mock(side_effect=AssertionError("No checkpoint should be loaded"))
+    monkeypatch.setattr(pretrained_mlip, "get_predict_unit", load)
+    output = tmp_path / "validation.json"
+    assert main([*options, "--output", str(output)]) == 1
+    report = json.loads(output.read_text())
+    assert report["error"]["type"] == "ValueError"
+    assert message in report["error"]["message"]
+    load.assert_not_called()
 
 
 @pytest.mark.parametrize(

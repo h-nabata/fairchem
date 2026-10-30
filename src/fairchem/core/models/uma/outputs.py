@@ -7,11 +7,92 @@ LICENSE file in the root directory of this source tree.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import torch
 
 from fairchem.core.common import gp_utils
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+
+def resolve_requested_properties(
+    regress_config,
+    requested_properties: Iterable[str] | None = None,
+) -> frozenset[str]:
+    """
+    Resolve an output selection without adding internal derivative dependencies.
+
+    ``None`` retains the historical EFS-head output selection. Explicit requests
+    select returned properties only: a Hessian still needs forces internally,
+    but does not require returning them. Model/head capability checks belong to
+    the caller; this helper validates the public property names.
+    """
+    supported = frozenset(
+        {
+            "energy",
+            "forces",
+            "stress",
+            "hessian",
+            "hessian_vector_product",
+            "embeddings",
+        }
+    )
+    if requested_properties is not None:
+        if isinstance(requested_properties, str):
+            raise TypeError(
+                "requested_properties must be an iterable of property names"
+            )
+        properties = frozenset(requested_properties)
+        unknown = properties - supported
+        if unknown:
+            raise ValueError(
+                f"Unknown requested properties: {sorted(unknown, key=str)}"
+            )
+        return properties
+
+    properties = {"energy", "embeddings"}
+    if regress_config.forces or (
+        regress_config.stress and not regress_config.direct_stress
+    ):
+        properties.add("forces")
+    if regress_config.stress:
+        properties.add("stress")
+    if regress_config.hessian:
+        properties.add("hessian")
+    return frozenset(properties)
+
+
+def _energy_gradients(
+    energy: torch.Tensor,
+    inputs: tuple[torch.Tensor, ...],
+    create_graph: bool,
+) -> tuple[torch.Tensor, ...]:
+    """
+    Differentiate energy, including constant/unused coordinate components.
+    """
+    if any(not value.requires_grad for value in inputs):
+        raise ValueError("Derivative inputs must have requires_grad=True")
+    if energy.requires_grad:
+        gradients = torch.autograd.grad(
+            energy.sum(), inputs, create_graph=create_graph, allow_unused=True
+        )
+    else:
+        gradients = (None,) * len(inputs)
+    result = []
+    for value, input_gradient in zip(inputs, gradients):
+        if input_gradient is None:
+            gradient = value * 0 if create_graph else torch.zeros_like(value)
+        elif create_graph and not input_gradient.requires_grad:
+            # A linear energy has constant forces. Preserve its exact zero
+            # curvature without treating arbitrary detached force inputs as
+            # valid Hessian inputs later.
+            gradient = input_gradient + value * 0
+        else:
+            gradient = input_gradient
+        result.append(gradient)
+    return tuple(result)
 
 
 def get_l_component_range(x: torch.Tensor, l_min: int, l_max: int) -> torch.Tensor:
@@ -105,7 +186,8 @@ def compute_energy(
     Returns:
         A tuple of (energy, energy_part) where:
         - energy: System-level energy after GP reduction and reduce, shape [num_systems].
-        - energy_part: System-level energy before GP reduction (for autograd), shape [num_systems].
+        - energy_part: System-level energy before GP reduction, with the same
+            sum/mean normalization as energy (for autograd), shape [num_systems].
     """
     scalar_embedding = get_l_component_range(
         emb["node_embedding"], l_min=0, l_max=0
@@ -124,6 +206,9 @@ def compute_energy(
         if natoms is None:
             raise ValueError("natoms must be provided when reduce='mean'")
         energy = energy / natoms
+        # Derivatives must describe the reported mean energy too. Under GP,
+        # natoms is the global atom count, not the local partition size.
+        energy_part = energy_part / natoms
     else:
         raise ValueError(f"reduce can only be sum or mean, got: {reduce}")
 
@@ -145,11 +230,7 @@ def compute_forces(
     Returns:
         Forces tensor of shape [N, 3].
     """
-    (grad,) = torch.autograd.grad(
-        energy_part.sum(),
-        pos,
-        create_graph=training,
-    )
+    (grad,) = _energy_gradients(energy_part, (pos,), create_graph=training)
     forces = torch.neg(grad)
 
     if gp_utils.initialized():
@@ -189,11 +270,7 @@ def compute_forces_and_stress(
         - forces: Shape [N, 3].
         - stress: Shape [num_systems, 9] (flattened 3x3 tensor).
     """
-    grads = torch.autograd.grad(
-        [energy_part.sum()],
-        [pos, cell],
-        create_graph=training,
-    )
+    grads = _energy_gradients(energy_part, (pos, cell), create_graph=training)
 
     num_systems = cell.shape[0]
 
@@ -226,39 +303,69 @@ def compute_hessian_vmap(
     forces_flat: torch.Tensor,
     pos: torch.Tensor,
     create_graph: bool,
+    chunk_size: int | None = 64,
 ) -> torch.Tensor:
-    """Compute Hessian using vectorized mapping (vmap).
+    """
+    Compute Hessian rows in bounded vectorized blocks.
 
-    Uses torch.vmap to compute all Hessian components in parallel by taking
-    gradients of each force component with respect to all positions.
+    The final dense Hessian still requires quadratic storage. Unlike a full
+    identity/vmap, the basis and simultaneous backward intermediates scale with
+    ``chunk_size`` rather than the number of coordinates. ``None`` explicitly
+    requests one unbounded block.
 
     Args:
         forces_flat: Flattened forces tensor, shape [N*3].
         pos: Atomic positions, shape [N, 3].
         create_graph: Whether to create graph for third-order derivatives.
+        chunk_size: Maximum rows per backward block, or None for all rows.
 
     Returns:
         Hessian matrix of shape [N*3, N*3].
     """
 
-    def compute_grad_component(vec):
-        """Compute gradient of forces w.r.t. positions for a single component."""
-        return torch.autograd.grad(
-            -1 * forces_flat,
-            pos,
-            grad_outputs=vec,
-            retain_graph=create_graph,
-            create_graph=create_graph,
-        )[0]
-
-    # Use vmap to compute all components in parallel
-    # autograd.grad returns shape [N, 3] (same as pos), vmap gives [N*3, N, 3]
-    hessian = torch.vmap(compute_grad_component)(
-        torch.eye(forces_flat.shape[0], device=forces_flat.device)
-    )
-
+    _validate_curvature_inputs(forces_flat, pos)
     n_dof = forces_flat.numel()
-    return hessian.reshape(n_dof, n_dof)
+    if chunk_size is not None and (
+        isinstance(chunk_size, bool)
+        or not isinstance(chunk_size, int)
+        or chunk_size < 1
+    ):
+        raise ValueError("hessian chunk_size must be a positive integer or None")
+    if n_dof == 0:
+        return _empty_hessian(forces_flat, pos, create_graph)
+    block_size = min(chunk_size or n_dof, n_dof)
+    # In inference, write directly into final storage rather than retaining all
+    # block tensors and concatenating another complete Hessian at the end.
+    hessian = None if create_graph else forces_flat.new_empty((n_dof, n_dof))
+    blocks = []
+    negative_forces = -forces_flat
+    for start in range(0, n_dof, block_size):
+        stop = min(start + block_size, n_dof)
+        basis = forces_flat.new_zeros((stop - start, n_dof))
+        rows = torch.arange(stop - start, device=forces_flat.device)
+        basis[rows, rows + start] = 1
+
+        def compute_grad_component(vec, stop=stop):
+            gradient = torch.autograd.grad(
+                negative_forces,
+                pos,
+                grad_outputs=vec,
+                retain_graph=create_graph or stop < n_dof,
+                create_graph=create_graph,
+                allow_unused=True,
+            )[0]
+            if gradient is None:
+                return _zero_curvature(pos, forces_flat, create_graph)
+            if create_graph and not gradient.requires_grad:
+                gradient = gradient + pos * 0
+            return gradient
+
+        block = torch.vmap(compute_grad_component)(basis).reshape(stop - start, n_dof)
+        if create_graph:
+            blocks.append(block)
+        else:
+            hessian[start:stop].copy_(block)
+    return torch.cat(blocks, dim=0) if create_graph else hessian
 
 
 def compute_hessian_loop(
@@ -279,7 +386,10 @@ def compute_hessian_loop(
     Returns:
         Hessian matrix of shape [N*3, N*3].
     """
-    n_forces = len(forces_flat)
+    _validate_curvature_inputs(forces_flat, pos)
+    n_forces = forces_flat.numel()
+    if n_forces == 0:
+        return _empty_hessian(forces_flat, pos, create_graph)
     hessian = torch.zeros(
         (n_forces, n_forces),
         device=forces_flat.device,
@@ -288,12 +398,18 @@ def compute_hessian_loop(
     )
 
     for i in range(n_forces):
-        hessian[:, i] = torch.autograd.grad(
+        gradient = torch.autograd.grad(
             -forces_flat[i],
             pos,
             retain_graph=create_graph or i < n_forces - 1,
             create_graph=create_graph,
-        )[0].flatten()
+            allow_unused=True,
+        )[0]
+        if gradient is None:
+            gradient = _zero_curvature(pos, forces_flat, create_graph)
+        elif create_graph and not gradient.requires_grad:
+            gradient = gradient + pos * 0
+        hessian[i] = gradient.flatten()
 
     return hessian
 
@@ -303,6 +419,7 @@ def compute_hessian(
     pos: torch.Tensor,
     vmap: bool = True,
     training: bool = False,
+    chunk_size: int | None = 64,
 ) -> torch.Tensor:
     """Compute Hessian matrix as second derivative of energy w.r.t. positions.
 
@@ -314,6 +431,7 @@ def compute_hessian(
         pos: Atomic positions, shape [N, 3].
         vmap: Whether to use vectorized mapping (faster but higher memory).
         training: Whether to create graph for third-order derivatives.
+        chunk_size: Maximum vmap rows per backward block. None selects all rows.
 
     Returns:
         Hessian matrix of shape [1, N*3, N*3] (batch dim always 1 since
@@ -332,8 +450,102 @@ def compute_hessian(
     forces_flat = forces.flatten()
 
     if vmap:
-        hessian = compute_hessian_vmap(forces_flat, pos, create_graph=training)
+        hessian = compute_hessian_vmap(
+            forces_flat, pos, create_graph=training, chunk_size=chunk_size
+        )
     else:
         hessian = compute_hessian_loop(forces_flat, pos, create_graph=training)
 
     return hessian.unsqueeze(0)
+
+
+def _validate_curvature_inputs(forces: torch.Tensor, pos: torch.Tensor) -> None:
+    """
+    Reject missing derivative graphs instead of silently returning zero curvature.
+    """
+    if forces.numel() != pos.numel():
+        raise ValueError("forces and positions must have the same number of elements")
+    if forces.device != pos.device:
+        raise ValueError("forces and positions must be on the same device")
+    if forces.numel() and (not pos.requires_grad or not forces.requires_grad):
+        raise ValueError(
+            "Curvature requires differentiable forces and positions; "
+            "compute forces with training=True/create_graph=True"
+        )
+
+
+def _zero_curvature(
+    pos: torch.Tensor, forces: torch.Tensor, create_graph: bool
+) -> torch.Tensor:
+    """
+    Materialize zero curvature while preserving zero higher derivatives.
+    """
+    if create_graph:
+        return pos * 0 + forces.sum() * 0
+    return torch.zeros_like(pos)
+
+
+def _empty_hessian(
+    forces: torch.Tensor, pos: torch.Tensor, create_graph: bool
+) -> torch.Tensor:
+    result = forces.new_empty((0, 0))
+    if create_graph:
+        result = result + (pos.sum() + forces.sum()) * 0
+    return result
+
+
+def compute_hessian_vector_product(
+    forces: torch.Tensor,
+    pos: torch.Tensor,
+    vector: torch.Tensor,
+    training: bool = False,
+    retain_graph: bool | None = None,
+) -> torch.Tensor:
+    """
+    Compute an exact Hessian-vector product without materializing the Hessian.
+
+    Forces must be the differentiable negative gradient of the same scalar
+    energy with respect to ``pos``. The reverse-over-reverse calculation gives
+    ``H.T @ vector``, equal to ``H @ vector`` for this conservative energy.
+    Direct/nonconservative force models do not satisfy this contract.
+
+    Args:
+        forces: Differentiable conservative forces, shape [N, 3].
+        pos: Positions used to compute forces, shape [N, 3].
+        vector: A vector with shape pos.shape, or flattened shape [N*3]. For
+            independent systems in one batch, the product applies their block
+            diagonal Hessian to the corresponding slices of this vector.
+        training: Whether to retain differentiability of the product.
+        retain_graph: Keep the force graph for additional products or a full
+            Hessian. Defaults to training, as in torch.autograd.grad.
+
+    Returns:
+        Hessian-vector product with the same shape as vector.
+    """
+    if gp_utils.initialized():
+        raise NotImplementedError(
+            "Hessian-vector products are not supported with graph parallel mode"
+        )
+    _validate_curvature_inputs(forces, pos)
+    if vector.shape not in (pos.shape, torch.Size([pos.numel()])):
+        raise ValueError("vector must have position shape or flattened position shape")
+    if vector.device != pos.device or vector.dtype != forces.dtype:
+        raise ValueError("vector must have the force dtype and position device")
+    if pos.numel() == 0:
+        result = _zero_curvature(pos, forces, training).reshape(vector.shape)
+        return result + vector * 0 if training else result
+    gradient = torch.autograd.grad(
+        -forces.reshape(-1),
+        pos,
+        grad_outputs=vector.reshape(-1),
+        create_graph=training,
+        retain_graph=training if retain_graph is None else retain_graph,
+        allow_unused=True,
+    )[0]
+    if gradient is None:
+        gradient = _zero_curvature(pos, forces, training)
+        if training:
+            gradient = gradient + vector.reshape(pos.shape) * 0
+    elif training and not gradient.requires_grad:
+        gradient = gradient + pos * 0 + vector.reshape(pos.shape) * 0
+    return gradient.reshape(vector.shape)

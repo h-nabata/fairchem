@@ -13,6 +13,99 @@ import torch
 import torch.nn as nn
 
 
+def _normalized_silu_parts(x, weight, bias, eps):
+    centered = x - x.mean(dim=-1, keepdim=True)
+    inv_std = (centered.square().mean(dim=-1, keepdim=True) + eps).rsqrt()
+    normalized = centered * inv_std
+    affine = normalized * weight + bias
+    sigmoid = affine.sigmoid()
+    derivative = sigmoid * (1 + affine * (1 - sigmoid))
+    return normalized, inv_std, derivative
+
+
+class _LayerNormSiLU(torch.autograd.Function):
+    """
+    Recompute a cheap epilogue instead of saving a full normalized activation.
+
+    Forward uses the native normalization and SiLU operations. The pure tensor
+    backward is compiler-fusible and supports higher derivatives and vmap;
+    no reduced-precision or approximate transcendental operation is selected.
+    """
+
+    generate_vmap_rule = True
+
+    @staticmethod
+    def forward(x, weight, bias, eps):
+        return torch.nn.functional.silu(
+            torch.nn.functional.layer_norm(x, (x.shape[-1],), weight, bias, eps)
+        )
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        x, weight, bias, eps = inputs
+        ctx.save_for_backward(x, weight, bias)
+        ctx.save_for_forward(x, weight, bias)
+        ctx.eps = eps
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, weight, bias = ctx.saved_tensors
+        normalized, inv_std, derivative = _normalized_silu_parts(
+            x, weight, bias, ctx.eps
+        )
+        grad_affine = grad_output * derivative
+        grad_normalized = grad_affine * weight
+        grad_x = inv_std * (
+            grad_normalized
+            - grad_normalized.mean(dim=-1, keepdim=True)
+            - normalized * (grad_normalized * normalized).mean(dim=-1, keepdim=True)
+        )
+        batch_dims = tuple(range(x.ndim - 1))
+        grad_weight = grad_affine * normalized
+        grad_bias = grad_affine
+        if batch_dims:
+            grad_weight = grad_weight.sum(dim=batch_dims)
+            grad_bias = grad_bias.sum(dim=batch_dims)
+        return grad_x, grad_weight, grad_bias, None
+
+    @staticmethod
+    def jvp(ctx, tangent_x, tangent_weight, tangent_bias, tangent_eps):
+        x, weight, bias = ctx.saved_tensors
+        normalized, inv_std, derivative = _normalized_silu_parts(
+            x, weight, bias, ctx.eps
+        )
+        tangent_affine = torch.zeros_like(x)
+        if tangent_x is not None:
+            tangent_affine = (
+                weight
+                * inv_std
+                * (
+                    tangent_x
+                    - tangent_x.mean(dim=-1, keepdim=True)
+                    - normalized * (tangent_x * normalized).mean(dim=-1, keepdim=True)
+                )
+            )
+        if tangent_weight is not None:
+            tangent_affine = tangent_affine + normalized * tangent_weight
+        if tangent_bias is not None:
+            tangent_affine = tangent_affine + tangent_bias
+        return tangent_affine * derivative
+
+
+def layer_norm_silu(x, weight, bias, eps):
+    """
+    Normalize and activate while retaining only the input for force backward.
+    """
+    # Dynamo does not capture custom jvp; capturing a custom reverse adjoint
+    # also loses double-backward support on some Torch releases. Let the
+    # compiler fuse native operators and manage saved activations instead.
+    if torch.compiler.is_compiling() or x.dtype not in (torch.float32, torch.float64):
+        return torch.nn.functional.silu(
+            torch.nn.functional.layer_norm(x, (x.shape[-1],), weight, bias, eps)
+        )
+    return _LayerNormSiLU.apply(x, weight, bias, eps)
+
+
 @torch.jit.script
 def gaussian(x: torch.Tensor, mean, std) -> torch.Tensor:
     a = (2 * math.pi) ** 0.5

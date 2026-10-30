@@ -102,8 +102,26 @@ def conditional_grad(dec):
         def cls_method(self, *args, **kwargs):
             f = func
             if hasattr(self, "regress_config"):
-                regress_forces = self.regress_config.forces
+                regress_forces = any(
+                    getattr(self.regress_config, name, False)
+                    for name in ("forces", "stress", "hessian")
+                )
                 direct_forces = self.regress_config.direct_forces
+                data = args[0] if args else kwargs.get("data", kwargs.get("data_dict"))
+                request = (
+                    data.get(
+                        "_requested_properties",
+                        getattr(self, "requested_properties", None),
+                    )
+                    if hasattr(data, "get")
+                    else None
+                )
+                if request is not None:
+                    regress_forces = bool(
+                        set(request).intersection(
+                            {"forces", "stress", "hessian", "hessian_vector_product"}
+                        )
+                    )
             else:
                 regress_forces = self.regress_forces
                 direct_forces = getattr(self, "direct_forces", 0)

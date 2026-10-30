@@ -13,6 +13,12 @@ import math
 import numpy as np
 import torch
 
+from fairchem.core.graph.portable_search import (
+    alternative_candidates,
+    integer_cartesian_table,
+    source_cloud,
+)
+
 
 def is_mixed_pbc(data) -> bool:
     """
@@ -450,7 +456,19 @@ def radius_graph_pbc_v2(
     max_num_neighbors_threshold,
     enforce_max_neighbors_strictly: bool = False,
     pbc: torch.Tensor | None = None,
+    *,
+    method: str = "cell",
+    include_zero_distance: bool = False,
 ):
+    if method not in {"cell", "auto", "all_pairs", "bvh"}:
+        raise ValueError(f"Unknown graph search method: {method}")
+    if not math.isfinite(radius) or radius <= 0:
+        raise ValueError("Graph radius must be finite and positive")
+    # Strict tie selection is historically tied to the old cell traversal.
+    # Preserve that path instead of changing which degenerate neighbors survive.
+    legacy_order = enforce_max_neighbors_strictly and max_num_neighbors_threshold > 0
+    if legacy_order:
+        method = "cell"
     # Preserve the per-system flags before canonical_pbc collapses them. An
     # explicit override (including always_use_pbc) must also control image
     # repetitions, not only the global warning/check flags.
@@ -481,7 +499,6 @@ def radius_graph_pbc_v2(
     # are outside of the unit cell, it will not work correctly.
     # position of the atoms
     atom_pos = data.pos
-    num_atoms = len(data.pos)
     num_atoms_per_image = data.natoms
 
     # Calculate required number of unit cells in each direction.
@@ -525,25 +542,14 @@ def radius_graph_pbc_v2(
         (rep[:, 0] * 2 + 1.0) * (rep[:, 1] * 2 + 1.0) * (rep[:, 2] * 2 + 1.0)
     ).long()
 
-    # Create a tensor of unit cells for each image
-    unit_cell = torch.zeros(
-        torch.sum(cells_per_image), 3, device=device, dtype=data.cell.dtype
+    # Cache only integer image indices. Cell-dependent Cartesian offsets are
+    # recomputed at every call, including cache rebuilds after cell changes.
+    unit_cell = torch.cat(
+        [
+            integer_cartesian_table(*map(int, repetitions), device).to(data.cell.dtype)
+            for repetitions in rep.tolist()
+        ]
     )
-    offset = 0
-    for i in range(batch_size):
-        cells_x = torch.arange(
-            -rep[i][0], rep[i][0] + 1, device=device, dtype=data.cell.dtype
-        )
-        cells_y = torch.arange(
-            -rep[i][1], rep[i][1] + 1, device=device, dtype=data.cell.dtype
-        )
-        cells_z = torch.arange(
-            -rep[i][2], rep[i][2] + 1, device=device, dtype=data.cell.dtype
-        )
-        unit_cell[offset : cells_per_image[i] + offset] = torch.cartesian_prod(
-            cells_x, cells_y, cells_z
-        )
-        offset = offset + cells_per_image[i]
 
     # Compute the x, y, z positional offsets for each cell in each image
     cell_matrix = torch.transpose(data.cell, 1, 2)
@@ -563,180 +569,227 @@ def radius_graph_pbc_v2(
         target_atom_pos = atom_pos
         target_atom_image = data_batch_idxs
 
-    # Compute the position of the source atoms for the edges. There are
-    # more source atoms than target atoms, since the source atoms are
-    # tiled by the PBC cells.
-    num_cells_per_atom = torch.repeat_interleave(cells_per_image, num_atoms_per_image)
-    source_atom_index = torch.repeat_interleave(
-        torch.arange(num_atoms, device=device).long(), num_cells_per_atom
+    source_atom_index, pbc_cell_index, source_atom_pos = source_cloud(
+        atom_pos,
+        atom_pos,
+        data_batch_idxs,
+        pbc_cell_offsets,
+        unit_cell,
+        cells_per_image,
+        num_atoms_per_image,
+        prune=radius if any(pbc) and not legacy_order else None,
     )
     source_atom_image = data_batch_idxs[source_atom_index]
+    if method == "auto":
+        if len(source_atom_pos) * len(target_atom_pos) <= 16384:
+            method = "all_pairs"
+        else:
+            extent = source_atom_pos.amax(0) - source_atom_pos.amin(0)
+            # Sparse-box rule avoids a large unoccupied-cell search. It is a
+            # deterministic heuristic, not a claimed device-specific optimum.
+            method = (
+                "bvh"
+                if bool((extent / radius).prod() > 64 * len(source_atom_pos))
+                else "cell"
+            )
 
-    # Concatenate once: repeatedly growing this tensor copies all earlier
-    # systems for every new system in a heterogeneous batch.
-    pbc_cell_indices = []
-    offset = 0
-    for i in range(batch_size):
-        cell_indices = (
-            torch.arange(offset, offset + cells_per_image[i], device=device)
-            .repeat(num_atoms_per_image[i])
-            .long()
+    if method == "cell":
+        # Given the positions of all the atoms has been computed, we
+        # split them up using a cubic grid to make pairwise comparisons
+        # more computationally efficient. The resolution of the grid
+        # is grid_resolution.
+
+        # Compute the grid index for each dimension for each atom
+        # The source tiles include the unshifted atoms and therefore every target.
+        # One reduction suffices; Python max(tensor, tensor) also synchronizes an
+        # accelerator unnecessarily to compare the two scalar tensors.
+        if legacy_order:
+            max_coordinate = source_atom_pos.abs().max()
+            if max_coordinate / grid_resolution > 200:
+                grid_resolution = max_coordinate / 200
+            origin = atom_pos.new_zeros((batch_size, 3))
+        else:
+            origin = atom_pos.new_zeros((batch_size, 3))
+            origin.scatter_reduce_(
+                0,
+                data_batch_idxs[:, None].expand(-1, 3),
+                atom_pos,
+                reduce="amin",
+                include_self=False,
+            )
+            # The sparse integer hash must fit int64, including batch offsets.
+            max_extent = (source_atom_pos - origin[source_atom_image]).abs().max()
+            safe_axis = min(1000000, int((2**59 / max(1, batch_size)) ** (1 / 3)))
+            if bool(max_extent / grid_resolution > safe_axis):
+                grid_resolution = max_extent / safe_axis
+        source_atom_grid = torch.floor(
+            (source_atom_pos - origin[source_atom_image]) / grid_resolution
+        ).long()
+        target_grid_float = (
+            target_atom_pos - origin[target_atom_image]
+        ) / grid_resolution
+        target_atom_grid = torch.floor(target_grid_float).long()
+
+        # Reduce directly into one row per system. Padding all systems to the
+        # largest tiled system wastes memory and includes spurious zero grid
+        # coordinates in the bounds of smaller systems.
+        if batch_size == 1:
+            grid_min = source_atom_grid.amin(dim=0, keepdim=True)
+            grid_max = source_atom_grid.amax(dim=0, keepdim=True)
+        else:
+            image_index = source_atom_image[:, None].expand(-1, 3)
+            grid_min = torch.zeros((batch_size, 3), device=device, dtype=torch.long)
+            grid_max = torch.zeros_like(grid_min)
+            grid_min.scatter_reduce_(
+                0, image_index, source_atom_grid, reduce="amin", include_self=False
+            )
+            grid_max.scatter_reduce_(
+                0, image_index, source_atom_grid, reduce="amax", include_self=False
+            )
+
+        # Size of grid in each dimension for each image
+        grid_size = grid_max - grid_min + 1
+        grid_length = grid_size[:, 0] * grid_size[:, 1] * grid_size[:, 2]
+        # Offset between grids for each image
+        grid_offset = torch.cat(
+            [torch.tensor([0], device=device), torch.cumsum(grid_length, dim=0)], dim=0
         )
-        pbc_cell_indices.append(cell_indices)
-        offset = offset + cells_per_image[i]
 
-    pbc_cell_index = torch.cat(pbc_cell_indices)
-    del pbc_cell_indices, cell_indices
-    source_atom_pos = atom_pos[source_atom_index] + pbc_cell_offsets[pbc_cell_index]
+        num_grid_cells = torch.sum(grid_length)
 
-    # Given the positions of all the atoms has been computed, we
-    # split them up using a cubic grid to make pairwise comparisons
-    # more computationally efficient. The resolution of the grid
-    # is grid_resolution.
+        # Subtract the minimum grid index so they are zero indexed
+        source_atom_grid = source_atom_grid - grid_min[source_atom_image]
+        target_atom_grid = target_atom_grid - grid_min[target_atom_image]
 
-    # Compute the grid index for each dimension for each atom
-    # The source tiles include the unshifted atoms and therefore every target.
-    # One reduction suffices; Python max(tensor, tensor) also synchronizes an
-    # accelerator unnecessarily to compare the two scalar tensors.
-    max_coordinate = source_atom_pos.abs().max()
-    if max_coordinate / grid_resolution > 200:
-        box_size_warning(data.cell, data.pos, pbc)
-        grid_resolution = max_coordinate / 200
-    source_atom_grid = torch.floor(source_atom_pos / grid_resolution).long()
-    target_atom_grid = torch.floor(target_atom_pos / grid_resolution).long()
+        # Compute the grid id which is a combination of the grid indices in the x,y,z directions
+        # Grid id is x + y*grid_size[0] + z*grid_size[0]*grid_size[1] + offset
+        source_atom_grid_size = grid_size[source_atom_image]
+        source_atom_grid_offset = grid_offset[source_atom_image]
+        source_atom_grid_id = (
+            source_atom_grid[:, 0]
+            + source_atom_grid[:, 1] * source_atom_grid_size[:, 0]
+            + source_atom_grid[:, 2]
+            * source_atom_grid_size[:, 0]
+            * source_atom_grid_size[:, 1]
+        )
+        source_atom_grid_id = source_atom_grid_id + source_atom_grid_offset
 
-    # Reduce directly into one row per system. Padding all systems to the
-    # largest tiled system wastes memory and includes spurious zero grid
-    # coordinates in the bounds of smaller systems.
-    if batch_size == 1:
-        grid_min = source_atom_grid.amin(dim=0, keepdim=True)
-        grid_max = source_atom_grid.amax(dim=0, keepdim=True)
+        target_atom_grid_size = grid_size[target_atom_image]
+        target_atom_grid_offset = grid_offset[target_atom_image]
+        target_atom_grid_id = (
+            target_atom_grid[:, 0]
+            + target_atom_grid[:, 1] * target_atom_grid_size[:, 0]
+            + target_atom_grid[:, 2]
+            * target_atom_grid_size[:, 0]
+            * target_atom_grid_size[:, 1]
+        )
+        target_atom_grid_id = target_atom_grid_id + target_atom_grid_offset
+
+        # Keep only occupied cells. A dense [all cells, maximum occupancy]
+        # table scales with vacuum volume and the densest cell in any system.
+        # Sorting is unchanged so ties retain the previous source traversal order.
+        sort_grid_id, sort_indices = torch.sort(source_atom_grid_id)
+        occupied_grid_ids, grid_cell_atom_count = torch.unique_consecutive(
+            sort_grid_id, return_counts=True
+        )
+        grid_cell_start = torch.cumsum(grid_cell_atom_count, 0) - grid_cell_atom_count
+
+        # How many grid cells do we need to include in each direction given the search radius?
+        padding_size = math.floor(radius / grid_resolution) + 1
+        num_padding_grid_cells = (
+            (2 * padding_size + 1) * (2 * padding_size + 1) * (2 * padding_size + 1)
+        )
+
+        padding_offsets = (
+            integer_cartesian_table(padding_size, padding_size, padding_size, device)
+            .unsqueeze(0)
+            .expand(batch_size, -1, -1)
+        )
+
+        grid_index = target_atom_grid[:, None, :] + padding_offsets[target_atom_image]
+        max_index = target_atom_grid_size.view(-1, 1, 3).expand(
+            -1, num_padding_grid_cells, -1
+        )
+        out_of_bounds = torch.logical_and(grid_index.ge(0), grid_index.lt(max_index))
+        out_of_bounds = torch.all(out_of_bounds, dim=2).ne(True)
+
+        if not legacy_order:
+            # Distance from the target point to each candidate cell's AABB. This
+            # cannot discard an in-radius source, including skew periodic images,
+            # because the spatial search itself uses Cartesian cubes.
+            relative_target = target_grid_float - grid_min[target_atom_image]
+            delta = (grid_index - relative_target[:, None]).clamp(min=0) + (
+                relative_target[:, None] - grid_index - 1
+            ).clamp(min=0)
+            margin = (
+                64
+                * torch.finfo(atom_pos.dtype).eps
+                * (relative_target.abs().amax() + 1)
+            )
+            out_of_bounds |= (
+                delta.square().sum(-1) > (radius / grid_resolution + margin) ** 2
+            )
+        # Never mutate a cached integer table.
+        strides = torch.stack(
+            (
+                torch.ones_like(grid_size[:, 0]),
+                grid_size[:, 0],
+                grid_size[:, 0] * grid_size[:, 1],
+            ),
+            dim=-1,
+        )
+        padding_offsets = (padding_offsets * strides[:, None]).sum(dim=2)
+
+        # For each target, preserve cell traversal order while expanding only
+        # actual source atoms, rather than padding every cell to the maximum
+        # occupancy. Out-of-bounds cells use a key above every valid grid id.
+        neighboring_grid_cells = (
+            target_atom_grid_id[:, None] + padding_offsets[target_atom_image]
+        )
+        neighboring_grid_cells.masked_fill_(out_of_bounds, num_grid_cells)
+        neighboring_grid_cells = neighboring_grid_cells.reshape(-1)
+        # A direct lookup is faster for compact grids, but cap its size by the
+        # number of tiled atoms so vacuum cannot turn it into a volume allocation.
+        if num_grid_cells <= 4 * len(source_atom_grid_id):
+            cell_to_occupied = torch.full(
+                (num_grid_cells + 1,), -1, device=device, dtype=torch.long
+            )
+            cell_to_occupied[occupied_grid_ids] = torch.arange(
+                len(occupied_grid_ids), device=device
+            )
+            occupied_index = cell_to_occupied[neighboring_grid_cells].clamp(min=0)
+        else:
+            occupied_index = torch.searchsorted(
+                occupied_grid_ids, neighboring_grid_cells
+            )
+            occupied_index = occupied_index.clamp(max=len(occupied_grid_ids) - 1)
+        candidate_counts = torch.where(
+            occupied_grid_ids[occupied_index] == neighboring_grid_cells,
+            grid_cell_atom_count[occupied_index],
+            0,
+        )
+        candidate_starts = torch.cumsum(candidate_counts, 0) - candidate_counts
+        source_offsets = torch.repeat_interleave(
+            grid_cell_start[occupied_index] - candidate_starts, candidate_counts
+        )
+        source_atom_edge_index = sort_indices[
+            torch.arange(len(source_offsets), device=device) + source_offsets
+        ]
+        target_atom_edge_index = torch.repeat_interleave(
+            torch.arange(len(target_atom_pos), device=device),
+            candidate_counts.view(-1, num_padding_grid_cells).sum(dim=1),
+            output_size=len(source_atom_edge_index),
+        )
+
     else:
-        image_index = source_atom_image[:, None].expand(-1, 3)
-        grid_min = torch.zeros((batch_size, 3), device=device, dtype=torch.long)
-        grid_max = torch.zeros_like(grid_min)
-        grid_min.scatter_reduce_(
-            0, image_index, source_atom_grid, reduce="amin", include_self=False
+        source_atom_edge_index, target_atom_edge_index = alternative_candidates(
+            source_atom_pos,
+            target_atom_pos,
+            source_atom_image,
+            target_atom_image,
+            radius,
+            method,
         )
-        grid_max.scatter_reduce_(
-            0, image_index, source_atom_grid, reduce="amax", include_self=False
-        )
-
-    # Size of grid in each dimension for each image
-    grid_size = grid_max - grid_min + 1
-    grid_length = grid_size[:, 0] * grid_size[:, 1] * grid_size[:, 2]
-    # Offset between grids for each image
-    grid_offset = torch.cat(
-        [torch.tensor([0], device=device), torch.cumsum(grid_length, dim=0)], dim=0
-    )
-
-    num_grid_cells = torch.sum(grid_length)
-
-    # Subtract the minimum grid index so they are zero indexed
-    source_atom_grid = source_atom_grid - grid_min[source_atom_image]
-    target_atom_grid = target_atom_grid - grid_min[target_atom_image]
-
-    # Compute the grid id which is a combination of the grid indices in the x,y,z directions
-    # Grid id is x + y*grid_size[0] + z*grid_size[0]*grid_size[1] + offset
-    source_atom_grid_size = grid_size[source_atom_image]
-    source_atom_grid_offset = grid_offset[source_atom_image]
-    source_atom_grid_id = (
-        source_atom_grid[:, 0]
-        + source_atom_grid[:, 1] * source_atom_grid_size[:, 0]
-        + source_atom_grid[:, 2]
-        * source_atom_grid_size[:, 0]
-        * source_atom_grid_size[:, 1]
-    )
-    source_atom_grid_id = source_atom_grid_id + source_atom_grid_offset
-
-    target_atom_grid_size = grid_size[target_atom_image]
-    target_atom_grid_offset = grid_offset[target_atom_image]
-    target_atom_grid_id = (
-        target_atom_grid[:, 0]
-        + target_atom_grid[:, 1] * target_atom_grid_size[:, 0]
-        + target_atom_grid[:, 2]
-        * target_atom_grid_size[:, 0]
-        * target_atom_grid_size[:, 1]
-    )
-    target_atom_grid_id = target_atom_grid_id + target_atom_grid_offset
-
-    # Keep only occupied cells. A dense [all cells, maximum occupancy]
-    # table scales with vacuum volume and the densest cell in any system.
-    # Sorting is unchanged so ties retain the previous source traversal order.
-    sort_grid_id, sort_indices = torch.sort(source_atom_grid_id)
-    occupied_grid_ids, grid_cell_atom_count = torch.unique_consecutive(
-        sort_grid_id, return_counts=True
-    )
-    grid_cell_start = torch.cumsum(grid_cell_atom_count, 0) - grid_cell_atom_count
-
-    # How many grid cells do we need to include in each direction given the search radius?
-    padding_size = math.floor(radius / grid_resolution) + 1
-    num_padding_grid_cells = (
-        (2 * padding_size + 1) * (2 * padding_size + 1) * (2 * padding_size + 1)
-    )
-
-    padding_offsets = torch.arange(
-        -padding_size, padding_size + 1, device=device, dtype=torch.long
-    )
-    padding_offsets = padding_offsets.view(1, -1).repeat(3, 1)
-    padding_offsets = torch.cartesian_prod(
-        padding_offsets[0, :], padding_offsets[1, :], padding_offsets[2, :]
-    )
-    padding_offsets = padding_offsets.unsqueeze(0).repeat(batch_size, 1, 1)
-
-    grid_index = target_atom_grid[:, None, :] + padding_offsets[target_atom_image]
-    max_index = target_atom_grid_size.view(-1, 1, 3).expand(
-        -1, num_padding_grid_cells, -1
-    )
-    out_of_bounds = torch.logical_and(grid_index.ge(0), grid_index.lt(max_index))
-    out_of_bounds = torch.all(out_of_bounds, dim=2).ne(True)
-
-    padding_offsets[:, :, 1] = padding_offsets[:, :, 1] * grid_size.unsqueeze(-1)[:, 0]
-    padding_offsets[:, :, 2] = (
-        padding_offsets[:, :, 2]
-        * grid_size.unsqueeze(-1)[:, 0]
-        * grid_size.unsqueeze(-1)[:, 1]
-    )
-    padding_offsets = torch.sum(padding_offsets, dim=2)
-
-    # For each target, preserve cell traversal order while expanding only
-    # actual source atoms, rather than padding every cell to the maximum
-    # occupancy. Out-of-bounds cells use a key above every valid grid id.
-    neighboring_grid_cells = (
-        target_atom_grid_id[:, None] + padding_offsets[target_atom_image]
-    )
-    neighboring_grid_cells.masked_fill_(out_of_bounds, num_grid_cells)
-    neighboring_grid_cells = neighboring_grid_cells.reshape(-1)
-    # A direct lookup is faster for compact grids, but cap its size by the
-    # number of tiled atoms so vacuum cannot turn it into a volume allocation.
-    if num_grid_cells <= 4 * len(source_atom_grid_id):
-        cell_to_occupied = torch.full(
-            (num_grid_cells + 1,), -1, device=device, dtype=torch.long
-        )
-        cell_to_occupied[occupied_grid_ids] = torch.arange(
-            len(occupied_grid_ids), device=device
-        )
-        occupied_index = cell_to_occupied[neighboring_grid_cells].clamp(min=0)
-    else:
-        occupied_index = torch.searchsorted(occupied_grid_ids, neighboring_grid_cells)
-        occupied_index = occupied_index.clamp(max=len(occupied_grid_ids) - 1)
-    candidate_counts = torch.where(
-        occupied_grid_ids[occupied_index] == neighboring_grid_cells,
-        grid_cell_atom_count[occupied_index],
-        0,
-    )
-    candidate_starts = torch.cumsum(candidate_counts, 0) - candidate_counts
-    source_offsets = torch.repeat_interleave(
-        grid_cell_start[occupied_index] - candidate_starts, candidate_counts
-    )
-    source_atom_edge_index = sort_indices[
-        torch.arange(len(source_offsets), device=device) + source_offsets
-    ]
-    target_atom_edge_index = torch.repeat_interleave(
-        torch.arange(len(target_atom_pos), device=device),
-        candidate_counts.view(-1, num_padding_grid_cells).sum(dim=1),
-        output_size=len(source_atom_edge_index),
-    )
 
     # Keep the same distance arithmetic, but release gathered positions after
     # subtraction instead of retaining both candidate-sized arrays to return.
@@ -750,7 +803,10 @@ def radius_graph_pbc_v2(
     )
     # Is the distance within the radius and not 0 (the same atom)
     within_radius_mask = torch.logical_and(
-        atom_distance_sqr.le(radius * radius), atom_distance_sqr.ne(0.0)
+        atom_distance_sqr.le(radius * radius),
+        torch.ones_like(atom_distance_sqr, dtype=torch.bool)
+        if include_zero_distance
+        else atom_distance_sqr.ne(0.0),
     )
     source_atom_edge_index = torch.masked_select(
         source_atom_edge_index, within_radius_mask

@@ -25,6 +25,7 @@ __all__ = [
     "ExecutionMode",
     "ExecutionBackend",
     "UMASFastPytorchBackend",
+    "UMASFastPortableBackend",
     "UMASFastGPUBackend",
     "get_execution_backend",
     "maybe_update_settings_backend",
@@ -56,6 +57,7 @@ class ExecutionMode(str, Enum):
 
     GENERAL = "general"
     UMAS_FAST_PYTORCH = "umas_fast_pytorch"
+    UMAS_FAST_PORTABLE = "umas_fast_portable"
     UMAS_FAST_GPU = "umas_fast_gpu"
 
 
@@ -116,6 +118,7 @@ class ExecutionBackend:
     def get_layer_radial_emb(
         x_edge: torch.Tensor,
         model: torch.nn.Module,
+        **decomposition,
     ) -> list[torch.Tensor]:
         """
         Get edge embeddings for each layer.
@@ -292,6 +295,8 @@ class UMASFastPytorchBackend(ExecutionBackend):
             raise ValueError(
                 "UMASFastPytorchBackend requires activation_checkpointing=False"
             )
+        if settings is not None and not settings.merge_mole:
+            raise ValueError("UMASFastPytorchBackend requires merge_mole=True")
 
     @staticmethod
     def prepare_model_for_inference(model: torch.nn.Module) -> None:
@@ -305,13 +310,21 @@ class UMASFastPytorchBackend(ExecutionBackend):
         radial functions for efficient batched computation.
         """
         from fairchem.core.models.uma.nn.so2_layers import (
+            SO2_Conv1_WithRadialBlock,
+            SO2_Conv2_InternalBlock,
             convert_so2_conv1,
             convert_so2_conv2,
         )
 
         for block in model.blocks:
-            block.edge_wise.so2_conv_1 = convert_so2_conv1(block.edge_wise.so2_conv_1)
-            block.edge_wise.so2_conv_2 = convert_so2_conv2(block.edge_wise.so2_conv_2)
+            if not isinstance(block.edge_wise.so2_conv_1, SO2_Conv1_WithRadialBlock):
+                block.edge_wise.so2_conv_1 = convert_so2_conv1(
+                    block.edge_wise.so2_conv_1
+                )
+            if not isinstance(block.edge_wise.so2_conv_2, SO2_Conv2_InternalBlock):
+                block.edge_wise.so2_conv_2 = convert_so2_conv2(
+                    block.edge_wise.so2_conv_2
+                )
 
         # Create unified radial MLP for batched computation
         rad_funcs = [block.edge_wise.so2_conv_1.rad_func for block in model.blocks]
@@ -321,6 +334,7 @@ class UMASFastPytorchBackend(ExecutionBackend):
     def get_layer_radial_emb(
         x_edge: torch.Tensor,
         model: torch.nn.Module,
+        **decomposition,
     ) -> list[torch.Tensor]:
         """
         Compute radial embeddings for all layers using batched UnifiedRadialMLP.
@@ -332,7 +346,148 @@ class UMASFastPytorchBackend(ExecutionBackend):
         Returns:
             List of radial embeddings, one per layer [E, radial_features]
         """
+        if decomposition:
+            return model._unified_radial_mlp.forward_decomposed(**decomposition)
         return model._unified_radial_mlp(x_edge)
+
+
+class UMASFastPortableBackend(UMASFastPytorchBackend):
+    """
+    Compact l=2 SO2 path using PyTorch and optional strict-FP32 XPU kernels.
+
+    The reference uses differentiable block operations for energy, forces,
+    stress and Hessians. ``FAIRCHEM_XPU_FUSED_KERNELS=1`` enables experimental
+    Triton-XPU forward kernels, whose adjoints remain PyTorch operations.
+    """
+
+    supports_fused_edgewise = True
+    supports_residual_scatter = True
+
+    @staticmethod
+    def prepare_model_for_inference(model):
+        from fairchem.core.models.uma.nn.portable_geometry import PortableGeometry
+        from fairchem.core.models.uma.nn.radial import (
+            GaussianSmearing,
+            PolynomialEnvelope,
+        )
+
+        UMASFastPytorchBackend.prepare_model_for_inference(model)
+        if (
+            model.use_quaternion_wigner
+            and isinstance(model.distance_expansion, GaussianSmearing)
+            and isinstance(model.envelope, PolynomialEnvelope)
+        ):
+            model._portable_geometry = PortableGeometry(model)
+
+    @staticmethod
+    def compute_geometry(edge_vectors, model):
+        geometry = getattr(model, "_portable_geometry", None)
+        return None if geometry is None else geometry(edge_vectors)
+
+    @staticmethod
+    def validate(lmax, mmax, settings):
+        UMASFastPytorchBackend.validate(lmax, mmax, settings)
+        if lmax != 2 or mmax != 2:
+            raise ValueError("umas_fast_portable requires lmax==2 and mmax==2")
+        if settings is not None and settings.tf32:
+            raise ValueError(
+                "umas_fast_portable preserves FP32 and requires tf32=False"
+            )
+
+    @staticmethod
+    def get_layer_radial_emb(x_edge, model, **decomposition):
+        if decomposition:
+            return model._unified_radial_mlp.forward_decomposed(
+                **decomposition, lazy=True
+            )
+        return model._unified_radial_mlp(x_edge, lazy=True)
+
+    @staticmethod
+    def prepare_wigner(wigner, wigner_inv, mappingReduced, coefficient_index):
+        from fairchem.core.models.uma.nn.portable_wigner import compact_wigner
+
+        return compact_wigner(wigner), compact_wigner(wigner_inv)
+
+    @staticmethod
+    def fused_node_to_edge_conv1_pack(
+        x_full, edge_index, wigner, radial, sphere_channels
+    ):
+        from fairchem.core.models.uma.nn.portable_wigner import producer
+
+        return producer(x_full, edge_index, wigner, radial, sphere_channels)
+
+    @staticmethod
+    def fused_node_to_edge_conv1_pack_projected(
+        x_full, edge_index, wigner, projection, sphere_channels
+    ):
+        from fairchem.core.models.uma.nn.portable_wigner import (
+            producer_projected,
+        )
+
+        return producer_projected(
+            x_full, edge_index, wigner, projection, sphere_channels
+        )
+
+    @staticmethod
+    def gate_activation(x0_full, x1, x2, channels, activation):
+        gating, x0 = x0_full.split((2 * channels, 3 * channels), dim=-1)
+        return activation.forward_m_blocks(gating, (x0, x1, x2))
+
+    @staticmethod
+    def fused_conv2_inv_edge_to_node(
+        g0,
+        g1,
+        g2,
+        wigner_inv_envelope,
+        scatter_target,
+        num_nodes,
+        sphere_channels,
+        residual=None,
+    ):
+        from fairchem.core.models.uma.nn.portable_wigner import consumer
+
+        return consumer(
+            g0,
+            g1,
+            g2,
+            wigner_inv_envelope,
+            scatter_target,
+            num_nodes,
+            sphere_channels,
+            residual,
+        )
+
+    @staticmethod
+    def edge_degree_scatter(
+        x,
+        radial_output,
+        wigner_inv,
+        scatter_target,
+        m_0_num_coefficients,
+        sphere_channels,
+        rescale_factor,
+    ):
+        from fairchem.core.models.uma.nn.portable_wigner import (
+            compact_wigner,
+            segmented_sum,
+        )
+
+        if m_0_num_coefficients != 3:
+            raise ValueError("portable l=2 edge degree requires three m=0 coefficients")
+        wigner = compact_wigner(wigner_inv)
+        radial = radial_output.reshape(-1, 3, sphere_channels)
+        blocks = (
+            wigner[:, 0:1, None] * radial[:, 0:1],
+            wigner[:, (2, 5, 8), None] * radial[:, 1:2],
+            wigner[:, (12, 17, 22, 27, 32), None] * radial[:, 2:3],
+        )
+        reduced = [
+            segmented_sum(
+                block.to(x.dtype) / rescale_factor, scatter_target, x.shape[0]
+            )
+            for block in blocks
+        ]
+        return x + torch.cat(reduced, dim=1)
 
 
 class UMASFastGPUBackend(UMASFastPytorchBackend):
@@ -571,6 +726,7 @@ class UMASFastGPUBackend(UMASFastPytorchBackend):
 _EXECUTION_BACKENDS: dict[ExecutionMode, type[ExecutionBackend]] = {
     ExecutionMode.GENERAL: ExecutionBackend,
     ExecutionMode.UMAS_FAST_PYTORCH: UMASFastPytorchBackend,
+    ExecutionMode.UMAS_FAST_PORTABLE: UMASFastPortableBackend,
     ExecutionMode.UMAS_FAST_GPU: UMASFastGPUBackend,
 }
 

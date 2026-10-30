@@ -27,6 +27,8 @@ from pathlib import Path
 import numpy as np
 import torch
 from ase.build import bulk, molecule
+from ase.calculators.calculator import all_changes
+from ase.stress import full_3x3_to_voigt_6_stress
 
 
 def validate_prediction(prediction, natoms, stress=False):
@@ -77,15 +79,23 @@ def compare_predictions(reference, candidate, natoms, tolerances):
 
 def evaluate(atoms, stress=False):
     """
-    Force a fresh ASE evaluation instead of timing cached calculator results.
+    Request fresh raw calculator outputs in one model evaluation.
+
+    Atom constraints and kinetic stress are excluded from these model checks.
+    Sequential ASE getters can trigger one forward per requested property when
+    a calculator supports selective outputs, biasing both timing and memory.
     """
     atoms.calc.reset()
+    properties = ["energy", "forces", *(["stress"] if stress else [])]
+    atoms.calc.calculate(atoms, properties=properties, system_changes=all_changes)
     result = {
-        "energy": float(atoms.get_potential_energy()),
-        "forces": np.asarray(atoms.get_forces()).copy(),
+        "energy": float(atoms.calc.results["energy"]),
+        "forces": np.asarray(atoms.calc.results["forces"]).copy(),
     }
     if stress:
-        result["stress"] = np.asarray(atoms.get_stress()).copy()
+        result["stress"] = np.asarray(atoms.calc.results["stress"]).copy()
+        if result["stress"].shape == (3, 3):
+            result["stress"] = full_3x3_to_voigt_6_stress(result["stress"])
     validate_prediction(result, len(atoms), stress)
     for name, value in result.items():
         if not np.isfinite(value).all():
@@ -326,27 +336,58 @@ def probe_fp64_reduction(device):
     }
 
 
+def case_settings(args, device, merge_mole, stress=False):
+    """
+    Keep a general CPU reference and select explicit FP32 XPU optimizations.
+
+    The unmerged XPU case exercises graph/compile options. Backend transforms
+    and graph capture require merged experts and apply only to the merged case.
+    """
+    from fairchem.core.units.mlip_unit.api.inference import InferenceSettings
+
+    xpu = device.type == "xpu"
+    options = {}
+    if xpu:
+        defaults = {
+            "neighbor_skin": 0.0,
+            "neighbor_cache_entries": 1,
+            "graph_search_method": "cell",
+            "graph_edge_order": "original",
+            "edge_chunk_size": None,
+            "compile_scope": "model",
+            "xpu_graph_cache_size": 1,
+        }
+        options = {name: getattr(args, name, value) for name, value in defaults.items()}
+    return InferenceSettings(
+        base_precision_dtype=torch.float32,
+        activation_checkpointing=False,
+        tf32=False,
+        nitro=False,
+        execution_mode=(
+            getattr(args, "execution_mode", "general")
+            if xpu and merge_mole
+            else "general"
+        ),
+        internal_graph_gen_version=2,
+        merge_mole=merge_mole,
+        compile=args.compile and xpu,
+        xpu_graph=xpu and merge_mole and getattr(args, "xpu_graph", False),
+        requested_properties=("energy", "forces", *(["stress"] if stress else [])),
+        **options,
+    )
+
+
 def run_case(args, atoms, task, device, merge_mole, stress=False, progress=None):
     """
     Load a fresh predictor so each timing retains its chosen MoLE configuration.
     """
     from fairchem.core import FAIRChemCalculator, pretrained_mlip
-    from fairchem.core.units.mlip_unit.api.inference import InferenceSettings
 
     def stage(name):
         if progress is not None:
             progress.update(device=str(device), merge_mole=merge_mole, stage=name)
 
-    settings = InferenceSettings(
-        base_precision_dtype=torch.float32,
-        activation_checkpointing=False,
-        tf32=False,
-        nitro=False,
-        execution_mode="general",
-        internal_graph_gen_version=2,
-        merge_mole=merge_mole,
-        compile=args.compile and device.type == "xpu",
-    )
+    settings = case_settings(args, device, merge_mole, stress)
     predictor = structure = None
     completed = False
     memory = {}
@@ -478,6 +519,39 @@ def build_parser():
     parser.add_argument(
         "--compile", action="store_true", help="Experimental XPU compile"
     )
+    parser.add_argument(
+        "--compile-scope",
+        choices=("model", "blocks"),
+        default="model",
+        help="Compile the complete model or only numerical blocks; requires --compile",
+    )
+    parser.add_argument("--neighbor-skin", type=float, default=0.0)
+    parser.add_argument("--neighbor-cache-entries", type=int, default=1)
+    parser.add_argument(
+        "--graph-search-method",
+        choices=("cell", "auto", "all_pairs", "bvh"),
+        default="cell",
+    )
+    parser.add_argument(
+        "--graph-edge-order", choices=("original", "spatial"), default="original"
+    )
+    parser.add_argument(
+        "--edge-chunk-size",
+        type=int,
+        help="Pad edge capacity to this bucket size without removing real edges",
+    )
+    parser.add_argument(
+        "--execution-mode",
+        choices=("general", "umas_fast_pytorch", "umas_fast_portable"),
+        default="general",
+        help="Merged XPU backend; non-general modes require --compare-merged",
+    )
+    parser.add_argument(
+        "--xpu-graph",
+        action="store_true",
+        help="Experimental numerical-block graph capture; requires --compare-merged",
+    )
+    parser.add_argument("--xpu-graph-cache-size", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=10)
     parser.add_argument("--fd-step", type=float, default=0.005)
@@ -511,6 +585,18 @@ def main(argv=None):
     try:
         if args.warmup < 0 or args.repeats < 1:
             raise ValueError("warmup must be nonnegative and repeats positive")
+        if not np.isfinite(args.neighbor_skin) or args.neighbor_skin < 0:
+            raise ValueError("neighbor_skin must be finite and nonnegative")
+        if (
+            args.execution_mode != "general" or args.xpu_graph
+        ) and not args.compare_merged:
+            raise ValueError(
+                "The selected backend or XPU graph requires --compare-merged"
+            )
+        if args.compile_scope != "model" and not args.compile:
+            raise ValueError("--compile-scope blocks requires --compile")
+        # Validate all capacities before device discovery or checkpoint loading.
+        case_settings(args, torch.device("xpu:0"), True, args.stress)
         if any(
             not np.isfinite(value) or value <= 0
             for value in (

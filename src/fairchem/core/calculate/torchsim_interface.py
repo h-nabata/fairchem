@@ -7,6 +7,7 @@ LICENSE file in the root directory of this source tree.
 
 from __future__ import annotations
 
+import copy
 import os
 import typing
 from pathlib import Path
@@ -35,6 +36,101 @@ if typing.TYPE_CHECKING:
 # Use object as fallback base class if ModelInterface is not available
 # The __init__ method will raise ImportError if torch-sim is not installed
 _TSModelInterface = ModelInterface if ModelInterface is not None else object
+
+
+class _SimStateConverter:
+    """
+    Cache validated, immutable batch metadata while refreshing geometry each call.
+
+    Cache keys retain the original tensors and check PyTorch's mutation versions,
+    so allocator address reuse cannot produce a false hit. Normal in-place tensor
+    updates, replacement, device/dtype changes and charge/spin changes invalidate
+    the template. Tensor mutation through ``.data`` or foreign raw pointers is not
+    supported; disable metadata caching for such callers.
+    """
+
+    def __init__(self):
+        self._owners = None
+        self._versions = None
+        self._signature = None
+        self._template = None
+        self._periodic = False
+
+    def clear(self):
+        self._owners = None
+        self._versions = None
+        self._signature = None
+        self._template = None
+
+    def __call__(self, state, task_name, target_dtype):
+        owners = (
+            state.atomic_numbers,
+            state.system_idx,
+            state.pbc,
+            state.charge if state.has_extras("charge") else None,
+            state.spin if state.has_extras("spin") else None,
+        )
+        signature = (
+            state.positions.shape,
+            state.positions.device,
+            target_dtype,
+            task_name,
+            None if state.cell is None else (state.cell.shape, state.cell.device),
+        )
+        try:
+            versions = tuple(t._version if t is not None else None for t in owners)
+        except RuntimeError:
+            # Inference tensors do not expose mutation counters. Revalidate rather
+            # than treating an unobservable mutation as immutable metadata.
+            self.clear()
+            return _simstate_to_atomicdata_batch(state, task_name, target_dtype)
+        hit = (
+            self._template is not None
+            and self._signature == signature
+            and self._versions == versions
+            and all(old is new for old, new in zip(self._owners, owners))
+        )
+        if not hit:
+            batch = _simstate_to_atomicdata_batch(state, task_name, target_dtype)
+            # Keep owned static values only. Never retain an old coordinate/cell
+            # tensor or its autograd graph in the metadata cache.
+            memo = {}
+            for key, value in vars(batch).items():
+                if isinstance(value, torch.Tensor):
+                    memo[id(value)] = (
+                        torch.empty(0, device=value.device, dtype=value.dtype)
+                        if key in {"pos", "cell"}
+                        else value.detach().clone()
+                    )
+            self._template = copy.deepcopy(batch, memo)
+            self._owners = owners
+            self._versions = versions
+            self._signature = signature
+            self._periodic = bool(batch.pbc.any())
+            return batch
+
+        positions = state.positions.to(target_dtype)
+        n_systems = self._template.natoms.numel()
+        cell = (
+            state.row_vector_cell.to(target_dtype)
+            if state.cell is not None
+            else torch.eye(3, device=positions.device, dtype=target_dtype)
+            .unsqueeze(0)
+            .expand(n_systems, -1, -1)
+        )
+        if self._periodic:
+            positions = pbc_wrap_batched(
+                positions,
+                cell.transpose(-2, -1),
+                self._template.batch,
+                self._template.pbc[0],
+            )
+        batch = copy.copy(self._template)
+        batch.__dict__ = self._template.__dict__.copy()
+        batch.__keys__ = self._template.__keys__.copy()
+        batch.pos = positions.contiguous()
+        batch.cell = cell.contiguous()
+        return batch
 
 
 def _simstate_to_atomicdata_batch(
@@ -182,6 +278,7 @@ class FairChemModel(_TSModelInterface):
         dtype: torch.dtype | None = None,
         compute_stress: bool = False,
         task_name: UMATask | str | None = None,
+        cache_state_metadata: bool = True,
     ) -> None:
         """Initialize the FairChem model.
 
@@ -199,6 +296,9 @@ class FairChemModel(_TSModelInterface):
             compute_stress (bool): Whether to compute stress tensor
             task_name (UMATask | str | None): Task type for UMA models (optional,
                 only needed for UMA models)
+            cache_state_metadata: Reuse validated composition and batch metadata
+                across steps. Disable if metadata is changed via raw pointers or
+                tensor .data operations that bypass mutation counters.
 
         Raises:
             ImportError: If torch-sim is not installed
@@ -218,6 +318,7 @@ class FairChemModel(_TSModelInterface):
         self._dtype = dtype or torch.float32
         self._compute_stress = compute_stress
         self._compute_forces = True
+        self._state_converter = _SimStateConverter() if cache_state_metadata else None
         self._memory_scales_with = "n_atoms"  # TODO: this does vary with model type
 
         # Convert Path to string for consistency
@@ -301,15 +402,18 @@ class FairChemModel(_TSModelInterface):
             state = state.to(self._device)
 
         # Convert SimState to batched AtomicData in a single vectorized operation
-        batch = _simstate_to_atomicdata_batch(
-            sim_state=state,
-            task_name=self.task_name,
-            target_dtype=self._dtype,
-        )
-        batch = batch.to(self._device)
+        converter = self._state_converter or _simstate_to_atomicdata_batch
+        # state is already resident on the selected device. The converter updates
+        # differentiable positions/cells but can reuse immutable batch metadata.
+        batch = converter(state, self.task_name, self._dtype)
 
         # Run efficient batch prediction
-        predictions = self.predictor.predict(batch)
+        predict_kwargs = (
+            {"requested_properties": tuple(self.implemented_properties)}
+            if getattr(self.predictor, "supports_requested_properties", False)
+            else {}
+        )
+        predictions = self.predictor.predict(batch, **predict_kwargs)
 
         # Convert predictions to torch-sim format
         results: dict[str, torch.Tensor] = {}

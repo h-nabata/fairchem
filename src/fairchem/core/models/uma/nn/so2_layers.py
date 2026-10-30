@@ -17,6 +17,12 @@ from torch.nn import Linear
 
 from .matmul import linear_with_folded_batch
 from .radial import RadialMLP
+from .unified_radial import (
+    RadialProjection,
+    _record_cache_event,
+    _tensor_cache_key,
+    _wait_cache_event,
+)
 
 if TYPE_CHECKING:
     from fairchem.core.models.uma.common.so3 import CoefficientMapping
@@ -87,8 +93,8 @@ class SO2_m_Conv_Block(torch.nn.Module):
     Uses a single larger GEMM instead of the standard approach:
         [x_real, x_imag] @ [[W1, -W2], [W2, W1]]^T
 
-    Produces identical results to SO2_m_Conv but with better tensor
-    core utilization (1.3-1.5x faster).
+    Preserves the mathematical operation while changing accumulation order.
+    Throughput depends on the device and matrix dimensions.
 
     Args:
         m (int):                    Order of the spherical harmonic coefficients
@@ -132,23 +138,64 @@ class SO2_m_Conv_Block(torch.nn.Module):
         self.fc.weight.data.mul_(1 / math.sqrt(2))
 
         self.register_buffer("_w_block", None, persistent=False)
+        self._w_block_key = None
+        self._w_block_owner = ()
+        self._w_block_event = None
+
+    def _apply(self, fn, recurse=True):
+        self._w_block = None
+        self._w_block_key = None
+        self._w_block_owner = ()
+        self._w_block_event = None
+        return super()._apply(fn, recurse=recurse)
+
+    def __getstate__(self):
+        state = super().__getstate__()
+        state["_buffers"] = dict(state["_buffers"])
+        state["_buffers"]["_w_block"] = None
+        state["_w_block_key"] = None
+        state["_w_block_owner"] = ()
+        state["_w_block_event"] = None
+        return state
+
+    def _make_w_block(self) -> torch.Tensor:
+        W1, W2 = self.fc.weight.split(self.out_channels_half, dim=0)
+        return torch.cat(
+            (torch.cat((W1, -W2), dim=1), torch.cat((W2, W1), dim=1)), dim=0
+        ).contiguous()
 
     @torch.no_grad()
     def _build_w_block(self) -> None:
         """
-        Build and cache the block matrix from fc weights.
-
-        Converts from standard weight layout to block matrix:
-            [[W1, -W2], [W2, W1]]
+        Cache a block matrix for frozen inference, tracking weight mutations.
         """
-        W1, W2 = self.fc.weight.split(self.out_channels_half, dim=0)
-        self._w_block = torch.cat(
-            [
-                torch.cat([W1, -W2], dim=1),
-                torch.cat([W2, W1], dim=1),
-            ],
-            dim=0,
-        ).contiguous()
+        self._w_block = self._make_w_block()
+        self._w_block_key = _tensor_cache_key(self.fc.weight)
+        self._w_block_owner = (self.fc.weight,)
+        self._w_block_event = _record_cache_event(self._w_block)
+
+    def block_weight(self) -> torch.Tensor:
+        """
+        Keep parameter gradients and never reuse stale inference weights.
+        """
+        # Compilers can fold this pure expression; avoid tracing Python cache
+        # mutations or reading version counters inside the captured region.
+        if torch.compiler.is_compiling():
+            return self._make_w_block()
+        if torch.is_grad_enabled() and self.fc.weight.requires_grad:
+            block = self._make_w_block()
+            # Keep only a detached snapshot for a later inference call. A
+            # differentiable caller always builds its own fresh graph.
+            self._w_block = block.detach()
+            self._w_block_key = _tensor_cache_key(self.fc.weight)
+            self._w_block_owner = (self.fc.weight,)
+            self._w_block_event = _record_cache_event(self._w_block)
+            return block
+        key = _tensor_cache_key(self.fc.weight)
+        if self._w_block is None or key is None or key != self._w_block_key:
+            self._build_w_block()
+        _wait_cache_event(self._w_block_event, self._w_block)
+        return self._w_block
 
     def forward(self, x_m: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -160,11 +207,8 @@ class SO2_m_Conv_Block(torch.nn.Module):
         Returns:
             (out_real, out_imag): each [E, num_l, m_output_channels]
         """
-        if self._w_block is None:
-            self._build_w_block()
-
         x_cat = x_m.flatten(1)
-        out_cat = x_cat @ self._w_block.T
+        out_cat = x_cat @ self.block_weight().T
 
         return out_cat.view(-1, 2, self.num_l, self.m_output_channels).unbind(1)
 
@@ -253,12 +297,20 @@ class SO2_Conv1_WithRadialBlock(torch.nn.Module):
             (output, gating): output [E, coeffs, m_output_channels],
                 gating [E, extra_m0_output_channels]
         """
-        x_edge_by_m = x_edge.split(self.edge_split_sizes, dim=1)
         x_by_m = x.split(self.m_split_sizes, dim=1)
         num_edges = x.shape[0]
+        if isinstance(x_edge, RadialProjection):
+            radial_block = x_edge.block
+        else:
 
-        # m=0: apply radial, linear, split gating
-        x_0 = x_by_m[0].view(num_edges, -1) * x_edge_by_m[0]
+            def radial_block(start, width):
+                return x_edge.narrow(1, start, width)
+
+        # Project only the order being consumed; no full radial output is
+        # retained for the deferred path.
+        offset = 0
+        x_0 = x_by_m[0].flatten(1) * radial_block(offset, self.edge_split_sizes[0])
+        offset += self.edge_split_sizes[0]
         x_0 = self.fc_m0(x_0)
         x_0_extra, x_0 = x_0.split(
             (
@@ -267,12 +319,14 @@ class SO2_Conv1_WithRadialBlock(torch.nn.Module):
             ),
             -1,
         )
-        out = [x_0.view(num_edges, -1, self.m_output_channels)]
+        out = [x_0.reshape(num_edges, self.lmax + 1, self.m_output_channels)]
 
         # m>0: apply radial, block GEMM
         for m in range(1, self.mmax + 1):
-            x_m = x_by_m[m].view(num_edges, 2, -1)
-            x_m = x_m * x_edge_by_m[m].unsqueeze(1)
+            width = self.edge_split_sizes[m]
+            x_m = x_by_m[m].reshape(num_edges, 2, width)
+            x_m = x_m * radial_block(offset, width).unsqueeze(1)
+            offset += width
             x_m = self.so2_m_conv[m - 1](x_m)
             out.extend(x_m)
 
@@ -302,14 +356,10 @@ class SO2_Conv1_WithRadialBlock(torch.nn.Module):
         if self.mmax != 2:
             raise ValueError("packed conv1 GEMMs require mmax=2")
         conv_m1, conv_m2 = self.so2_m_conv
-        if conv_m1._w_block is None:
-            conv_m1._build_w_block()
-        if conv_m2._w_block is None:
-            conv_m2._build_w_block()
         return (
             self.fc_m0(m0_buf),
-            m1_buf @ conv_m1._w_block.T,
-            m2_buf @ conv_m2._w_block.T,
+            m1_buf @ conv_m1.block_weight().T,
+            m2_buf @ conv_m2.block_weight().T,
         )
 
     def gemm_blocks_from_packed(
@@ -450,15 +500,11 @@ class SO2_Conv2_InternalBlock(torch.nn.Module):
 
         # m=1: block GEMM
         conv_m1 = self.so2_m_conv[0]
-        if conv_m1._w_block is None:
-            conv_m1._build_w_block()
-        g1 = input_blocks[1] @ conv_m1._w_block.T  # [E, 4C]
+        g1 = input_blocks[1] @ conv_m1.block_weight().T  # [E, 4C]
 
         # m=2: block GEMM
         conv_m2 = self.so2_m_conv[1]
-        if conv_m2._w_block is None:
-            conv_m2._build_w_block()
-        g2 = input_blocks[2] @ conv_m2._w_block.T  # [E, 2C]
+        g2 = input_blocks[2] @ conv_m2.block_weight().T  # [E, 2C]
 
         return g0, g1, g2
 
@@ -494,20 +540,31 @@ def convert_so2_conv1(
         "(internal_weights=False). Got an SO2_Convolution without rad_func, "
         "which means it was created with internal_weights=True."
     )
-    device = old.fc_m0.weight.device
     new = SO2_Conv1_WithRadialBlock(
         sphere_channels=old.sphere_channels,
         m_output_channels=old.m_output_channels,
         lmax=old.lmax,
         mmax=old.mmax,
-        mappingReduced=old.mappingReduced,
+        mappingReduced=copy.deepcopy(old.mappingReduced),
         extra_m0_output_channels=old.extra_m0_output_channels,
         edge_channels_list=old.edge_channels_list,
     )
-    new.load_state_dict(old.state_dict())
+    # assign=True preserves each loaded tensor's dtype/device, including FP64
+    # weights and mixed-dtype buffers. Clone so conversion never aliases old.
+    new.load_state_dict(
+        {name: value.detach().clone() for name, value in old.state_dict().items()},
+        assign=True,
+    )
+    if getattr(old, "rad_func", None) is not None:
+        # State dictionaries do not carry LayerNorm eps or activation options.
+        new.rad_func = copy.deepcopy(old.rad_func)
+    source_parameters = dict(old.named_parameters())
+    for name, parameter in new.named_parameters():
+        parameter.requires_grad_(source_parameters[name].requires_grad)
+    new.train(old.training)
     for m_conv in new.so2_m_conv:
         m_conv._build_w_block()
-    return new.to(device)
+    return new
 
 
 def convert_so2_conv2(
@@ -527,18 +584,29 @@ def convert_so2_conv2(
     Returns:
         SO2_Conv2_InternalBlock with identical weights.
     """
-    device = old.fc_m0.weight.device
     new = SO2_Conv2_InternalBlock(
         sphere_channels=old.sphere_channels,
         m_output_channels=old.m_output_channels,
         lmax=old.lmax,
         mmax=old.mmax,
-        mappingReduced=old.mappingReduced,
+        mappingReduced=copy.deepcopy(old.mappingReduced),
     )
-    new.load_state_dict(old.state_dict())
+    # assign=True preserves each loaded tensor's dtype/device, including FP64
+    # weights and mixed-dtype buffers. Clone so conversion never aliases old.
+    new.load_state_dict(
+        {name: value.detach().clone() for name, value in old.state_dict().items()},
+        assign=True,
+    )
+    if getattr(old, "rad_func", None) is not None:
+        # State dictionaries do not carry LayerNorm eps or activation options.
+        new.rad_func = copy.deepcopy(old.rad_func)
+    source_parameters = dict(old.named_parameters())
+    for name, parameter in new.named_parameters():
+        parameter.requires_grad_(source_parameters[name].requires_grad)
+    new.train(old.training)
     for m_conv in new.so2_m_conv:
         m_conv._build_w_block()
-    return new.to(device)
+    return new
 
 
 class SO2_Convolution(torch.nn.Module):
