@@ -14,9 +14,13 @@ from __future__ import annotations
 
 import copy
 import gc
+import inspect
 import weakref
+from contextlib import suppress
 from dataclasses import dataclass
+from functools import wraps
 from numbers import Integral, Real
+from types import AsyncGeneratorType, CoroutineType, GeneratorType
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -218,6 +222,72 @@ def _force_max(forces):
     return float(np.linalg.norm(forces, axis=-1).max())
 
 
+def _has_live_generator(frame):
+    if not frame.f_code.co_flags & (
+        inspect.CO_GENERATOR | inspect.CO_COROUTINE | inspect.CO_ASYNC_GENERATOR
+    ):
+        return False
+    # A chained error may originate from an unrelated suspended caller task.
+    # Clearing such a frame closes that task. Completed ASE optimizer generators
+    # no longer own their frames and must still release failed model references.
+    for owner in gc.get_referrers(frame):
+        if (
+            (isinstance(owner, GeneratorType) and owner.gi_frame is frame)
+            or (isinstance(owner, CoroutineType) and owner.cr_frame is frame)
+            or (isinstance(owner, AsyncGeneratorType) and owner.ag_frame is frame)
+        ):
+            return True
+    return False
+
+
+def _clear_completed_frames(traceback):
+    while traceback is not None:
+        frame = traceback.tb_frame
+        if not _has_live_generator(frame):
+            # The current wrapper and any active caller frames stay intact.
+            with suppress(RuntimeError):
+                frame.clear()
+        traceback = traceback.tb_next
+
+
+def _release_failed_workflow(function):
+    """
+    Release private model state even when a job runner retains its exception.
+
+    Completed frames can own calculators, optimizer hooks and model storage.
+    Clear their locals after unwinding, preserving exception types, causes and
+    traceback locations. Caller-owned objects are neither reset nor closed.
+    """
+
+    @wraps(function)
+    def run(*args, **kwargs):
+        try:
+            return function(*args, **kwargs)
+        except BaseException as error:
+            pending = [error]
+            seen = set()
+            while pending:
+                current = pending.pop()
+                if id(current) in seen:
+                    continue
+                seen.add(id(current))
+                _clear_completed_frames(current.__traceback__)
+                pending.extend(
+                    cause
+                    for cause in (current.__cause__, current.__context__)
+                    if cause is not None
+                )
+                if isinstance(current, BaseExceptionGroup):
+                    pending.extend(current.exceptions)
+            # Calculators can own bound-method cycles. Collect these before a
+            # caller retries the job or allocates its next model.
+            gc.collect()
+            raise
+
+    return run
+
+
+@_release_failed_workflow
 def run_respa(
     atoms: Atoms,
     *,
@@ -249,6 +319,10 @@ def run_respa(
     working = _owned_atoms(atoms)
     if working.constraints:
         raise ValueError("RESPA supports fixed-cell, unconstrained NVE only")
+    if inplace:
+        for name in ("positions", "momenta"):
+            if name in atoms.arrays and not atoms.arrays[name].flags.writeable:
+                raise ValueError(f"Inplace RESPA requires a writable {name} array")
     masses = _finite(working.get_masses(), "masses")[:, None]
     if np.any(masses <= 0):
         raise ValueError("Masses must be positive")
@@ -285,6 +359,11 @@ def run_respa(
         _finite(total, "total energy")
         energies.append(total)
     working.set_momenta(momentum)
+    # The result owns only copied numerical values, never the private models.
+    # Drop bound-callable cycles before another job allocates its calculators.
+    teacher.calc = None
+    student.calc = None
+    gc.collect()
     if inplace:
         atoms.set_positions(working.positions)
         atoms.set_momenta(momentum)
@@ -300,6 +379,7 @@ def run_respa(
     )
 
 
+@_release_failed_workflow
 def run_coarse_refine(
     atoms: Atoms,
     *,
@@ -352,6 +432,7 @@ def run_coarse_refine(
     )
 
 
+@_release_failed_workflow
 def run_dyneb(
     images: Sequence[Atoms],
     *,

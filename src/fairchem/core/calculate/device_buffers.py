@@ -10,7 +10,7 @@ from __future__ import annotations
 import copy
 import types
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
 from numbers import Integral
 from threading import RLock
 from typing import TYPE_CHECKING
@@ -48,6 +48,13 @@ def _tensors(value, path=(), seen=None):
     elif isinstance(value, (list, tuple)):
         for index, item in enumerate(value):
             yield from _tensors(item, (*path, ("item", index)), seen)
+    elif is_dataclass(value) and not isinstance(value, type):
+        for item in fields(value):
+            yield from _tensors(
+                getattr(value, item.name), (*path, ("field", item.name)), seen
+            )
+        if hasattr(value, "__dict__"):
+            yield from _tensors(vars(value), (*path, "attributes"), seen)
     elif (
         hasattr(value, "__dict__")
         and not isinstance(value, (type, types.ModuleType))

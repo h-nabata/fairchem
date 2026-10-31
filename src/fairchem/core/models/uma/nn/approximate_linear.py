@@ -36,6 +36,73 @@ def _require_finite(tensor: torch.Tensor, name: str) -> None:
         raise FloatingPointError(f"ApproximateLinear: non-finite {name}")
 
 
+def _validate_state_metadata(state_dict, key, expected) -> None:
+    state = state_dict.get(key)
+    if (
+        not isinstance(state, dict)
+        or state.keys() != expected.keys()
+        or any(type(state[name]) is not type(value) for name, value in expected.items())
+        or state != expected
+    ):
+        raise RuntimeError(f"ApproximateLinear metadata does not match: {key}")
+
+
+def _validate_state_tensor(state_dict, key, shape, dtype, *, positive=False) -> None:
+    tensor = state_dict.get(key)
+    if (
+        not isinstance(tensor, torch.Tensor)
+        or isinstance(tensor, nn.Parameter)
+        or tensor.layout != torch.strided
+        or tensor.is_meta
+        or tensor.requires_grad
+        or tensor.shape != shape
+        or tensor.dtype != dtype
+    ):
+        raise RuntimeError(
+            f"ApproximateLinear state {key} must be a materialized, frozen "
+            f"{dtype} buffer with shape {tuple(shape)}"
+        )
+    if tensor.is_floating_point() and not bool(torch.isfinite(tensor).all()):
+        raise RuntimeError(f"ApproximateLinear state {key} must be finite")
+    if positive and not bool((tensor > 0).all()):
+        raise RuntimeError(f"ApproximateLinear state {key} must be positive")
+
+
+def _validate_state_keys(state_dict, prefix, expected) -> None:
+    unexpected = {key for key in state_dict if key.startswith(prefix)} - {
+        prefix + name for name in expected
+    }
+    if unexpected:
+        raise RuntimeError(
+            f"ApproximateLinear unexpected state keys: {sorted(unexpected)}"
+        )
+
+
+def _preflight_approximate_state(module, state_dict, prefix, *args) -> None:
+    """
+    Validate converted children before the containing model copies any buffers.
+
+    A supplied converted layer must be complete, including format metadata,
+    even under strict=False. Entirely omitted layers remain compatible with
+    partial loads of unrelated model components. Visit shared-module aliases:
+    PyTorch loads every alias, including the last one, from the checkpoint.
+    This is a stateless hook so deepcopy/pickle cannot retain another model.
+    """
+
+    def visit(child, path, ancestors):
+        if id(child) in ancestors:
+            return
+        if isinstance(child, ApproximateLinear):
+            child._validate_state_dict(state_dict, path)
+            return
+        ancestors = ancestors | {id(child)}
+        for name, descendant in child._modules.items():
+            if descendant is not None:
+                visit(descendant, path + name + ".", ancestors)
+
+    visit(module, prefix, frozenset())
+
+
 def _components(tensor: torch.Tensor, precision: str) -> list[torch.Tensor]:
     dtype = torch.float16 if precision == "fp16" else torch.bfloat16
     count = {"bf16_split2": 2, "bf16_split3": 3}.get(precision, 1)
@@ -270,10 +337,48 @@ class _StoredWeight(nn.Module):
         }
 
     def set_extra_state(self, state):
-        if state != self.get_extra_state():
-            raise RuntimeError(
-                "ApproximateLinear packed weight metadata does not match"
+        _validate_state_metadata(
+            {"_extra_state": state}, "_extra_state", self.get_extra_state()
+        )
+
+    def _validate_state_dict(self, state_dict, prefix):
+        _validate_state_keys(state_dict, prefix, self._state_keys())
+        _validate_state_metadata(
+            state_dict, prefix + "_extra_state", self.get_extra_state()
+        )
+        if self.bits is None:
+            _validate_state_tensor(
+                state_dict,
+                prefix + "values",
+                (self.rows, self.columns),
+                torch.float32,
             )
+        else:
+            _validate_state_tensor(
+                state_dict,
+                prefix + "packed",
+                ((self.rows * self.columns + 1) // 2,)
+                if self.bits == 4
+                else (self.rows, self.columns),
+                torch.uint8 if self.bits == 4 else torch.int8,
+            )
+            _validate_state_tensor(
+                state_dict,
+                prefix + "scale",
+                (self.rows,),
+                torch.float32,
+                positive=True,
+            )
+
+    def _state_keys(self):
+        return {"_extra_state"} | (
+            {"values"} if self.bits is None else {"packed", "scale"}
+        )
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        if any(key.startswith(prefix) for key in state_dict):
+            self._validate_state_dict(state_dict, prefix)
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def storage_bytes(self) -> int:
         return sum(t.numel() * t.element_size() for t in self.buffers())
@@ -288,6 +393,9 @@ class ApproximateLinear(nn.Module):
     integer buffers retain their packed integer dtype under ``Module.to``.
     Backward vmap and directional JVP are supported. Forward vmap/jacfwd and
     compilation are unsupported because finite checks use host decisions.
+    Checkpoint loads require complete converted-layer state and matching format
+    metadata, including with strict=False; unrelated partial loads may omit the
+    whole layer. Invalid converted state is checked before copying its buffers.
     """
 
     def __init__(
@@ -353,10 +461,32 @@ class ApproximateLinear(nn.Module):
         }
 
     def set_extra_state(self, state):
-        if state != self.get_extra_state():
-            raise RuntimeError(
-                "ApproximateLinear architecture or policy metadata does not match"
+        _validate_state_metadata(
+            {"_extra_state": state}, "_extra_state", self.get_extra_state()
+        )
+
+    def _validate_state_dict(self, state_dict, prefix):
+        if not any(key.startswith(prefix) for key in state_dict):
+            return
+        expected = {"_extra_state"}
+        if self.bias is not None:
+            expected.add("bias")
+        for index, factor in enumerate(self.factors):
+            expected.update(f"factors.{index}.{key}" for key in factor._state_keys())
+        _validate_state_keys(state_dict, prefix, expected)
+        _validate_state_metadata(
+            state_dict, prefix + "_extra_state", self.get_extra_state()
+        )
+        if self.bias is not None:
+            _validate_state_tensor(
+                state_dict, prefix + "bias", (self.out_features,), torch.float32
             )
+        for index, factor in enumerate(self.factors):
+            factor._validate_state_dict(state_dict, f"{prefix}factors.{index}.")
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        self._validate_state_dict(state_dict, prefix)
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         with torch.autocast(device_type=x.device.type, enabled=False):
@@ -521,11 +651,17 @@ def apply_linear_approximations(
         rank = None
         if type(source) is not nn.Linear:
             reason = "custom Linear subclass is outside coverage"
+        elif "forward" in source.__dict__ or source._compiled_call_impl is not None:
+            reason = "custom forward requires the original Linear implementation"
         elif (
             source._forward_hooks
             or source._forward_pre_hooks
             or source._backward_hooks
             or source._backward_pre_hooks
+            or source._state_dict_hooks
+            or source._state_dict_pre_hooks
+            or source._load_state_dict_pre_hooks
+            or source._load_state_dict_post_hooks
         ):
             reason = "module hooks require the original Linear implementation"
         elif any(
@@ -583,6 +719,8 @@ def apply_linear_approximations(
     for aliases, replacement in replacements:
         for parent, name, _, _ in aliases:
             parent._modules[name] = replacement
+    if replacements:
+        model.register_load_state_dict_pre_hook(_preflight_approximate_state)
     manifest["effective"] = bool(replacements)
     manifest["warnings"] = [
         "Experimental approximation; application energy/force/stress/curvature validation is required.",

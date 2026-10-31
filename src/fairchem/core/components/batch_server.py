@@ -310,6 +310,8 @@ class BatchPredictServerMixin:
         """
         Run batched inference with OOM splitting.
         """
+        from fairchem.core.calculate.batched_inference import _compatibility_key
+
         if not items:
             return []
         settings = getattr(predict_unit, "inference_settings", None)
@@ -339,9 +341,7 @@ class BatchPredictServerMixin:
                 )
             )
             key = (
-                tuple(data.dataset),
-                data.pos.device,
-                data.pos.dtype,
+                _compatibility_key(data),
                 index if dense_hessian else None,
             )
             groups[key].append(index)

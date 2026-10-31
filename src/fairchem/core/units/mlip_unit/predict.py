@@ -41,6 +41,7 @@ except ImportError:
     ray_installed = False
 
 from fairchem.core.common import gp_utils
+from fairchem.core.common._model_state import MODEL_STATE_LOCK
 from fairchem.core.common.distutils import (
     CURRENT_DEVICE_TYPE_STR,
     assign_device_for_local_rank,
@@ -108,7 +109,6 @@ _AUXILIARY_LEVELS = {
 
 _PREDICTOR_STATES = weakref.WeakKeyDictionary()
 _PREDICTOR_STATE_LOCK = threading.RLock()
-_MODEL_CONSTRUCTION_LOCK = threading.RLock()
 
 
 def _predictor_state(predictor):
@@ -166,7 +166,12 @@ def _isolated_model_initialization(initialize):
         # Checkpoints and their newly created parameters are initialized on CPU.
         # Do not seed an accelerator here: manual_seed() would enqueue lazy
         # seed changes even on devices this predictor never uses.
-        with _MODEL_CONSTRUCTION_LOCK, torch.random.fork_rng(devices=[]):
+        with (
+            MODEL_STATE_LOCK,
+            torch.inference_mode(False),
+            torch.random.fork_rng(devices=[]),
+            torch.device("cpu"),
+        ):
             python_state, numpy_state = random.getstate(), np.random.get_state()
             prior_device = os.environ.get(CURRENT_DEVICE_TYPE_STR)
             try:
@@ -180,6 +185,25 @@ def _isolated_model_initialization(initialize):
                     os.environ[CURRENT_DEVICE_TYPE_STR] = prior_device
 
     return isolated
+
+
+def _model_reload_scope(load):
+    @wraps(load)
+    def reload(*args, **kwargs):
+        # Reloads can run while holding a predictor lock. Waiting for a training
+        # callback that itself calls that predictor would invert the lock order.
+        if not MODEL_STATE_LOCK.acquire(blocking=False):
+            raise RuntimeError(
+                "Predictor loading conflicts with model construction or distillation "
+                "in another thread; retry after that operation completes"
+            )
+        try:
+            with torch.inference_mode(False), torch.device("cpu"):
+                return load(*args, **kwargs)
+        finally:
+            MODEL_STATE_LOCK.release()
+
+    return reload
 
 
 @contextmanager
@@ -537,6 +561,7 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
 
         self.model.eval()
         self.lazy_model_intialized = False
+        self._preparation_failed = False
         self.assert_on_nans = assert_on_nans
         self._warned_upcast = False
         self._nitro_announced = False
@@ -560,6 +585,7 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
             state[name] = None
         return state
 
+    @_model_reload_scope
     def _load_model(self) -> None:
         """Load a fresh, unprepared model from the inference checkpoint."""
         # Load checkpoint first to get model type; UMA compat fixups run downstream
@@ -669,6 +695,7 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         # Release that reference before collecting and loading the replacement.
         del release
         self.lazy_model_intialized = False
+        self._preparation_failed = True
         del self.model
         gc.collect()
         device_type = torch.device(self._requested_device).type
@@ -677,6 +704,7 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         elif device_type == "xpu":
             torch.xpu.empty_cache()
         self._load_model()
+        self._preparation_failed = False
         self._log_settings_change(before)
 
     def _log_settings_change(self, before: InferenceSettings) -> None:
@@ -885,6 +913,7 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
             settings_key=repr(self.inference_settings),
         )
 
+    @torch.inference_mode(False)
     def _select_prepared_model(self, data) -> None:
         """
         Select or prepare an exact-composition model without disabling merging.
@@ -1138,7 +1167,9 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
 
         Delegates to the model's backbone for model-specific validation.
         """
-        self.model.module.validate_atoms_data(atoms, task_name)
+        with _predictor_state(self)[0]:
+            self._restore_failed_preparation()
+            self.model.module.validate_atoms_data(atoms, task_name)
 
     def predict_step(self, state: State, data: AtomicData) -> dict[str, torch.tensor]:
         return self.predict(data)
@@ -1150,6 +1181,7 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         undo_element_references: bool = True,
         requested_properties: tuple[str, ...] | list[str] | None = None,
     ) -> dict[str, torch.tensor]:
+        self._restore_failed_preparation()
         if requested_properties is not None and (
             isinstance(requested_properties, (str, bytes, Mapping))
             or not isinstance(requested_properties, Collection)
@@ -1288,9 +1320,45 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         """
         Lazy initialization on first predict call.
         """
+        self._restore_failed_preparation()
         validate_series_b(
             self.inference_settings, self.device, self.model.module.backbone
         )
+        try:
+            # Merging creates new modules; an ambient foreign default device
+            # must not move these away from the CPU checkpoint/preparation data.
+            with torch.device("cpu"):
+                self._prepare_model(data)
+        except BaseException:
+            # Preparation replaces modules before device allocation/compilation.
+            # Retrying those operations in place can reuse merged weights for a
+            # different input or apply Series B transformations a second time.
+            self._preparation_failed = True
+            self.lazy_model_intialized = False
+            raise
+
+    @torch.inference_mode(False)
+    def _restore_failed_preparation(self) -> None:
+        """
+        Retry an interrupted preparation from pristine weights, without cloning
+        an extra full model on every successful preparation.
+        """
+        if not getattr(self, "_preparation_failed", False):
+            return
+        logging.warning("Reloading model after interrupted inference preparation")
+        self.clear_prepared_model_cache()
+        self._numeric_runtimes = []
+        template = getattr(self, "_mole_template", None)
+        if template is not None:
+            self.model = copy.deepcopy(template)
+        else:
+            self._load_model()
+        # Keep the failed flag if loading raises, so a later retry cannot use
+        # any partially reconstructed model or mistake it for a prepared one.
+        self._preparation_failed = False
+        self.lazy_model_intialized = False
+
+    def _prepare_model(self, data: AtomicData) -> None:
         # Checkpoints are loaded on CPU. Preparing MOLE with an already-device-
         # resident batch would mix accelerator inputs and CPU weights; float64
         # inputs also break the head's FP32 expert contraction before predict()

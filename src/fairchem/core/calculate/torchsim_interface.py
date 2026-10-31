@@ -24,6 +24,7 @@ from fairchem.core.units.mlip_unit.api.inference import (
     DEFAULT_SPIN,
     DEFAULT_SPIN_OMOL,
     SPIN_RANGE,
+    InferenceSettings,
 )
 
 try:
@@ -436,6 +437,8 @@ class FairChemModel(_TSModelInterface):
         compute_stress: bool = False,
         task_name: UMATask | str | None = None,
         cache_state_metadata: bool = True,
+        inference_settings: InferenceSettings | str = "batch",
+        overrides: dict | None = None,
     ) -> None:
         """Initialize the FairChem model.
 
@@ -450,12 +453,15 @@ class FairChemModel(_TSModelInterface):
                 None, prefers CUDA, then XPU, then CPU. Specify ``xpu:<index>``
                 explicitly on hosts with both NVIDIA and Intel GPUs.
             dtype (torch.dtype | None): Simulation input/output dtype (float32 or
-                float64). The predictor retains its batch preset's FP32 network.
+                float64). Network precision is selected by inference_settings.
             compute_stress (bool): Whether to compute stress tensor
             task_name (UMATask | str | None): Task type for UMA models (optional,
                 only needed for UMA models)
             cache_state_metadata: Reuse validated composition and batch metadata
                 across steps, checking owned snapshots for external mutations.
+            inference_settings: Predictor startup configuration, including optional
+                series_b settings. Defaults to the heterogeneous "batch" preset.
+            overrides: Optional overrides applied to the predictor startup settings.
 
         Raises:
             ImportError: If torch-sim is not installed
@@ -507,17 +513,16 @@ class FairChemModel(_TSModelInterface):
         # Create efficient batch predictor for fast inference. TorchSim sends
         # batches of systems, so use the batch preset rather than the
         # single-system default (Nitro).
-        if model_cache_dir is not None:
-            self.predictor = pretrained_mlip.get_predict_unit(
-                model,
-                inference_settings="batch",
-                device=device_str,
-                cache_dir=model_cache_dir,
-            )
-        else:
-            self.predictor = pretrained_mlip.get_predict_unit(
-                model, inference_settings="batch", device=device_str
-            )
+        loader_kwargs = (
+            {} if model_cache_dir is None else {"cache_dir": model_cache_dir}
+        )
+        self.predictor = pretrained_mlip.get_predict_unit(
+            model,
+            inference_settings=inference_settings,
+            overrides=overrides,
+            device=device_str,
+            **loader_kwargs,
+        )
 
         if self._device.type in {"xpu", "cuda"}:
             # The predictor resolves a bare accelerator to a concrete ordinal. Keep

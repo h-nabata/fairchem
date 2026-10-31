@@ -128,6 +128,38 @@ def local_fast_exp(exponent):
     return result.reshape(original_shape)
 
 
+def _validate_radial_replacement(module, expected_type):
+    # These replacements implement the standard Gaussian formula directly.
+    # Moving hooks to a new module, or bypassing a customized forward, would
+    # silently change application semantics beyond the selected approximation.
+    if type(module) is not expected_type or "forward" in module.__dict__:
+        raise ValueError(
+            "Radial approximation cannot replace a customized Gaussian module"
+        )
+    if (
+        module._forward_hooks
+        or module._forward_pre_hooks
+        or module._backward_hooks
+        or module._backward_pre_hooks
+    ):
+        raise ValueError("Radial approximation cannot replace a module with hooks")
+
+
+def _validate_radial_options(points, fast_exp):
+    if points is not None and (
+        isinstance(points, bool) or not isinstance(points, int) or points < 2
+    ):
+        raise ValueError("radial_table_points must be an integer >= 2")
+    if points is not None and fast_exp:
+        raise ValueError(
+            "radial_table_points and radial_fast_exp are mutually exclusive"
+        )
+    if not isinstance(fast_exp, bool):
+        raise ValueError("radial_fast_exp must be a boolean")
+    if points is None and not fast_exp:
+        raise ValueError("Choose a Gaussian approximation explicitly")
+
+
 class ApproximateGaussian(torch.nn.Module):
     """
     Gaussian radial approximation; geometry, normalization and weights stay FP32.
@@ -139,26 +171,17 @@ class ApproximateGaussian(torch.nn.Module):
 
     def __init__(self, original: GaussianSmearing, *, points=None, fast_exp=False):
         super().__init__()
-        if points is not None and (
-            isinstance(points, bool) or not isinstance(points, int) or points < 2
-        ):
-            raise ValueError("radial_table_points must be an integer >= 2")
-        if points is not None and fast_exp:
-            raise ValueError(
-                "radial_table_points and radial_fast_exp are mutually exclusive"
-            )
-        if not isinstance(fast_exp, bool):
-            raise ValueError("radial_fast_exp must be a boolean")
-        if points is None and not fast_exp:
-            raise ValueError("Choose a Gaussian approximation explicitly")
+        _validate_radial_options(points, fast_exp)
+        _validate_radial_replacement(original, GaussianSmearing)
         self.original = original
+        self.training = original.training
         self.points = points
         self.fast_exp = fast_exp
         self.num_output = original.num_output
         if points is not None:
             # Build once on the CPU in FP64; runtime buffers follow model dtype
             # and device, so Intel GPU setup does not require FP64 arithmetic.
-            grid = torch.linspace(-8, 8, points, dtype=torch.float64)
+            grid = torch.linspace(-8, 8, points, dtype=torch.float64, device="cpu")
             values = (-grid.square()).exp()
             first = -2 * grid * values
             second = (4 * grid.square() - 2) * values
@@ -223,13 +246,20 @@ def apply_feature_approximations(backbone, settings) -> dict:
     manifest = {}
     current = getattr(backbone, "distance_expansion", None)
     if points is not None or fast_exp:
+        _validate_radial_options(points, fast_exp)
+        existing = None
         if isinstance(current, ApproximateGaussian):
+            if current.points == points and current.fast_exp == fast_exp:
+                existing = current
+            else:
+                _validate_radial_replacement(current, ApproximateGaussian)
             current = current.original
         if not isinstance(current, GaussianSmearing):
             raise ValueError("Radial approximation requires UMA GaussianSmearing")
-        backbone.distance_expansion = ApproximateGaussian(
-            current, points=points, fast_exp=fast_exp
-        )
+        if existing is None:
+            backbone.distance_expansion = ApproximateGaussian(
+                current, points=points, fast_exp=fast_exp
+            )
         manifest["radial_approximation"] = {
             "target": "distance_expansion",
             "kind": "quintic_gaussian_table" if points is not None else "local_exp",
@@ -238,6 +268,7 @@ def apply_feature_approximations(backbone, settings) -> dict:
             "smoothness": "C2",
         }
     elif isinstance(current, ApproximateGaussian):
+        _validate_radial_replacement(current, ApproximateGaussian)
         backbone.distance_expansion = current.original
     if getattr(settings, "compensated_reduction", False):
         manifest["compensated_reduction"] = {

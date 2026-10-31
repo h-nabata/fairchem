@@ -16,6 +16,7 @@ import hydra
 import torch
 from omegaconf import DictConfig
 
+from fairchem.core.common._model_state import MODEL_STATE_LOCK
 from fairchem.core.common.registry import registry
 from fairchem.core.common.utils import load_state_dict, match_state_dict
 from fairchem.core.models.uma.compat import apply_uma_compat_fixups
@@ -38,6 +39,7 @@ def get_backbone_class_from_checkpoint(
     return registry.get_model_class(backbone_model_name)
 
 
+@torch.inference_mode(False)
 def load_inference_model(
     checkpoint_location: str,
     overrides: dict | None = None,
@@ -62,11 +64,18 @@ def load_inference_model(
     if overrides is not None:
         checkpoint.model_config = update_configs(checkpoint.model_config, overrides)
 
-    model = hydra.utils.instantiate(checkpoint.model_config)
+    # Loading on CPU must also hold for newly initialized/nonpersistent tensors.
+    # map_location only controls checkpoint tensors, not the caller's ambient
+    # torch default device (which may even be a meta construction context).
+    with MODEL_STATE_LOCK, torch.device("cpu"):
+        model = hydra.utils.instantiate(checkpoint.model_config)
     if use_ema:
-        model = torch.optim.swa_utils.AveragedModel(model)
+        with MODEL_STATE_LOCK, torch.device("cpu"):
+            model = torch.optim.swa_utils.AveragedModel(model)
         model_dict = model.state_dict()
-        ema_state_dict = dict(checkpoint.ema_state_dict)
+        # Preserve module-version metadata used by PyTorch's checkpoint migration
+        # hooks while removing the EMA counter only from our private mapping.
+        ema_state_dict = copy(checkpoint.ema_state_dict)
 
         n_averaged = ema_state_dict["n_averaged"]
         del model_dict["n_averaged"]
@@ -96,9 +105,11 @@ def load_tasks(checkpoint_location: str) -> list[Task]:
     checkpoint: MLIPInferenceCheckpoint = torch.load(
         checkpoint_location, map_location="cpu", weights_only=False
     )
-    return [
-        hydra.utils.instantiate(task_config) for task_config in checkpoint.tasks_config
-    ]
+    with MODEL_STATE_LOCK, torch.device("cpu"), torch.inference_mode(False):
+        return [
+            hydra.utils.instantiate(task_config)
+            for task_config in checkpoint.tasks_config
+        ]
 
 
 _TF32_CONTEXT_LOCK = RLock()

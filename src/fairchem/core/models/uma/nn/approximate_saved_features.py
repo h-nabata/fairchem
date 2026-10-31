@@ -63,8 +63,9 @@ def _pack_feature(tensor, dtype, min_elements):
     # A block scale avoids introducing infinities for finite FP32 features that
     # exceed FP16's range (or round above BF16's largest finite value). The scale
     # stays on the same device, without scalar reads or host synchronization.
-    maximum = value.abs().amax()
-    maximum = torch.where(torch.isfinite(maximum), maximum, torch.ones_like(maximum))
+    # Nonfinite entries must remain visible, but must not disable scaling for
+    # the finite entries sharing this activation tensor.
+    maximum = torch.where(torch.isfinite(value), value.abs(), 0).amax()
     scale = (maximum / torch.finfo(dtype).max).clamp_min(1)
     packed = (value / scale).to(dtype=dtype, memory_format=torch.contiguous_format)
     return _PackedFeature(packed, scale, tensor.dtype, weakref.ref(tensor), version)

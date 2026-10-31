@@ -169,13 +169,27 @@ def _orthogonalize(vector, basis):
     return vector
 
 
+def _scaled_norm(tensor, dim=None, keepdim=False):
+    # Squaring finite FP32 coordinates can overflow (or underflow to zero)
+    # even when their norm is representable. Keep the accelerator dtype;
+    # a CPU FP64 copy of every Krylov vector would defeat matrix-free usage.
+    scale = tensor.abs().amax(dim=dim, keepdim=True)
+    divisor = torch.where(scale == 0, torch.ones_like(scale), scale)
+    norm = torch.linalg.vector_norm(tensor / divisor, dim=dim, keepdim=True) * scale
+    if not torch.isfinite(norm).all():
+        raise ValueError("Curvature arithmetic overflowed; rescale the HVP operator")
+    if keepdim:
+        return norm
+    return norm.squeeze() if dim is None else norm.squeeze(dim)
+
+
 def _random_direction(size, template, generator, basis):
     for _ in range(4):
         vector = torch.randn(
             size, dtype=template.dtype, generator=generator, device="cpu"
         ).to(template.device)
         vector = _orthogonalize(vector, basis)
-        norm = torch.linalg.vector_norm(vector)
+        norm = _scaled_norm(vector)
         if norm.item() > 32 * torch.finfo(template.dtype).eps:
             return vector / norm
     # Deterministic fallback when a nearly complete basis leaves a very small
@@ -185,7 +199,7 @@ def _random_direction(size, template, generator, basis):
         vector = torch.zeros(size, dtype=template.dtype, device=template.device)
         vector[index] = 1
         vector = _orthogonalize(vector, basis)
-        norm = torch.linalg.vector_norm(vector)
+        norm = _scaled_norm(vector)
         if norm.item() > 32 * torch.finfo(template.dtype).eps:
             return vector / norm
     raise RuntimeError("Unable to construct an independent Krylov direction")
@@ -235,10 +249,8 @@ def lanczos_modes(
             if index + 1 == iterations:
                 break
             residual = _orthogonalize(hq, basis)
-            norm = torch.linalg.vector_norm(residual)
-            scale = max(
-                torch.finfo(reference.dtype).tiny, torch.linalg.vector_norm(hq).item()
-            )
+            norm = _scaled_norm(residual)
+            scale = max(torch.finfo(reference.dtype).tiny, _scaled_norm(hq).item())
             if norm.item() <= 32 * torch.finfo(reference.dtype).eps * scale:
                 q = _random_direction(dimension, reference, generator, basis)
             else:
@@ -248,6 +260,15 @@ def lanczos_modes(
         # Only the small projected eigensolve runs on CPU FP64. There is no
         # requirement for an accelerator FP64 eigh kernel.
         projected = (q_matrix.T @ hq_matrix).to(device="cpu", dtype=torch.float64)
+        if not torch.isfinite(projected).all():
+            raise ValueError(
+                "Curvature projection overflowed; rescale the HVP operator"
+            )
+        # Solve a scaled small matrix to protect both the symmetry test and
+        # the eigensolver from squaring extreme, but finite, operator scales.
+        projection_scale = projected.abs().amax()
+        if projection_scale.item() != 0:
+            projected = projected / projection_scale
         asymmetry = torch.linalg.matrix_norm(projected - projected.T).item()
         scale = max(
             torch.finfo(reference.dtype).tiny,
@@ -256,12 +277,16 @@ def lanczos_modes(
         if asymmetry > options.symmetry_tolerance * scale:
             raise ValueError("HVP is not symmetric within symmetry_tolerance")
         eigenvalues, rotations = torch.linalg.eigh((projected + projected.T) * 0.5)
-        values = eigenvalues[: options.num_modes].to(reference)
+        values = (eigenvalues[: options.num_modes] * projection_scale).to(reference)
         vectors = q_matrix @ rotations[:, : options.num_modes].to(reference)
-        vectors = vectors / torch.linalg.vector_norm(vectors, dim=0, keepdim=True)
+        vectors = vectors / _scaled_norm(vectors, dim=0, keepdim=True)
+        if not torch.isfinite(values).all():
+            raise ValueError(
+                "Curvature eigenvalues overflowed; rescale the HVP operator"
+            )
         residuals = torch.stack(
             [
-                torch.linalg.vector_norm(
+                _scaled_norm(
                     _product(hvp, vectors[:, i], reference) - values[i] * vectors[:, i]
                 )
                 for i in range(options.num_modes)
@@ -324,6 +349,13 @@ def hutchinson_estimates(
             trace_delta = trace_sample - trace_mean
             trace_mean += trace_delta / index
             trace_m2 += trace_delta * (trace_sample - trace_mean)
+            if not all(
+                torch.isfinite(statistic).all()
+                for statistic in (mean, m2, trace_mean, trace_m2)
+            ):
+                raise ValueError(
+                    "Hutchinson statistics overflowed in FP64; rescale the HVP operator"
+                )
         variance = (m2 / (options.samples - 1)).clamp_min(0)
         trace_variance = (trace_m2 / (options.samples - 1)).clamp_min(0)
     return HutchinsonResult(

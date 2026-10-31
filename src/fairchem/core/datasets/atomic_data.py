@@ -13,6 +13,7 @@ import copy
 import logging
 import types
 from collections.abc import Sequence
+from dataclasses import fields, is_dataclass
 from numbers import Integral
 from typing import Union
 
@@ -67,14 +68,15 @@ _REQUIRED_KEYS = [
 _OPTIONAL_KEYS = ["energy", "forces", "stress", "dataset"]
 
 
-def _clone_tensor_tree(value, tensor_transform=None):
+def _clone_tensor_tree(value, tensor_transform=None, memo=None):
     """
     Deep-copy nested data with differentiable clones of all referenced tensors.
     """
-    memo, visited = {}, set()
+    memo = {} if memo is None else memo
+    visited = set()
 
     def remember(item):
-        if id(item) in visited:
+        if id(item) in visited or id(item) in memo:
             return
         visited.add(id(item))
         if torch.is_tensor(item):
@@ -89,6 +91,11 @@ def _clone_tensor_tree(value, tensor_transform=None):
         elif isinstance(item, (tuple, list)):
             for child in item:
                 remember(child)
+        elif is_dataclass(item) and not isinstance(item, type):
+            for field in fields(item):
+                remember(getattr(item, field.name))
+            if hasattr(item, "__dict__"):
+                remember(vars(item))
         elif (
             hasattr(item, "__dict__")
             and not isinstance(item, (type, types.ModuleType))
@@ -785,6 +792,14 @@ class AtomicData:
             result = {}
             memo[id(item)] = result
             result.update((k, self.__apply__(v, func, memo)) for k, v in item.items())
+        elif (is_dataclass(item) and not isinstance(item, type)) or (
+            hasattr(item, "__dict__")
+            and not isinstance(item, (type, types.ModuleType))
+            and not callable(item)
+        ):
+            # Match clone's job metadata traversal, including frozen/slotted
+            # dataclasses. Keep cycles and aliases across the conversion.
+            result = _clone_tensor_tree(item, tensor_transform=func, memo=memo)
         else:
             return item
         memo[id(item)] = result
@@ -792,7 +807,9 @@ class AtomicData:
 
     def apply(self, func):
         r"""Applies the function :obj:`func` to all tensor attributes"""
-        memo = {}
+        # Conversion mutates this owner in place. Metadata back-references must
+        # keep pointing here instead of creating a second AtomicData instance.
+        memo = {id(self): self}
         for key in self.__keys__:
             self[key] = self.__apply__(self[key], func, memo)
 

@@ -11,24 +11,25 @@ import copy
 import math
 import os
 import tempfile
+from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from numbers import Integral, Real
 from pathlib import Path
-from threading import RLock
 from typing import TYPE_CHECKING
 
 import hydra
 import torch
 
-from fairchem.core.datasets.atomic_data import AtomicData
+from fairchem.core.common._model_state import MODEL_STATE_LOCK
+from fairchem.core.datasets.atomic_data import AtomicData, _clone_tensor_tree
+from fairchem.core.models.uma.nn.mole import MOLEGlobals
 from fairchem.core.units.mlip_unit.api.inference import MLIPInferenceCheckpoint
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
 
 
-_TRAINING_RNG_LOCK = RLock()
 _PROPERTIES = frozenset({"energy", "forces", "stress"})
 
 
@@ -65,7 +66,9 @@ def _property_tensor(value, name, data):
 def _owned_data(data):
     if not isinstance(data, AtomicData):
         raise TypeError("Distillation inputs must be AtomicData")
-    owned = data.clone().apply(lambda tensor: tensor.detach()).cpu()
+    owned = _clone_tensor_tree(
+        data, tensor_transform=lambda tensor: tensor.detach().cpu().clone()
+    )
     if owned.pos.numel() == 0 or not torch.isfinite(owned.pos).all():
         raise ValueError("Distillation inputs require finite, nonempty positions")
     if not torch.isfinite(owned.cell).all():
@@ -288,6 +291,7 @@ class DistillationResult:
     provenance: dict
 
 
+@torch.inference_mode(False)
 def distill_student(
     student: torch.nn.Module,
     dataset: DistillationDataset,
@@ -335,7 +339,20 @@ def distill_student(
     dataset = DistillationDataset(dataset.samples, dataset.provenance)
     if any(set(weights.active) - sample.targets.keys() for sample in dataset.samples):
         raise ValueError("Every sample must contain all positively weighted properties")
-    model = copy.deepcopy(student)
+    # A warm UMA stores the previous forward's routing graph in shared MoLE
+    # globals. These transient coefficients are recomputed before each forward;
+    # snapshot them without their graph so deepcopy never follows caller weights.
+    # Keep ordinary parameters and their tied aliases under deepcopy's control.
+    memo = {}
+    for module in student.modules():
+        mole_globals = getattr(module, "global_mole_tensors", None)
+        if isinstance(mole_globals, MOLEGlobals) and id(mole_globals) not in memo:
+            _clone_tensor_tree(
+                mole_globals,
+                tensor_transform=lambda tensor: tensor.detach().clone(),
+                memo=memo,
+            )
+    model = copy.deepcopy(student, memo)
     parameters = [
         parameter for parameter in model.parameters() if parameter.requires_grad
     ]
@@ -358,7 +375,7 @@ def distill_student(
     devices = [] if device.type == "cpu" else [device.index or 0]
     rng_backend = "cuda" if device.type == "cpu" else device.type
     history = []
-    with _TRAINING_RNG_LOCK, torch.random.fork_rng(
+    with MODEL_STATE_LOCK, torch.random.fork_rng(
         devices=devices, device_type=rng_backend
     ), torch.enable_grad(), torch.autocast(device.type, enabled=False):
         torch.random.default_generator.manual_seed(int(seed))
@@ -369,9 +386,18 @@ def distill_student(
         optimizer = torch.optim.Adam(parameters, lr=learning_rate)
         for _ in range(int(steps)):
             sample = dataset.samples[
-                int(torch.randint(len(dataset.samples), (), generator=generator))
+                int(
+                    torch.randint(
+                        len(dataset.samples), (), generator=generator, device="cpu"
+                    )
+                )
             ]
-            data = sample.data.clone().to(device, dtype=dtype)
+            data = _clone_tensor_tree(
+                sample.data,
+                tensor_transform=lambda tensor: tensor.to(
+                    device=device, dtype=dtype if tensor.is_floating_point() else None
+                ).clone(),
+            )
             data["_requested_properties"] = weights.active
             data.pos.requires_grad_(True)
             optimizer.zero_grad(set_to_none=True)
@@ -454,28 +480,45 @@ def export_distilled_checkpoint(
         raise ValueError("model_config must be an explicit Hydra target config")
     if not isinstance(tasks_config, list):
         raise TypeError("tasks_config must be a list of task configurations")
-    state = {
-        name: value.detach().cpu().clone()
-        for name, value in result.model.state_dict().items()
-    }
-    if any(
-        value.is_floating_point() and not torch.isfinite(value).all()
-        for value in state.values()
-    ):
-        raise ValueError("Cannot export nonfinite student state")
+
+    def cpu_state_tensor(value):
+        value = value.detach().cpu().clone()
+        if (value.is_floating_point() or value.is_complex()) and not torch.isfinite(
+            value
+        ).all():
+            raise ValueError("Cannot export nonfinite student state")
+        return value
+
+    # PyTorch state_dicts also carry version metadata and may contain a
+    # module's arbitrary get_extra_state() payload, rather than only tensors.
+    state = _clone_tensor_tree(
+        result.model.state_dict(), tensor_transform=cpu_state_tensor
+    )
     config, tasks = copy.deepcopy(dict(model_config)), copy.deepcopy(tasks_config)
-    with _TRAINING_RNG_LOCK, torch.random.fork_rng(devices=[]):
+    with MODEL_STATE_LOCK, torch.random.fork_rng(devices=[]), torch.device("cpu"):
         reconstructed = hydra.utils.instantiate(config)
         reconstructed.load_state_dict(state, strict=True)
         if hasattr(reconstructed, "setup_tasks"):
             reconstructed.setup_tasks(tasks)
+    ema_state = OrderedDict(
+        [("n_averaged", torch.tensor(0, device="cpu"))]
+        + [
+            (f"module.{name}", value)
+            for name, value in _clone_tensor_tree(state).items()
+        ]
+    )
+    if hasattr(state, "_metadata"):
+        ema_state._metadata = {
+            "": {"version": torch.optim.swa_utils.AveragedModel._version},
+            **{
+                "module" if not name else f"module.{name}": copy.deepcopy(value)
+                for name, value in state._metadata.items()
+            },
+        }
     checkpoint = MLIPInferenceCheckpoint(
         model_config=config,
         model_state_dict=state,
-        ema_state_dict={
-            "n_averaged": torch.tensor(0),
-            **{f"module.{name}": value.clone() for name, value in state.items()},
-        },
+        ema_state_dict=ema_state,
         tasks_config=tasks,
     )
     checkpoint.distillation_metadata = {

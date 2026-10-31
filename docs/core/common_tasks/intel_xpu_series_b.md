@@ -6,6 +6,7 @@ B系列を既定で無効の実験機能として実装した。A系列のFP32�
 この文書のCPU試験は実際のPyTorch・ASE演算を実行するが、学習済みUMAの
 対象化学系での精度や、Arc Pro B70での速度を保証するものではない。
 B09/B10には学習用の実装があり、学習済みの実用studentを同梱しているわけではない。
+実装後の追加修正と検証は[ライブラリ間整合性再監査](intel_xpu_series_b_interoperability_audit.md)を参照。
 
 ## 今回のA系列の再監査
 
@@ -90,6 +91,25 @@ spec = ModelSpec("uma-s-1p1", device="cpu", inference_settings=server_settings)
 predictorを使う。上のサーバー例はCPUのINT8設定である。RayのXPU割当・複数GPU
 スケジューリングを新たにサポートしたものではない。
 `ParallelMLIPPredictUnit`のB実行は明示的に拒否する。
+
+TorchSimも起動時に同じ設定を指定できる。複数組成を扱う例ではMoLEの固定統合を無効にする。
+`inference_settings`を省略すると従来どおり`"batch"`を使用する。
+
+```python
+from fairchem.core.calculate.torchsim_interface import FairChemModel
+
+torchsim_settings = replace(
+    inference_settings_xpu(),
+    merge_mole=False,
+    series_b=SeriesBSettings(weight_bits=8),
+)
+model = FairChemModel(
+    "uma-s-1p1",
+    device="xpu:0",
+    task_name="omol",
+    inference_settings=torchsim_settings,
+)
+```
 
 ## B01–B17の実装と範囲
 

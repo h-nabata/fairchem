@@ -1,5 +1,8 @@
 # Series A/B validation record — 2026-10-31
 
+この記録はB実装時点の試験結果である。以後の追加修正と統合再試験は
+[B系列を含む整合性再監査](intel_xpu_series_b_interoperability_audit.md)に記録する。
+
 CPU環境: Python 3.12、PyTorch 2.15.0+cpu。実GPU・学習済みUMA checkpointは使っていない。
 実際の小型UMA、ASE最適化・MD、PyTorch自動微分、保存・再読込を実行した。
 仮想XPU/CUDA試験はAPI選択・stream・設定復元等の検証であり、実GPU演算の代用ではない。

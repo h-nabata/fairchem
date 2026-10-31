@@ -14,10 +14,10 @@ def validate_series_b(settings, device, backbone=None):
     """
     Fail before approximation reaches an unsupported backend or graph policy.
     """
+    settings.__post_init__()
     options = settings.series_b
     if not options.enabled:
         return
-    settings.__post_init__()
     device_type = torch.device(device).type
     if options.onednn_tf32 and device_type != "xpu":
         raise ValueError("series_b.onednn_tf32 is only available on XPU")
