@@ -233,6 +233,52 @@ def test_staging_cyclic_metadata_has_no_recursion_error_or_caller_alias():
     stager.close()
 
 
+def test_staging_nested_object_tensors_preserves_aliases_and_counts_capacity():
+    data = _structure()
+    base_payload = sum(
+        value.numel() * value.element_size()
+        for value in vars(data).values()
+        if torch.is_tensor(value)
+    )
+    tensor = torch.arange(12.0)
+    metadata = SimpleNamespace(value=tensor)
+    metadata.self = metadata
+    data.extra = {tensor: metadata}
+    original_payload = base_payload + tensor.numel() * tensor.element_size()
+    stager = DeviceBatchStager("cpu", max_batch_bytes=original_payload)
+    with stager.stage(data) as owned:
+        key, metadata = next(iter(owned.extra.items()))
+        assert key is metadata.value
+        assert metadata.self is metadata
+        assert key is not tensor
+        torch.testing.assert_close(key, tensor)
+        assert stager.allocated_bytes == original_payload
+    stager.close()
+    stager = DeviceBatchStager("cpu", max_batch_bytes=original_payload - 1)
+    with pytest.raises(ValueError, match="max_batch_bytes"):
+        stager.stage(data)
+    stager.close()
+
+
+def test_staging_rejects_differentiable_tensors_in_custom_metadata():
+    data = _structure()
+    data.extra = SimpleNamespace(value=torch.ones(3, requires_grad=True))
+    stager = DeviceBatchStager("cpu")
+    with pytest.raises(ValueError, match="differentiable"):
+        stager.stage(data)
+    stager.close()
+
+
+def test_staging_finds_accelerator_tensors_in_custom_metadata():
+    data = _structure()
+    stager = DeviceBatchStager("cpu")
+    with FakeTensorMode():
+        data.extra = SimpleNamespace(value=torch.ones(3, device="xpu:1"))
+        with pytest.raises(ValueError, match="must be on CPU"):
+            stager.stage(data)
+    stager.close()
+
+
 def test_concurrent_staging_cannot_lease_same_slot_during_metadata_copy():
     entered, release, second_entered = Event(), Event(), Event()
 

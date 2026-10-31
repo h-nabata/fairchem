@@ -3,7 +3,8 @@
 調査日: 2026-10-30。対象: `intel-xpu-fp32` ブランチの単一 XPU 推論。
 本資料は実装候補の一覧であり、B70 上の速度・精度の実測結果ではない。
 系列 A の実装・有効化条件は [series A implementation](intel_xpu_series_a.md)
-を参照。系列 B は保留し、この実装では追加していない。
+を参照。2026-10-31にB系列を既定で無効の実験機能として追加した。
+実装範囲・引数・未検証事項は [series B implementation](intel_xpu_series_b.md) を参照。
 既実装の改善と CPU 検証は [performance audit](intel_xpu_performance.md) を参照。
 
 ## 分類と現状

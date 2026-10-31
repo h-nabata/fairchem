@@ -12,6 +12,10 @@ from typing import TYPE_CHECKING, Literal
 import torch
 
 from fairchem.core.common import gp_utils
+from fairchem.core.models.uma.nn.approximate_ops import (
+    compensated_node_sum,
+    compensated_reduction_enabled,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -138,17 +142,20 @@ def reduce_node_to_system(
         - reduced: System-level values after GP reduction (if applicable), shape [num_systems, ...].
         - unreduced: System-level values before GP reduction, useful for autograd, shape [num_systems, ...].
     """
-    output_shape = (num_systems,) + node_values.shape[1:]
-    system_values = torch.zeros(
-        output_shape,
-        device=node_values.device,
-        dtype=torch.float64,
-    )
+    if compensated_reduction_enabled():
+        system_values = compensated_node_sum(node_values, batch, num_systems).double()
+    else:
+        output_shape = (num_systems,) + node_values.shape[1:]
+        system_values = torch.zeros(
+            output_shape,
+            device=node_values.device,
+            dtype=torch.float64,
+        )
 
-    # index_add_ supports arbitrary trailing dimensions directly, including
-    # strided and empty inputs. Flattening with view() rejects both cases and
-    # using reshape() instead would introduce an unnecessary contiguous copy.
-    system_values.index_add_(0, batch, node_values.to(system_values.dtype))
+        # index_add_ supports arbitrary trailing dimensions directly, including
+        # strided and empty inputs. Flattening with view() rejects both cases and
+        # using reshape() instead would introduce an unnecessary contiguous copy.
+        system_values.index_add_(0, batch, node_values.to(system_values.dtype))
 
     if gp_utils.initialized():
         reduced = gp_utils.reduce_from_model_parallel_region(system_values)

@@ -105,7 +105,7 @@ _TF32_CONTEXT_LOCK = RLock()
 
 
 @contextmanager
-def tf32_context_manager(tf32: bool):
+def tf32_context_manager(tf32: bool, *, device_type: str = "cuda"):
     """
     Temporarily configure and restore TF32-related precision settings.
 
@@ -113,6 +113,25 @@ def tf32_context_manager(tf32: bool):
         tf32: Whether to enable TF32 for float32 matmul and cuDNN operations.
     """
     with _TF32_CONTEXT_LOCK:
+        if device_type == "xpu":
+            original = getattr(torch.backends.mkldnn, "allow_tf32", None)
+            if not tf32 and original:
+                raise ValueError(
+                    "Strict FP32 XPU inference requires torch.backends.mkldnn.allow_tf32=False. "
+                    "The predictor does not change this process-global setting."
+                )
+            if tf32 and not isinstance(original, bool):
+                raise RuntimeError("This PyTorch build does not expose XPU oneDNN TF32")
+            try:
+                if tf32:
+                    torch.backends.mkldnn.allow_tf32 = True
+                yield
+            finally:
+                if tf32:
+                    torch.backends.mkldnn.allow_tf32 = original
+            return
+        if device_type != "cuda":
+            raise ValueError("TF32 policy is only defined for CUDA or XPU")
         original_precision = torch.get_float32_matmul_precision()
         original_allow_tf32_cudnn = torch.backends.cudnn.allow_tf32
         configured_precision = "high" if tf32 else "highest"

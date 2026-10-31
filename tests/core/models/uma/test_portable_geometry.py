@@ -101,6 +101,21 @@ def test_joint_geometry_first_and_second_derivatives_match_original():
     assert torch.autograd.gradgradcheck(geometry, inputs, fast_mode=True)
 
 
+def test_fp64_analytic_coefficients_follow_fp32_network_geometry_dtype():
+    model = _model(torch.float32)
+    model.wigner_data.double()
+    geometry = PortableGeometry(model)
+    vectors = torch.tensor([[0.2, 0.8, -0.4], [1.0, 0.2, 0.5]], requires_grad=True)
+    gamma = torch.tensor([0.5, 1.0])
+    assert geometry.quartic_coefficients.dtype == torch.float32
+    assert geometry.quartic_coefficients.device == vectors.device
+    for actual, expected in zip(
+        geometry(vectors, gamma), _reference(model, vectors, gamma)
+    ):
+        assert actual.dtype == torch.float32
+        torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-6)
+
+
 def test_joint_geometry_compiles_and_handles_multiple_shapes():
     model = _model(torch.float32)
     geometry = PortableGeometry(model)

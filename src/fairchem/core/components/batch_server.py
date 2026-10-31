@@ -312,6 +312,9 @@ class BatchPredictServerMixin:
         """
         if not items:
             return []
+        settings = getattr(predict_unit, "inference_settings", None)
+        requested = getattr(settings, "requested_properties", None)
+        tasks = getattr(predict_unit, "dataset_to_tasks", {})
         groups = defaultdict(list)
         for index, data in enumerate(items):
             if data.num_graphs != 1:
@@ -319,7 +322,28 @@ class BatchPredictServerMixin:
             # A property need not exist for every dataset. Mixing datasets can
             # produce a shortened collated tensor that cannot be assigned back
             # to the right request by its shape alone.
-            key = (tuple(data.dataset), data.pos.device, data.pos.dtype)
+            # Dense Hessians have system-dependent square shapes, and UMA
+            # computes them for one structure at a time. A batch window may
+            # still contain several such requests; isolate their forward calls.
+            dense_hessian = (
+                "hessian" in requested
+                if requested is not None
+                else any(
+                    task.property == "hessian"
+                    for dataset in data.dataset
+                    for task in tasks.get(dataset, ())
+                )
+                or bool(
+                    set(data.dataset)
+                    & set(getattr(settings, "predict_untrained_hessian", ()))
+                )
+            )
+            key = (
+                tuple(data.dataset),
+                data.pos.device,
+                data.pos.dtype,
+                index if dense_hessian else None,
+            )
             groups[key].append(index)
         if len(groups) > 1:
             ordered = [None] * len(items)

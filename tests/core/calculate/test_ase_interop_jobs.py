@@ -24,6 +24,7 @@ from ase.vibrations import Vibrations
 from fairchem.core.calculate.ase_calculator import (
     FAIRChemCalculator,
     FormationEnergyCalculator,
+    pretrained_mlip,
 )
 from fairchem.core.units.mlip_unit.api.inference import InferenceSettings
 
@@ -95,6 +96,47 @@ def test_metadata_arrays_and_nested_mutation_do_not_contaminate_cache():
     atoms.info["charge"] = 1
     before = atoms.calc.results["energy"]
     assert atoms.get_potential_energy() == pytest.approx(before + 1)
+
+
+@pytest.mark.parametrize("formation", [False, True])
+def test_cyclic_metadata_cache_detects_nested_changes(formation):
+    predictor = BufferPredictor()
+    atoms = _atoms()
+    job = {"values": [np.array([1, 2])]}
+    job["self"] = job
+    job["values"].append(job["values"])
+    atoms.info["job"] = job
+    calculator = FAIRChemCalculator(predictor, task_name="omol")
+    if formation:
+        calculator = FormationEnergyCalculator(
+            calculator, {"H": 0, "O": 0}, apply_corrections=False
+        )
+    atoms.calc = calculator
+    atoms.get_potential_energy()
+    atoms.get_potential_energy()
+    assert predictor.calls == 1
+    job["values"][0][0] = 3
+    atoms.get_potential_energy()
+    assert predictor.calls == 2
+    assert calculator.atoms.info["job"]["self"] is calculator.atoms.info["job"]
+    assert calculator.atoms.info["job"] is not job
+
+
+def test_checkpoint_factory_passes_seed_to_loader(monkeypatch, caplog):
+    calls = []
+    predictor = BufferPredictor()
+
+    def load(name, **kwargs):
+        calls.append((name, kwargs))
+        return predictor
+
+    monkeypatch.setattr(pretrained_mlip, "get_predict_unit", load)
+    calculator = FAIRChemCalculator.from_model_checkpoint(
+        "local.pt", task_name="omol", seed=123
+    )
+    assert calculator.predictor is predictor
+    assert calls[0][1]["seed"] == 123
+    assert "'seed' argument is deprecated" not in caplog.text
 
 
 def test_calculators_own_cpu_prediction_arrays_across_shared_predictor_jobs():

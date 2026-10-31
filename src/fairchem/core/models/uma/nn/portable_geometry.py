@@ -108,7 +108,12 @@ class PortableGeometry(torch.nn.Module):
         coefficients = model.wigner_data.custom_kernels.C_l2
         self.register_buffer(
             "quartic_coefficients",
-            compress_quartic_coefficients(coefficients),
+            # Analytic Wigner coefficients originate in FP64 even when the
+            # network was constructed directly in FP32. Match its radial
+            # buffer rather than requiring a later model.to(dtype) call.
+            compress_quartic_coefficients(coefficients).to(
+                model.distance_expansion.offset
+            ),
             persistent=False,
         )
         self.register_buffer(

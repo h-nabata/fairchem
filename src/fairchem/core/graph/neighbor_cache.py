@@ -93,6 +93,12 @@ class VerletNeighborCache:
             name: getattr(data, name, None)
             for name in ("cell", "natoms", "batch", "atomic_numbers", "node_partition")
         }
+        if values["node_partition"] is not None:
+            # Match graph-v2's accepted index containers before snapshotting.
+            # NumPy/list partitions must work with caching just as without it.
+            values["node_partition"] = torch.as_tensor(
+                values["node_partition"], device=data.pos.device
+            )
         values["pbc"] = data.pbc if pbc is None else pbc
         return values
 

@@ -16,7 +16,7 @@ from ase import Atoms
 
 from fairchem.core.datasets.atomic_data import AtomicData, atomicdata_list_to_batch
 from fairchem.core.graph import portable_search
-from fairchem.core.graph.compute import generate_graph
+from fairchem.core.graph.compute import generate_graph, get_pbc_distances
 from fairchem.core.graph.neighbor_cache import VerletNeighborCache
 from fairchem.core.graph.radius_graph_pbc import canonical_pbc, radius_graph_pbc_v2
 
@@ -58,6 +58,103 @@ def test_partition_is_per_call_and_does_not_contaminate_later_jobs(cached):
     whole = generate_graph(data, 1.1, 8, False, 2, data.pbc, neighbor_cache=cache)
     assert set(whole["edge_index"][1].tolist()) == {0, 1, 2}
     assert data.node_partition is partition
+
+
+@pytest.mark.parametrize("kind", ["tensor", "numpy", "list"])
+def test_cached_partition_accepts_the_same_index_containers_as_fresh_graph(kind):
+    data = _data()
+    partition = {"tensor": torch.tensor([1]), "numpy": np.array([1]), "list": [1]}[kind]
+    cache = VerletNeighborCache(0.4)
+    for target in (1, 1, 2):
+        partition[0] = target
+        actual = generate_graph(data, 1.1, 8, False, 2, data.pbc, partition, cache)
+        expected = generate_graph(data, 1.1, 8, False, 2, data.pbc, partition)
+        assert _edges((actual["edge_index"], actual["cell_offsets"])) == _edges(
+            (expected["edge_index"], expected["cell_offsets"])
+        )
+        assert set(actual["edge_index"][1].tolist()) == {target}
+    assert cache.rebuilds == 2
+    assert cache.hits == 1
+    assert not hasattr(data, "node_partition")
+
+
+@pytest.mark.parametrize("cached", [False, True])
+@pytest.mark.parametrize("method", ["cell", "all_pairs", "bvh"])
+def test_periodic_cancellation_keeps_filtered_topology_metadata_aligned(cached, method):
+    data = AtomicData.from_ase(
+        Atoms(
+            "H2",
+            positions=[[0, 0, 0], [1e-8, 0, 0]],
+            cell=[2, 3, 3],
+            pbc=[True, False, False],
+        ),
+        task_name="omol",
+    )
+    # from_ase wraps positions; an MD update can place an atom on the boundary.
+    # (2 - 1e-8) - 2 rounds to zero, but 1e-8 - (2 - 2) does not.
+    data.pos[0, 0] = 2
+    cache = VerletNeighborCache(0.4) if cached else None
+    for _ in range(2):
+        graph = generate_graph(
+            data,
+            0.5,
+            8,
+            False,
+            2,
+            data.pbc,
+            neighbor_cache=cache,
+            graph_search_method=method,
+        )
+        assert graph["edge_index"].shape == (2, 0)
+        for key in (
+            "cell_offsets",
+            "offset_distances",
+            "edge_distance",
+            "edge_distance_vec",
+        ):
+            assert len(graph[key]) == 0
+        assert graph["neighbors"].tolist() == [0]
+
+
+def test_zero_edge_filter_preserves_batch_counts_and_second_derivatives():
+    pos = torch.tensor(
+        [[0.0, 0, 0], [0.5, 0, 0], [1.0, 0, 0], [1.5, 0, 0]],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    cell = torch.eye(3, dtype=pos.dtype).repeat(3, 1, 1).requires_grad_()
+    edge_index = torch.tensor([[0, 0, 2, 2], [0, 1, 2, 3]])
+    offsets = torch.tensor([[0, 0, 0], [1, 0, 0], [0, 0, 0], [-1, 0, 0]])
+    neighbors = torch.tensor([2, 0, 2])
+    original_offsets, original_neighbors = offsets.clone(), neighbors.clone()
+    result = get_pbc_distances(
+        pos,
+        edge_index,
+        cell,
+        offsets,
+        neighbors,
+        return_offsets=True,
+        return_distance_vec=True,
+    )
+    torch.testing.assert_close(result["edge_index"], edge_index[:, [1, 3]])
+    torch.testing.assert_close(result["cell_offsets"], offsets[[1, 3]])
+    assert result["neighbors"].tolist() == [1, 0, 1]
+    torch.testing.assert_close(offsets, original_offsets)
+    torch.testing.assert_close(neighbors, original_neighbors)
+
+    actual = result["distances"].square().sum()
+    vectors = torch.stack((pos[0] - pos[1] + cell[0, 0], pos[2] - pos[3] - cell[2, 0]))
+    reference = vectors.square().sum()
+    actual_first = torch.autograd.grad(actual, (pos, cell), create_graph=True)
+    expected_first = torch.autograd.grad(reference, (pos, cell), create_graph=True)
+    actual_second = torch.autograd.grad(sum(x.sum() for x in actual_first), (pos, cell))
+    expected_second = torch.autograd.grad(
+        sum(x.sum() for x in expected_first), (pos, cell)
+    )
+    for actual_value, expected_value in zip(
+        (*actual_first, *actual_second), (*expected_first, *expected_second)
+    ):
+        torch.testing.assert_close(actual_value, expected_value)
 
 
 @pytest.mark.parametrize("kind", ["tensor", "numpy", "list"])

@@ -77,6 +77,10 @@ from fairchem.core.units.mlip_unit.inference_runtime import (
     mole_composition_key,
 )
 from fairchem.core.units.mlip_unit.mlip_unit import OutputSpec, Task
+from fairchem.core.units.mlip_unit.series_b_runtime import (
+    prepare_series_b,
+    validate_series_b,
+)
 from fairchem.core.units.mlip_unit.single_atom_patch import (
     single_atom_prediction_from_lookup,
 )
@@ -403,9 +407,10 @@ _NITRO_BANNER = r"""
 
 def _uses_reduced_precision(settings: InferenceSettings, device: str) -> bool:
     """
-    Whether inference runs below standard FP32 precision: TF32 or UMA Nitro on a
-    CUDA device (TF32 does not apply on the CPU).
+    Whether inference opts into Series B, or CUDA TF32/UMA Nitro.
     """
+    if settings.series_b.enabled:
+        return True
     if torch.device(device).type != "cuda":
         return False
     return settings.nitro or (
@@ -514,6 +519,7 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         self._inference_model_path = inference_model_path
         self._overrides = copy.deepcopy(overrides)
         self._requested_device = device
+        validate_series_b(self.inference_settings, device)
         if torch.device(device).type == "xpu":
             self._validate_xpu_settings()
         self._setup_threads(self.inference_settings)
@@ -1098,10 +1104,32 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
             f"Reason: '{consistency_error}'.\n"
             "Use inference_settings='batch' for heterogeneous batched evaluations."
         )
+        if self.inference_settings.series_b.low_rank_fraction is not None:
+            raise ValueError(
+                "Series B low-rank weights belong to one merged composition. "
+                "Use mole_cache_size>0 or construct a predictor for the new composition."
+            )
         # Fall back to the unmerged and uncompiled model.
-        changes = {"merge_mole": False, "compile": False}
-        if self.inference_settings.execution_mode == ExecutionMode.UMAS_FAST_GPU:
+        changes = {"merge_mole": False, "compile": False, "xpu_graph": False}
+        # Every specialized UMA-S backend uses merged expert weights. Keeping
+        # a portable/PyTorch backend here would make the replacement model fail
+        # its own preparation validation; XPU graph capture also needs merging.
+        backbone_overrides = (getattr(self, "_overrides", None) or {}).get(
+            "backbone", {}
+        )
+        execution_mode = backbone_overrides.get(
+            "execution_mode", self.inference_settings.execution_mode
+        )
+        if execution_mode in (
+            ExecutionMode.UMAS_FAST_GPU,
+            ExecutionMode.UMAS_FAST_PYTORCH,
+            ExecutionMode.UMAS_FAST_PORTABLE,
+        ):
             changes["execution_mode"] = ExecutionMode.GENERAL
+            if "execution_mode" in backbone_overrides:
+                # The predictor owns this copy. An explicit override otherwise
+                # takes precedence and silently restores the incompatible mode.
+                backbone_overrides["execution_mode"] = ExecutionMode.GENERAL
         self._fall_back_with(reason, **changes)
 
     def validate_atoms_data(self, atoms: Atoms, task_name: str) -> None:
@@ -1144,6 +1172,27 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
             supported.update(task.property for task in self.tasks.values())
             if unknown := set(requested) - supported:
                 raise ValueError(f"Unknown requested properties: {sorted(unknown)}")
+        prepared_options = getattr(self.model.module, "_prepared_series_b", None)
+        if (
+            self.lazy_model_intialized
+            and prepared_options is not None
+            and prepared_options != self.inference_settings.series_b
+        ):
+            raise ValueError(
+                "Series B settings cannot change after preparation; construct a new predictor"
+            )
+        prepared_settings = getattr(
+            self.model.module, "_prepared_inference_settings", None
+        )
+        if self.lazy_model_intialized and prepared_settings is not None:
+            current = copy.deepcopy(self.inference_settings)
+            # Output selection is per-call and does not change prepared weights.
+            current.requested_properties = prepared_settings.requested_properties
+            if current != prepared_settings:
+                raise ValueError(
+                    "Inference settings cannot change after preparation; construct a new predictor. "
+                    "Use requested_properties for per-call output selection."
+                )
         self._select_prepared_model(data)
         regress_config = getattr(self.model.module.backbone, "regress_config", None)
         if (
@@ -1239,6 +1288,9 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         """
         Lazy initialization on first predict call.
         """
+        validate_series_b(
+            self.inference_settings, self.device, self.model.module.backbone
+        )
         # Checkpoints are loaded on CPU. Preparing MOLE with an already-device-
         # resident batch would mix accelerator inputs and CPU weights; float64
         # inputs also break the head's FP32 expert contraction before predict()
@@ -1271,6 +1323,15 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         self.model.requires_grad_(False)
 
         self.model.to(self.inference_settings.base_precision_dtype)
+
+        if self.inference_settings.series_b.enabled:
+            self.model.module._series_b_manifest = prepare_series_b(
+                self.model.module, self.inference_settings, self.device
+            )
+        self.model.module._prepared_series_b = self.inference_settings.series_b
+        self.model.module._prepared_inference_settings = copy.deepcopy(
+            self.inference_settings
+        )
 
         self.move_to_device()
         self.model.module._inference_stream_guard = ModelStreamGuard(self.model)
@@ -1313,11 +1374,6 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
             else torch.enable_grad()
         )
         device_type = torch.device(getattr(self, "device", "cpu")).type
-        if device_type == "xpu" and getattr(torch.backends.mkldnn, "allow_tf32", False):
-            raise ValueError(
-                "Strict FP32 XPU inference requires torch.backends.mkldnn.allow_tf32=False. "
-                "The predictor does not change this process-global setting."
-            )
         if device_type == "xpu" and self.inference_settings.compile:
             from torch._inductor import config as inductor_config
 
@@ -1358,31 +1414,58 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
             getattr(self.model, "_orig_mod", self.model) if higher_order else self.model
         )
         # XPU's oneDNN precision control is separate from CUDA TF32 controls.
-        # Leave global backend state unchanged when an Intel predictor runs.
-        precision_context = (
-            nullcontext()
-            if device_type != "cuda"
-            else tf32_context_manager(self.inference_settings.tf32)
-        )
-        # FP32 is the supported XPU contract even inside a caller's autocast
-        # context. Preserve that contract for every backbone operation.
+        # Strict XPU leaves it unchanged; B03 scopes and restores its opt-in flag.
+        precision_context = nullcontext()
+        if device_type == "cuda":
+            precision_context = tf32_context_manager(self.inference_settings.tf32)
+        elif device_type == "xpu":
+            precision_context = tf32_context_manager(
+                self.inference_settings.series_b.onednn_tf32, device_type="xpu"
+            )
+        # Disable ambient autocast. Approximate modules choose their own operand
+        # precision, leaving geometry, normalization and heads in FP32.
         autocast_context = (
-            torch.autocast("xpu", enabled=False)
-            if device_type == "xpu"
+            torch.autocast(device_type, enabled=False)
+            if device_type == "xpu" or self.inference_settings.series_b.enabled
             else nullcontext()
+        )
+        from fairchem.core.models.uma.nn.approximate_ops import approximate_ops_context
+
+        approximation_context = approximate_ops_context(
+            self.inference_settings.series_b
         )
         with (
             inference_context,
             precision_context,
             autocast_context,
+            approximation_context,
         ):
             output = inference_model(data)
             predictions = self._process_outputs(data, output, undo_refs)
+
+        if self.inference_settings.series_b.enabled:
+            for name, value in predictions.items():
+                if (
+                    isinstance(value, torch.Tensor)
+                    and value.is_floating_point()
+                    and not torch.isfinite(value).all()
+                ):
+                    raise FloatingPointError(f"Series B produced nonfinite {name}")
 
         if self.inference_settings.nitro and not self._nitro_announced:
             print(_NITRO_BANNER, file=sys.stderr, flush=True)
             self._nitro_announced = True
         return predictions
+
+    @property
+    def approximation_manifest(self) -> dict:
+        """
+        Return the applied approximation coverage after the first prediction.
+        """
+        with _predictor_state(self)[0]:
+            return copy.deepcopy(
+                getattr(self.model.module, "_series_b_manifest", {"enabled": False})
+            )
 
     def _process_outputs(self, data: AtomicData, output: dict, undo_refs: bool) -> dict:
         """
@@ -1589,6 +1672,11 @@ class ParallelMLIPPredictUnit(MLIPPredictUnitProtocol):
 
         if torch.device(device).type == "xpu":
             raise ValueError("ParallelMLIPPredictUnit does not support XPU devices.")
+
+        if inference_settings is not None and inference_settings.series_b.enabled:
+            raise ValueError(
+                "Series B currently requires independent single-worker predictors"
+            )
 
         gp_config = gp_utils.resolve_gp_config_for_workers(gp_config, num_workers)
 

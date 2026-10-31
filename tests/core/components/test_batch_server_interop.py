@@ -123,6 +123,41 @@ def test_mixed_tasks_and_dtypes_restore_request_order_without_partial_outputs():
     assert len(predictor.calls) == 3
 
 
+def test_actual_uma_hessians_are_isolated_per_server_request():
+    from tests.core.calculate.test_batch_interoperability import _uma
+
+    predictor = _uma()
+    predictor.inference_settings.requested_properties = ("hessian",)
+    items = [_data(1), _data(2)]
+    expected = [predictor.predict(item, False)["hessian"] for item in items]
+    actual = _server()._run_batched_inference(items, predictor, False)
+    for result, oracle in zip(actual, expected, strict=True):
+        assert result["hessian"].shape == (1, 6, 6)
+        torch.testing.assert_close(result["hessian"], oracle)
+
+
+def test_declared_hessians_use_singletons_but_explicit_energy_can_batch():
+    calls = []
+
+    def predict(batch, undo_element_references):
+        calls.append(batch.num_graphs)
+        return {"energy": torch.zeros(batch.num_graphs)}
+
+    predictor = SimpleNamespace(
+        predict=predict,
+        inference_settings=InferenceSettings(),
+        dataset_to_tasks={
+            "omol": [SimpleNamespace(property="hessian", level="system")]
+        },
+    )
+    _server()._run_batched_inference([_data(), _data(2)], predictor, False)
+    assert calls == [1, 1]
+    calls.clear()
+    predictor.inference_settings.requested_properties = ("energy",)
+    _server()._run_batched_inference([_data(), _data(2)], predictor, False)
+    assert calls == [2]
+
+
 @pytest.mark.parametrize("device", ["cpu", "xpu:2", "cuda:3"])
 def test_oom_retry_releases_failed_frames_and_uses_predictor_device(
     monkeypatch, device

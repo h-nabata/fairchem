@@ -7,9 +7,9 @@ records the ASE/TorchSim job checks, ownership fixes, configuration-loading
 regressions, and boundaries of CPU versus physical-GPU validation.
 
 This document tracks all 33 accuracy-preserving items in the
-[optimization roadmap](intel_xpu_optimization_roadmap.md). Series B is deferred:
-this change adds no mixed precision, quantization, reduced cutoff, approximate
-potential, or altered integrator. FP32 network arithmetic and the existing FP64
+[optimization roadmap](intel_xpu_optimization_roadmap.md). The A settings add no mixed precision, quantization, reduced cutoff, approximate
+potential, or altered integrator. The later [Series B implementation](intel_xpu_series_b.md)
+adds explicit, default-off alternatives; it does not change this A contract. FP32 network arithmetic and the existing FP64
 energy/stress reductions remain the contract. Reordered sums and factored linear
 maps can produce floating-point rounding differences; bitwise identity and
 identical long MD trajectories are not promised.

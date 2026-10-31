@@ -8,6 +8,7 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 import copy
+import types
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from numbers import Integral
@@ -34,13 +35,27 @@ def _tensors(value, path=(), seen=None):
         seen = set()
     if isinstance(value, torch.Tensor):
         yield path, value
-    elif isinstance(value, (dict, list, tuple)):
-        if id(value) in seen:
-            return
-        seen.add(id(value))
-        items = value.items() if isinstance(value, dict) else enumerate(value)
-        for key, item in items:
-            yield from _tensors(item, (*path, key), seen)
+        return
+    if id(value) in seen:
+        return
+    seen.add(id(value))
+    if isinstance(value, dict):
+        for index, (key, item) in enumerate(value.items()):
+            # Paths identify reusable buffers, without retaining caller-owned
+            # keys (which can themselves be tensors or mutable objects).
+            yield from _tensors(key, (*path, ("key", index)), seen)
+            yield from _tensors(item, (*path, ("value", index)), seen)
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            yield from _tensors(item, (*path, ("item", index)), seen)
+    elif (
+        hasattr(value, "__dict__")
+        and not isinstance(value, (type, types.ModuleType))
+        and not callable(value)
+    ):
+        # Match AtomicData.clone's object traversal: these tensors also need
+        # admission checks, staging copies and cross-thread stream tracking.
+        yield from _tensors(vars(value), (*path, "attributes"), seen)
 
 
 @dataclass

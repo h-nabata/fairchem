@@ -7,6 +7,7 @@ file in the root directory of this source tree.
 
 from __future__ import annotations
 
+import copy
 import math
 from collections.abc import Collection, Mapping
 from dataclasses import asdict, dataclass, field, replace
@@ -15,6 +16,7 @@ from numbers import Integral, Real
 import torch  # - needed at runtime for dataclass field type resolution
 
 from fairchem.core.common.utils import StrEnum
+from fairchem.core.units.mlip_unit.api.series_b import SeriesBSettings
 
 
 class UMATask(StrEnum):
@@ -263,7 +265,36 @@ class InferenceSettings:
     # VRAM but allow bigger systems; reduce if you run into OOM errors.
     max_atoms: int | None = None
 
+    # Approximation is opt-in and travels with model/server cache identity.
+    series_b: SeriesBSettings | dict = field(default_factory=SeriesBSettings)
+
     def __post_init__(self):
+        if isinstance(self.series_b, Mapping):
+            self.series_b = SeriesBSettings(**dict(self.series_b))
+        if not isinstance(self.series_b, SeriesBSettings):
+            raise ValueError("series_b must be a SeriesBSettings instance or mapping")
+        self.series_b.__post_init__()
+        if self.series_b.enabled:
+            if self.execution_mode is None:
+                self.execution_mode = "general"
+            if self.execution_mode != "general":
+                raise ValueError("Series B currently requires execution_mode='general'")
+            if self.compile or self.xpu_graph or self.nitro:
+                raise ValueError(
+                    "Series B currently requires compile, xpu_graph and nitro disabled"
+                )
+            if self.activation_checkpointing:
+                raise ValueError(
+                    "Series B currently requires activation_checkpointing=False"
+                )
+            if self.base_precision_dtype not in (torch.float32, "float32"):
+                raise ValueError("Series B requires base_precision_dtype=float32")
+            if self.tf32:
+                raise ValueError("Use the separate series_b.onednn_tf32 option for XPU")
+            if self.series_b.low_rank_fraction is not None and not self.merge_mole:
+                raise ValueError(
+                    "Series B low-rank compression requires merge_mole=True"
+                )
         for name in (
             "tf32",
             "activation_checkpointing",
@@ -371,6 +402,12 @@ class InferenceSettings:
         back to a torch.dtype when InferenceSettings is reinstantiated.
         """
         config = asdict(self)
+        for name in (
+            "predict_untrained_forces",
+            "predict_untrained_stress",
+            "predict_untrained_hessian",
+        ):
+            config[name] = sorted(config[name])
         config["base_precision_dtype"] = str(self.base_precision_dtype).replace(
             "torch.", ""
         )
@@ -505,7 +542,11 @@ def guess_inference_settings(settings: str | InferenceSettings):
         assert (
             settings in NAME_TO_INFERENCE_SETTING
         ), f"inference setting name must be one of {NAME_TO_INFERENCE_SETTING.keys()}"
-        return NAME_TO_INFERENCE_SETTING[settings]
+        # Named presets are shared templates. A caller may customize a returned
+        # setting (including its mutable derivative-task sets) before creating
+        # a predictor; that must not contaminate subsequent jobs or the presets
+        # used to describe active settings.
+        return copy.deepcopy(NAME_TO_INFERENCE_SETTING[settings])
     elif isinstance(settings, InferenceSettings):
         return settings
     else:

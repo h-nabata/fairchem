@@ -35,17 +35,24 @@ if TYPE_CHECKING:
     from fairchem.core.units.mlip_unit import MLIPPredictUnit
 
 
-def _metadata_equal(first, second):
+def _metadata_equal(first, second, seen=None):
     """
-    Compare ASE metadata without ndarray truth-value coercion.
+    Compare ASE metadata without ndarray truth-value coercion or cycle recursion.
     """
+    if seen is None:
+        seen = set()
+    pair = (id(first), id(second))
+    if pair in seen:
+        return True
     if isinstance(first, dict) and isinstance(second, dict):
+        seen.add(pair)
         return first.keys() == second.keys() and all(
-            _metadata_equal(first[key], second[key]) for key in first
+            _metadata_equal(first[key], second[key], seen) for key in first
         )
     if isinstance(first, (list, tuple)) and isinstance(second, (list, tuple)):
+        seen.add(pair)
         return len(first) == len(second) and all(
-            _metadata_equal(a, b) for a, b in zip(first, second)
+            _metadata_equal(a, b, seen) for a, b in zip(first, second)
         )
     try:
         return equal(first, second)
@@ -235,8 +242,9 @@ class FAIRChemCalculator(Calculator):
             overrides=overrides,
             device=device,
             workers=workers,
+            seed=seed,
         )
-        return cls(predict_unit=predict_unit, task_name=task_name, seed=seed)
+        return cls(predict_unit=predict_unit, task_name=task_name)
 
     def check_state(self, atoms: Atoms, tol: float = 1e-15) -> list:
         """

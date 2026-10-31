@@ -168,14 +168,33 @@ def get_pbc_distances(
     # compute distances
     distances = distance_vectors.norm(dim=-1)
 
-    # redundancy: remove zero distances
-    nonzero_idx = torch.arange(len(distances), device=distances.device)[distances != 0]
+    # Graph-search and geometry arithmetic associate the periodic additions
+    # differently. A nonzero candidate can therefore round to zero here. Keep
+    # topology metadata aligned when removing it, including in mixed batches.
+    nonzero_mask = distances != 0
+    nonzero_idx = torch.arange(len(distances), device=distances.device)[nonzero_mask]
+    if len(nonzero_idx) != len(distances):
+        cell_offsets = cell_offsets[nonzero_idx]
+        kept_prefix = torch.cat(
+            (
+                neighbors.new_zeros(1),
+                nonzero_mask.to(neighbors.device).cumsum(0, dtype=neighbors.dtype),
+            )
+        )
+        kept_per_system = kept_prefix[neighbors.cumsum(0)]
+        neighbors = torch.diff(kept_per_system, prepend=neighbors.new_zeros(1))
+        # Selecting an already evaluated zero norm leaves its undefined second
+        # derivative in the graph (0 * NaN). Recompute only surviving norms.
+        distances = distance_vectors[nonzero_idx].norm(dim=-1)
+    else:
+        distances = distances[nonzero_idx]
     edge_index = edge_index[:, nonzero_idx]
-    distances = distances[nonzero_idx]
 
     out = {
         "edge_index": edge_index,
         "distances": distances,
+        "cell_offsets": cell_offsets,
+        "neighbors": neighbors,
     }
 
     if return_distance_vec:
@@ -322,7 +341,7 @@ def generate_graph(
         "edge_index": edge_index,
         "edge_distance": edge_dist,
         "edge_distance_vec": distance_vec,
-        "cell_offsets": cell_offsets,
+        "cell_offsets": out["cell_offsets"],
         "offset_distances": cell_offset_distances,
-        "neighbors": neighbors,
+        "neighbors": out["neighbors"],
     }

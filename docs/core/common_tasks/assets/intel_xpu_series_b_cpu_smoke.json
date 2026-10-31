@@ -1,0 +1,3915 @@
+{
+  "scope": "Synthetic random one-layer UMA, H2O, CPU only. Concurrent test workloads; timing is illustrative and not a speed qualification. No pretrained material accuracy or B70 performance claim.",
+  "results": {
+    "bf16": {
+      "success": true,
+      "finite": true,
+      "accuracy_qualified": false,
+      "qualification_note": "No application-specific error thresholds, force finite differences or trajectory validation were applied; this is a single-structure comparison.",
+      "environment": {
+        "python": "3.12.14",
+        "torch": "2.15.0+cpu",
+        "fairchem_core": "0.1.dev1530+gb8c49cda5",
+        "ase": "3.29.0",
+        "device": "cpu",
+        "device_name": "x86_64"
+      },
+      "reference": {
+        "device": "cpu",
+        "settings": {
+          "tf32": false,
+          "activation_checkpointing": false,
+          "merge_mole": true,
+          "compile": false,
+          "compile_scope": "model",
+          "compile_dynamic": true,
+          "xpu_graph": false,
+          "xpu_graph_cache_size": 1,
+          "mole_cache_size": 0,
+          "mole_cache_max_bytes": null,
+          "wigner_cuda": null,
+          "external_graph_gen": false,
+          "internal_graph_gen_version": 2,
+          "neighbor_skin": 0.0,
+          "neighbor_cache_entries": 1,
+          "graph_search_method": "cell",
+          "graph_edge_order": "original",
+          "torch_num_threads": null,
+          "edge_chunk_size": null,
+          "use_quaternion_wigner": true,
+          "base_precision_dtype": "float32",
+          "nitro": false,
+          "execution_mode": "general",
+          "predict_untrained_forces": [],
+          "predict_untrained_stress": [],
+          "predict_untrained_hessian": [],
+          "hessian_vmap": true,
+          "hessian_chunk_size": 64,
+          "requested_properties": null,
+          "auto_add_default_untrained_tasks": true,
+          "max_atoms": null,
+          "series_b": {
+            "gemm_precision": "fp32",
+            "low_precision_emulation": false,
+            "weight_bits": null,
+            "low_rank_fraction": null,
+            "saved_feature_dtype": null,
+            "saved_feature_min_elements": 1024,
+            "compensated_reduction": false,
+            "radial_table_points": null,
+            "radial_fast_exp": false,
+            "onednn_tf32": false
+          },
+          "_target_": "fairchem.core.units.mlip_unit.api.inference.InferenceSettings"
+        },
+        "approximation_manifest": {
+          "enabled": false
+        },
+        "cpu_low_precision_emulation": false,
+        "first_evaluation_seconds": 0.061688418998528505,
+        "warmup_evaluations": 1,
+        "timing": {
+          "repeats": 3,
+          "seconds": [
+            0.01994522200038773,
+            0.019962307000241708,
+            0.01884381600029883
+          ],
+          "median_seconds": 0.01994522200038773,
+          "mean_seconds": 0.01958378166697609,
+          "min_seconds": 0.01884381600029883,
+          "scope": "Private input copy, predictor call and selected-device synchronization; excludes loading, CPU output copies and validation"
+        },
+        "allocator_memory": null
+      },
+      "candidate": {
+        "device": "cpu",
+        "settings": {
+          "tf32": false,
+          "activation_checkpointing": false,
+          "merge_mole": true,
+          "compile": false,
+          "compile_scope": "model",
+          "compile_dynamic": true,
+          "xpu_graph": false,
+          "xpu_graph_cache_size": 1,
+          "mole_cache_size": 0,
+          "mole_cache_max_bytes": null,
+          "wigner_cuda": null,
+          "external_graph_gen": false,
+          "internal_graph_gen_version": 2,
+          "neighbor_skin": 0.0,
+          "neighbor_cache_entries": 1,
+          "graph_search_method": "cell",
+          "graph_edge_order": "original",
+          "torch_num_threads": null,
+          "edge_chunk_size": null,
+          "use_quaternion_wigner": true,
+          "base_precision_dtype": "float32",
+          "nitro": false,
+          "execution_mode": "general",
+          "predict_untrained_forces": [],
+          "predict_untrained_stress": [],
+          "predict_untrained_hessian": [],
+          "hessian_vmap": true,
+          "hessian_chunk_size": 64,
+          "requested_properties": null,
+          "auto_add_default_untrained_tasks": true,
+          "max_atoms": null,
+          "series_b": {
+            "gemm_precision": "bf16",
+            "low_precision_emulation": true,
+            "weight_bits": null,
+            "low_rank_fraction": null,
+            "saved_feature_dtype": null,
+            "saved_feature_min_elements": 1024,
+            "compensated_reduction": false,
+            "radial_table_points": null,
+            "radial_fast_exp": false,
+            "onednn_tf32": false
+          },
+          "_target_": "fairchem.core.units.mlip_unit.api.inference.InferenceSettings"
+        },
+        "approximation_manifest": {
+          "enabled": true,
+          "backbone_only": true,
+          "linear": {
+            "active": true,
+            "effective": true,
+            "gemm_precision": "bf16",
+            "weight_bits": null,
+            "low_rank_fraction": null,
+            "low_precision_emulation": true,
+            "exclude_patterns": [],
+            "coverage": "ordinary nn.Linear children only; no functional, fused or SO3 contractions",
+            "backward_precision": "fp32",
+            "converted": [
+              {
+                "names": [
+                  "mix_csd"
+                ],
+                "shape": [
+                  8,
+                  24
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 768,
+                "stored_weight_bytes": 768
+              },
+              {
+                "names": [
+                  "edge_degree_embedding.rad_func.net.0"
+                ],
+                "shape": [
+                  8,
+                  24
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 768,
+                "stored_weight_bytes": 768
+              },
+              {
+                "names": [
+                  "edge_degree_embedding.rad_func.net.3"
+                ],
+                "shape": [
+                  8,
+                  8
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 256,
+                "stored_weight_bytes": 256
+              },
+              {
+                "names": [
+                  "edge_degree_embedding.rad_func.net.6"
+                ],
+                "shape": [
+                  24,
+                  8
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 768,
+                "stored_weight_bytes": 768
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.fc_m0"
+                ],
+                "shape": [
+                  80,
+                  48
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 15360,
+                "stored_weight_bytes": 15360
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.so2_m_conv.0.fc"
+                ],
+                "shape": [
+                  64,
+                  32
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 8192,
+                "stored_weight_bytes": 8192
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.so2_m_conv.1.fc"
+                ],
+                "shape": [
+                  32,
+                  16
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 2048,
+                "stored_weight_bytes": 2048
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.rad_func.net.0"
+                ],
+                "shape": [
+                  8,
+                  24
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 768,
+                "stored_weight_bytes": 768
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.rad_func.net.3"
+                ],
+                "shape": [
+                  8,
+                  8
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 256,
+                "stored_weight_bytes": 256
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.rad_func.net.6"
+                ],
+                "shape": [
+                  96,
+                  8
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 3072,
+                "stored_weight_bytes": 3072
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_2.fc_m0"
+                ],
+                "shape": [
+                  24,
+                  48
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 4608,
+                "stored_weight_bytes": 4608
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_2.so2_m_conv.0.fc"
+                ],
+                "shape": [
+                  32,
+                  32
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 4096,
+                "stored_weight_bytes": 4096
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_2.so2_m_conv.1.fc"
+                ],
+                "shape": [
+                  16,
+                  16
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 1024,
+                "stored_weight_bytes": 1024
+              },
+              {
+                "names": [
+                  "blocks.0.atom_wise.grid_mlp.0"
+                ],
+                "shape": [
+                  16,
+                  8
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 512,
+                "stored_weight_bytes": 512
+              },
+              {
+                "names": [
+                  "blocks.0.atom_wise.grid_mlp.2"
+                ],
+                "shape": [
+                  16,
+                  16
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 1024,
+                "stored_weight_bytes": 1024
+              },
+              {
+                "names": [
+                  "blocks.0.atom_wise.grid_mlp.4"
+                ],
+                "shape": [
+                  8,
+                  16
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 512,
+                "stored_weight_bytes": 512
+              }
+            ],
+            "skipped": [],
+            "original_weight_bytes": 44032,
+            "stored_weight_bytes": 44032,
+            "storage_accounting": "Per unique Linear module; excludes bias/workspaces and does not deduplicate tied parameter storage across distinct Linear modules.",
+            "warnings": [
+              "Experimental approximation; application energy/force/stress/curvature validation is required.",
+              "Forward finite checks synchronize accelerators; speedup is not guaranteed.",
+              "Reduced activation casts use surrogate coordinate derivatives; backward GEMMs stay FP32.",
+              "CPU uses rounded-input FP32 emulation, not native reduced-precision acceleration."
+            ]
+          },
+          "compensated_reduction": false,
+          "onednn_tf32": false
+        },
+        "cpu_low_precision_emulation": true,
+        "first_evaluation_seconds": 0.07125036000070395,
+        "warmup_evaluations": 1,
+        "timing": {
+          "repeats": 3,
+          "seconds": [
+            0.023876003000623314,
+            0.03346444100134249,
+            0.02561991500078875
+          ],
+          "median_seconds": 0.02561991500078875,
+          "mean_seconds": 0.027653453000918187,
+          "min_seconds": 0.023876003000623314,
+          "scope": "Private input copy, predictor call and selected-device synchronization; excludes loading, CPU output copies and validation"
+        },
+        "allocator_memory": null
+      },
+      "errors": {
+        "energy": {
+          "unit": "eV",
+          "shape": [],
+          "max_absolute_error": 3.849342465400696e-05,
+          "rms_error": 3.849342465400696e-05,
+          "error_l2_norm": 3.849342465400696e-05,
+          "reference_l2_norm": 0.0761813297867775,
+          "reference_rms": 0.0761813297867775,
+          "relative_l2_error": 0.0005052868565269928
+        },
+        "forces": {
+          "unit": "eV/angstrom",
+          "shape": [
+            3,
+            3
+          ],
+          "max_absolute_error": 5.2240677177906036e-05,
+          "rms_error": 2.5029506547487228e-05,
+          "error_l2_norm": 7.508851964246168e-05,
+          "reference_l2_norm": 0.011437177600951256,
+          "reference_rms": 0.0038123925336504185,
+          "relative_l2_error": 0.006565301533502147
+        },
+        "stress": {
+          "unit": "eV/angstrom^3",
+          "shape": [
+            3,
+            3
+          ],
+          "max_absolute_error": 1.55722773342859e-07,
+          "rms_error": 5.2084788176067866e-08,
+          "error_l2_norm": 1.562543645282036e-07,
+          "reference_l2_norm": 2.1516445389433124e-05,
+          "reference_rms": 7.172148463144375e-06,
+          "relative_l2_error": 0.007262090075758573
+        },
+        "hessian": {
+          "unit": "eV/angstrom^2",
+          "shape": [
+            9,
+            9
+          ],
+          "max_absolute_error": 8.374196477234364e-05,
+          "rms_error": 2.6540175025859064e-05,
+          "error_l2_norm": 0.00023886157523273158,
+          "reference_l2_norm": 0.03095886380181898,
+          "reference_rms": 0.0034398737557576643,
+          "relative_l2_error": 0.00771545030727831
+        }
+      },
+      "reference_over_candidate_median_time": 0.7785046125162275,
+      "memory_scope": "Preloaded predictors: both models and unrelated process allocations are included. PyTorch device allocator only; CPU and external library allocations are excluded."
+    },
+    "fp16": {
+      "success": true,
+      "finite": true,
+      "accuracy_qualified": false,
+      "qualification_note": "No application-specific error thresholds, force finite differences or trajectory validation were applied; this is a single-structure comparison.",
+      "environment": {
+        "python": "3.12.14",
+        "torch": "2.15.0+cpu",
+        "fairchem_core": "0.1.dev1530+gb8c49cda5",
+        "ase": "3.29.0",
+        "device": "cpu",
+        "device_name": "x86_64"
+      },
+      "reference": {
+        "device": "cpu",
+        "settings": {
+          "tf32": false,
+          "activation_checkpointing": false,
+          "merge_mole": true,
+          "compile": false,
+          "compile_scope": "model",
+          "compile_dynamic": true,
+          "xpu_graph": false,
+          "xpu_graph_cache_size": 1,
+          "mole_cache_size": 0,
+          "mole_cache_max_bytes": null,
+          "wigner_cuda": null,
+          "external_graph_gen": false,
+          "internal_graph_gen_version": 2,
+          "neighbor_skin": 0.0,
+          "neighbor_cache_entries": 1,
+          "graph_search_method": "cell",
+          "graph_edge_order": "original",
+          "torch_num_threads": null,
+          "edge_chunk_size": null,
+          "use_quaternion_wigner": true,
+          "base_precision_dtype": "float32",
+          "nitro": false,
+          "execution_mode": "general",
+          "predict_untrained_forces": [],
+          "predict_untrained_stress": [],
+          "predict_untrained_hessian": [],
+          "hessian_vmap": true,
+          "hessian_chunk_size": 64,
+          "requested_properties": null,
+          "auto_add_default_untrained_tasks": true,
+          "max_atoms": null,
+          "series_b": {
+            "gemm_precision": "fp32",
+            "low_precision_emulation": false,
+            "weight_bits": null,
+            "low_rank_fraction": null,
+            "saved_feature_dtype": null,
+            "saved_feature_min_elements": 1024,
+            "compensated_reduction": false,
+            "radial_table_points": null,
+            "radial_fast_exp": false,
+            "onednn_tf32": false
+          },
+          "_target_": "fairchem.core.units.mlip_unit.api.inference.InferenceSettings"
+        },
+        "approximation_manifest": {
+          "enabled": false
+        },
+        "cpu_low_precision_emulation": false,
+        "first_evaluation_seconds": 0.06381055100064259,
+        "warmup_evaluations": 1,
+        "timing": {
+          "repeats": 3,
+          "seconds": [
+            0.02240835600059654,
+            0.021122688000104972,
+            0.01938437500029977
+          ],
+          "median_seconds": 0.021122688000104972,
+          "mean_seconds": 0.020971806333667093,
+          "min_seconds": 0.01938437500029977,
+          "scope": "Private input copy, predictor call and selected-device synchronization; excludes loading, CPU output copies and validation"
+        },
+        "allocator_memory": null
+      },
+      "candidate": {
+        "device": "cpu",
+        "settings": {
+          "tf32": false,
+          "activation_checkpointing": false,
+          "merge_mole": true,
+          "compile": false,
+          "compile_scope": "model",
+          "compile_dynamic": true,
+          "xpu_graph": false,
+          "xpu_graph_cache_size": 1,
+          "mole_cache_size": 0,
+          "mole_cache_max_bytes": null,
+          "wigner_cuda": null,
+          "external_graph_gen": false,
+          "internal_graph_gen_version": 2,
+          "neighbor_skin": 0.0,
+          "neighbor_cache_entries": 1,
+          "graph_search_method": "cell",
+          "graph_edge_order": "original",
+          "torch_num_threads": null,
+          "edge_chunk_size": null,
+          "use_quaternion_wigner": true,
+          "base_precision_dtype": "float32",
+          "nitro": false,
+          "execution_mode": "general",
+          "predict_untrained_forces": [],
+          "predict_untrained_stress": [],
+          "predict_untrained_hessian": [],
+          "hessian_vmap": true,
+          "hessian_chunk_size": 64,
+          "requested_properties": null,
+          "auto_add_default_untrained_tasks": true,
+          "max_atoms": null,
+          "series_b": {
+            "gemm_precision": "fp16",
+            "low_precision_emulation": true,
+            "weight_bits": null,
+            "low_rank_fraction": null,
+            "saved_feature_dtype": null,
+            "saved_feature_min_elements": 1024,
+            "compensated_reduction": false,
+            "radial_table_points": null,
+            "radial_fast_exp": false,
+            "onednn_tf32": false
+          },
+          "_target_": "fairchem.core.units.mlip_unit.api.inference.InferenceSettings"
+        },
+        "approximation_manifest": {
+          "enabled": true,
+          "backbone_only": true,
+          "linear": {
+            "active": true,
+            "effective": true,
+            "gemm_precision": "fp16",
+            "weight_bits": null,
+            "low_rank_fraction": null,
+            "low_precision_emulation": true,
+            "exclude_patterns": [],
+            "coverage": "ordinary nn.Linear children only; no functional, fused or SO3 contractions",
+            "backward_precision": "fp32",
+            "converted": [
+              {
+                "names": [
+                  "mix_csd"
+                ],
+                "shape": [
+                  8,
+                  24
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 768,
+                "stored_weight_bytes": 768
+              },
+              {
+                "names": [
+                  "edge_degree_embedding.rad_func.net.0"
+                ],
+                "shape": [
+                  8,
+                  24
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 768,
+                "stored_weight_bytes": 768
+              },
+              {
+                "names": [
+                  "edge_degree_embedding.rad_func.net.3"
+                ],
+                "shape": [
+                  8,
+                  8
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 256,
+                "stored_weight_bytes": 256
+              },
+              {
+                "names": [
+                  "edge_degree_embedding.rad_func.net.6"
+                ],
+                "shape": [
+                  24,
+                  8
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 768,
+                "stored_weight_bytes": 768
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.fc_m0"
+                ],
+                "shape": [
+                  80,
+                  48
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 15360,
+                "stored_weight_bytes": 15360
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.so2_m_conv.0.fc"
+                ],
+                "shape": [
+                  64,
+                  32
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 8192,
+                "stored_weight_bytes": 8192
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.so2_m_conv.1.fc"
+                ],
+                "shape": [
+                  32,
+                  16
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 2048,
+                "stored_weight_bytes": 2048
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.rad_func.net.0"
+                ],
+                "shape": [
+                  8,
+                  24
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 768,
+                "stored_weight_bytes": 768
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.rad_func.net.3"
+                ],
+                "shape": [
+                  8,
+                  8
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 256,
+                "stored_weight_bytes": 256
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.rad_func.net.6"
+                ],
+                "shape": [
+                  96,
+                  8
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 3072,
+                "stored_weight_bytes": 3072
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_2.fc_m0"
+                ],
+                "shape": [
+                  24,
+                  48
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 4608,
+                "stored_weight_bytes": 4608
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_2.so2_m_conv.0.fc"
+                ],
+                "shape": [
+                  32,
+                  32
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 4096,
+                "stored_weight_bytes": 4096
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_2.so2_m_conv.1.fc"
+                ],
+                "shape": [
+                  16,
+                  16
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 1024,
+                "stored_weight_bytes": 1024
+              },
+              {
+                "names": [
+                  "blocks.0.atom_wise.grid_mlp.0"
+                ],
+                "shape": [
+                  16,
+                  8
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 512,
+                "stored_weight_bytes": 512
+              },
+              {
+                "names": [
+                  "blocks.0.atom_wise.grid_mlp.2"
+                ],
+                "shape": [
+                  16,
+                  16
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 1024,
+                "stored_weight_bytes": 1024
+              },
+              {
+                "names": [
+                  "blocks.0.atom_wise.grid_mlp.4"
+                ],
+                "shape": [
+                  8,
+                  16
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 512,
+                "stored_weight_bytes": 512
+              }
+            ],
+            "skipped": [],
+            "original_weight_bytes": 44032,
+            "stored_weight_bytes": 44032,
+            "storage_accounting": "Per unique Linear module; excludes bias/workspaces and does not deduplicate tied parameter storage across distinct Linear modules.",
+            "warnings": [
+              "Experimental approximation; application energy/force/stress/curvature validation is required.",
+              "Forward finite checks synchronize accelerators; speedup is not guaranteed.",
+              "Reduced activation casts use surrogate coordinate derivatives; backward GEMMs stay FP32.",
+              "CPU uses rounded-input FP32 emulation, not native reduced-precision acceleration."
+            ]
+          },
+          "compensated_reduction": false,
+          "onednn_tf32": false
+        },
+        "cpu_low_precision_emulation": true,
+        "first_evaluation_seconds": 0.07075139299922739,
+        "warmup_evaluations": 1,
+        "timing": {
+          "repeats": 3,
+          "seconds": [
+            0.025166976998661994,
+            0.03237816300134,
+            0.02786603100139473
+          ],
+          "median_seconds": 0.02786603100139473,
+          "mean_seconds": 0.028470390333798907,
+          "min_seconds": 0.025166976998661994,
+          "scope": "Private input copy, predictor call and selected-device synchronization; excludes loading, CPU output copies and validation"
+        },
+        "allocator_memory": null
+      },
+      "errors": {
+        "energy": {
+          "unit": "eV",
+          "shape": [],
+          "max_absolute_error": 1.6372650861740112e-05,
+          "rms_error": 1.6372650861740112e-05,
+          "error_l2_norm": 1.6372650861740112e-05,
+          "reference_l2_norm": 0.0761813297867775,
+          "reference_rms": 0.0761813297867775,
+          "relative_l2_error": 0.00021491684258551563
+        },
+        "forces": {
+          "unit": "eV/angstrom",
+          "shape": [
+            3,
+            3
+          ],
+          "max_absolute_error": 4.554633051156998e-06,
+          "rms_error": 2.4964814613106537e-06,
+          "error_l2_norm": 7.48944438393196e-06,
+          "reference_l2_norm": 0.011437177600951256,
+          "reference_rms": 0.0038123925336504185,
+          "relative_l2_error": 0.0006548332678954856
+        },
+        "stress": {
+          "unit": "eV/angstrom^3",
+          "shape": [
+            3,
+            3
+          ],
+          "max_absolute_error": 1.05355866253376e-08,
+          "rms_error": 3.931888578719094e-09,
+          "error_l2_norm": 1.1795665736157282e-08,
+          "reference_l2_norm": 2.1516445389433124e-05,
+          "reference_rms": 7.172148463144375e-06,
+          "relative_l2_error": 0.0005482162839941124
+        },
+        "hessian": {
+          "unit": "eV/angstrom^2",
+          "shape": [
+            9,
+            9
+          ],
+          "max_absolute_error": 8.91275703907013e-06,
+          "rms_error": 2.64628849875843e-06,
+          "error_l2_norm": 2.3816596488825866e-05,
+          "reference_l2_norm": 0.03095886380181898,
+          "reference_rms": 0.0034398737557576643,
+          "relative_l2_error": 0.0007692981448313529
+        }
+      },
+      "reference_over_candidate_median_time": 0.7580084870733028,
+      "memory_scope": "Preloaded predictors: both models and unrelated process allocations are included. PyTorch device allocator only; CPU and external library allocations are excluded."
+    },
+    "bf16_split2": {
+      "success": true,
+      "finite": true,
+      "accuracy_qualified": false,
+      "qualification_note": "No application-specific error thresholds, force finite differences or trajectory validation were applied; this is a single-structure comparison.",
+      "environment": {
+        "python": "3.12.14",
+        "torch": "2.15.0+cpu",
+        "fairchem_core": "0.1.dev1530+gb8c49cda5",
+        "ase": "3.29.0",
+        "device": "cpu",
+        "device_name": "x86_64"
+      },
+      "reference": {
+        "device": "cpu",
+        "settings": {
+          "tf32": false,
+          "activation_checkpointing": false,
+          "merge_mole": true,
+          "compile": false,
+          "compile_scope": "model",
+          "compile_dynamic": true,
+          "xpu_graph": false,
+          "xpu_graph_cache_size": 1,
+          "mole_cache_size": 0,
+          "mole_cache_max_bytes": null,
+          "wigner_cuda": null,
+          "external_graph_gen": false,
+          "internal_graph_gen_version": 2,
+          "neighbor_skin": 0.0,
+          "neighbor_cache_entries": 1,
+          "graph_search_method": "cell",
+          "graph_edge_order": "original",
+          "torch_num_threads": null,
+          "edge_chunk_size": null,
+          "use_quaternion_wigner": true,
+          "base_precision_dtype": "float32",
+          "nitro": false,
+          "execution_mode": "general",
+          "predict_untrained_forces": [],
+          "predict_untrained_stress": [],
+          "predict_untrained_hessian": [],
+          "hessian_vmap": true,
+          "hessian_chunk_size": 64,
+          "requested_properties": null,
+          "auto_add_default_untrained_tasks": true,
+          "max_atoms": null,
+          "series_b": {
+            "gemm_precision": "fp32",
+            "low_precision_emulation": false,
+            "weight_bits": null,
+            "low_rank_fraction": null,
+            "saved_feature_dtype": null,
+            "saved_feature_min_elements": 1024,
+            "compensated_reduction": false,
+            "radial_table_points": null,
+            "radial_fast_exp": false,
+            "onednn_tf32": false
+          },
+          "_target_": "fairchem.core.units.mlip_unit.api.inference.InferenceSettings"
+        },
+        "approximation_manifest": {
+          "enabled": false
+        },
+        "cpu_low_precision_emulation": false,
+        "first_evaluation_seconds": 0.056249953999213176,
+        "warmup_evaluations": 1,
+        "timing": {
+          "repeats": 3,
+          "seconds": [
+            0.018195929998910287,
+            0.01829574699877412,
+            0.01838012299958791
+          ],
+          "median_seconds": 0.01829574699877412,
+          "mean_seconds": 0.018290599999090773,
+          "min_seconds": 0.018195929998910287,
+          "scope": "Private input copy, predictor call and selected-device synchronization; excludes loading, CPU output copies and validation"
+        },
+        "allocator_memory": null
+      },
+      "candidate": {
+        "device": "cpu",
+        "settings": {
+          "tf32": false,
+          "activation_checkpointing": false,
+          "merge_mole": true,
+          "compile": false,
+          "compile_scope": "model",
+          "compile_dynamic": true,
+          "xpu_graph": false,
+          "xpu_graph_cache_size": 1,
+          "mole_cache_size": 0,
+          "mole_cache_max_bytes": null,
+          "wigner_cuda": null,
+          "external_graph_gen": false,
+          "internal_graph_gen_version": 2,
+          "neighbor_skin": 0.0,
+          "neighbor_cache_entries": 1,
+          "graph_search_method": "cell",
+          "graph_edge_order": "original",
+          "torch_num_threads": null,
+          "edge_chunk_size": null,
+          "use_quaternion_wigner": true,
+          "base_precision_dtype": "float32",
+          "nitro": false,
+          "execution_mode": "general",
+          "predict_untrained_forces": [],
+          "predict_untrained_stress": [],
+          "predict_untrained_hessian": [],
+          "hessian_vmap": true,
+          "hessian_chunk_size": 64,
+          "requested_properties": null,
+          "auto_add_default_untrained_tasks": true,
+          "max_atoms": null,
+          "series_b": {
+            "gemm_precision": "bf16_split2",
+            "low_precision_emulation": true,
+            "weight_bits": null,
+            "low_rank_fraction": null,
+            "saved_feature_dtype": null,
+            "saved_feature_min_elements": 1024,
+            "compensated_reduction": false,
+            "radial_table_points": null,
+            "radial_fast_exp": false,
+            "onednn_tf32": false
+          },
+          "_target_": "fairchem.core.units.mlip_unit.api.inference.InferenceSettings"
+        },
+        "approximation_manifest": {
+          "enabled": true,
+          "backbone_only": true,
+          "linear": {
+            "active": true,
+            "effective": true,
+            "gemm_precision": "bf16_split2",
+            "weight_bits": null,
+            "low_rank_fraction": null,
+            "low_precision_emulation": true,
+            "exclude_patterns": [],
+            "coverage": "ordinary nn.Linear children only; no functional, fused or SO3 contractions",
+            "backward_precision": "fp32",
+            "converted": [
+              {
+                "names": [
+                  "mix_csd"
+                ],
+                "shape": [
+                  8,
+                  24
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 768,
+                "stored_weight_bytes": 768
+              },
+              {
+                "names": [
+                  "edge_degree_embedding.rad_func.net.0"
+                ],
+                "shape": [
+                  8,
+                  24
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 768,
+                "stored_weight_bytes": 768
+              },
+              {
+                "names": [
+                  "edge_degree_embedding.rad_func.net.3"
+                ],
+                "shape": [
+                  8,
+                  8
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 256,
+                "stored_weight_bytes": 256
+              },
+              {
+                "names": [
+                  "edge_degree_embedding.rad_func.net.6"
+                ],
+                "shape": [
+                  24,
+                  8
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 768,
+                "stored_weight_bytes": 768
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.fc_m0"
+                ],
+                "shape": [
+                  80,
+                  48
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 15360,
+                "stored_weight_bytes": 15360
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.so2_m_conv.0.fc"
+                ],
+                "shape": [
+                  64,
+                  32
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 8192,
+                "stored_weight_bytes": 8192
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.so2_m_conv.1.fc"
+                ],
+                "shape": [
+                  32,
+                  16
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 2048,
+                "stored_weight_bytes": 2048
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.rad_func.net.0"
+                ],
+                "shape": [
+                  8,
+                  24
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 768,
+                "stored_weight_bytes": 768
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.rad_func.net.3"
+                ],
+                "shape": [
+                  8,
+                  8
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 256,
+                "stored_weight_bytes": 256
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.rad_func.net.6"
+                ],
+                "shape": [
+                  96,
+                  8
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 3072,
+                "stored_weight_bytes": 3072
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_2.fc_m0"
+                ],
+                "shape": [
+                  24,
+                  48
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 4608,
+                "stored_weight_bytes": 4608
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_2.so2_m_conv.0.fc"
+                ],
+                "shape": [
+                  32,
+                  32
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 4096,
+                "stored_weight_bytes": 4096
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_2.so2_m_conv.1.fc"
+                ],
+                "shape": [
+                  16,
+                  16
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 1024,
+                "stored_weight_bytes": 1024
+              },
+              {
+                "names": [
+                  "blocks.0.atom_wise.grid_mlp.0"
+                ],
+                "shape": [
+                  16,
+                  8
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 512,
+                "stored_weight_bytes": 512
+              },
+              {
+                "names": [
+                  "blocks.0.atom_wise.grid_mlp.2"
+                ],
+                "shape": [
+                  16,
+                  16
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 1024,
+                "stored_weight_bytes": 1024
+              },
+              {
+                "names": [
+                  "blocks.0.atom_wise.grid_mlp.4"
+                ],
+                "shape": [
+                  8,
+                  16
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 512,
+                "stored_weight_bytes": 512
+              }
+            ],
+            "skipped": [],
+            "original_weight_bytes": 44032,
+            "stored_weight_bytes": 44032,
+            "storage_accounting": "Per unique Linear module; excludes bias/workspaces and does not deduplicate tied parameter storage across distinct Linear modules.",
+            "warnings": [
+              "Experimental approximation; application energy/force/stress/curvature validation is required.",
+              "Forward finite checks synchronize accelerators; speedup is not guaranteed.",
+              "Reduced activation casts use surrogate coordinate derivatives; backward GEMMs stay FP32.",
+              "CPU uses rounded-input FP32 emulation, not native reduced-precision acceleration."
+            ]
+          },
+          "compensated_reduction": false,
+          "onednn_tf32": false
+        },
+        "cpu_low_precision_emulation": true,
+        "first_evaluation_seconds": 0.06605220799974632,
+        "warmup_evaluations": 1,
+        "timing": {
+          "repeats": 3,
+          "seconds": [
+            0.023603539999385248,
+            0.023865586999818333,
+            0.023972083999979077
+          ],
+          "median_seconds": 0.023865586999818333,
+          "mean_seconds": 0.023813736999727553,
+          "min_seconds": 0.023603539999385248,
+          "scope": "Private input copy, predictor call and selected-device synchronization; excludes loading, CPU output copies and validation"
+        },
+        "allocator_memory": null
+      },
+      "errors": {
+        "energy": {
+          "unit": "eV",
+          "shape": [],
+          "max_absolute_error": 6.332993507385254e-08,
+          "rms_error": 6.332993507385254e-08,
+          "error_l2_norm": 6.332993507385254e-08,
+          "reference_l2_norm": 0.0761813297867775,
+          "reference_rms": 0.0761813297867775,
+          "relative_l2_error": 8.313051931635417e-07
+        },
+        "forces": {
+          "unit": "eV/angstrom",
+          "shape": [
+            3,
+            3
+          ],
+          "max_absolute_error": 8.847564458847046e-09,
+          "rms_error": 4.511563126998851e-09,
+          "error_l2_norm": 1.3534689380996553e-08,
+          "reference_l2_norm": 0.011437177600951256,
+          "reference_rms": 0.0038123925336504185,
+          "relative_l2_error": 1.1833941775872085e-06
+        },
+        "stress": {
+          "unit": "eV/angstrom^3",
+          "shape": [
+            3,
+            3
+          ],
+          "max_absolute_error": 1.7280399333685637e-11,
+          "rms_error": 6.740095205954448e-12,
+          "error_l2_norm": 2.0220285617863346e-11,
+          "reference_l2_norm": 2.1516445389433124e-05,
+          "reference_rms": 7.172148463144375e-06,
+          "relative_l2_error": 9.397595770067889e-07
+        },
+        "hessian": {
+          "unit": "eV/angstrom^2",
+          "shape": [
+            9,
+            9
+          ],
+          "max_absolute_error": 7.241033017635345e-08,
+          "rms_error": 2.1238634746388504e-08,
+          "error_l2_norm": 1.9114771271749654e-07,
+          "reference_l2_norm": 0.03095886380181898,
+          "reference_rms": 0.0034398737557576643,
+          "relative_l2_error": 6.1742483167701304e-06
+        }
+      },
+      "reference_over_candidate_median_time": 0.7666162579161949,
+      "memory_scope": "Preloaded predictors: both models and unrelated process allocations are included. PyTorch device allocator only; CPU and external library allocations are excluded."
+    },
+    "bf16_split3": {
+      "success": true,
+      "finite": true,
+      "accuracy_qualified": false,
+      "qualification_note": "No application-specific error thresholds, force finite differences or trajectory validation were applied; this is a single-structure comparison.",
+      "environment": {
+        "python": "3.12.14",
+        "torch": "2.15.0+cpu",
+        "fairchem_core": "0.1.dev1530+gb8c49cda5",
+        "ase": "3.29.0",
+        "device": "cpu",
+        "device_name": "x86_64"
+      },
+      "reference": {
+        "device": "cpu",
+        "settings": {
+          "tf32": false,
+          "activation_checkpointing": false,
+          "merge_mole": true,
+          "compile": false,
+          "compile_scope": "model",
+          "compile_dynamic": true,
+          "xpu_graph": false,
+          "xpu_graph_cache_size": 1,
+          "mole_cache_size": 0,
+          "mole_cache_max_bytes": null,
+          "wigner_cuda": null,
+          "external_graph_gen": false,
+          "internal_graph_gen_version": 2,
+          "neighbor_skin": 0.0,
+          "neighbor_cache_entries": 1,
+          "graph_search_method": "cell",
+          "graph_edge_order": "original",
+          "torch_num_threads": null,
+          "edge_chunk_size": null,
+          "use_quaternion_wigner": true,
+          "base_precision_dtype": "float32",
+          "nitro": false,
+          "execution_mode": "general",
+          "predict_untrained_forces": [],
+          "predict_untrained_stress": [],
+          "predict_untrained_hessian": [],
+          "hessian_vmap": true,
+          "hessian_chunk_size": 64,
+          "requested_properties": null,
+          "auto_add_default_untrained_tasks": true,
+          "max_atoms": null,
+          "series_b": {
+            "gemm_precision": "fp32",
+            "low_precision_emulation": false,
+            "weight_bits": null,
+            "low_rank_fraction": null,
+            "saved_feature_dtype": null,
+            "saved_feature_min_elements": 1024,
+            "compensated_reduction": false,
+            "radial_table_points": null,
+            "radial_fast_exp": false,
+            "onednn_tf32": false
+          },
+          "_target_": "fairchem.core.units.mlip_unit.api.inference.InferenceSettings"
+        },
+        "approximation_manifest": {
+          "enabled": false
+        },
+        "cpu_low_precision_emulation": false,
+        "first_evaluation_seconds": 0.05669768499865313,
+        "warmup_evaluations": 1,
+        "timing": {
+          "repeats": 3,
+          "seconds": [
+            0.01888850299837941,
+            0.018450485998982913,
+            0.017675142998996307
+          ],
+          "median_seconds": 0.018450485998982913,
+          "mean_seconds": 0.01833804399878621,
+          "min_seconds": 0.017675142998996307,
+          "scope": "Private input copy, predictor call and selected-device synchronization; excludes loading, CPU output copies and validation"
+        },
+        "allocator_memory": null
+      },
+      "candidate": {
+        "device": "cpu",
+        "settings": {
+          "tf32": false,
+          "activation_checkpointing": false,
+          "merge_mole": true,
+          "compile": false,
+          "compile_scope": "model",
+          "compile_dynamic": true,
+          "xpu_graph": false,
+          "xpu_graph_cache_size": 1,
+          "mole_cache_size": 0,
+          "mole_cache_max_bytes": null,
+          "wigner_cuda": null,
+          "external_graph_gen": false,
+          "internal_graph_gen_version": 2,
+          "neighbor_skin": 0.0,
+          "neighbor_cache_entries": 1,
+          "graph_search_method": "cell",
+          "graph_edge_order": "original",
+          "torch_num_threads": null,
+          "edge_chunk_size": null,
+          "use_quaternion_wigner": true,
+          "base_precision_dtype": "float32",
+          "nitro": false,
+          "execution_mode": "general",
+          "predict_untrained_forces": [],
+          "predict_untrained_stress": [],
+          "predict_untrained_hessian": [],
+          "hessian_vmap": true,
+          "hessian_chunk_size": 64,
+          "requested_properties": null,
+          "auto_add_default_untrained_tasks": true,
+          "max_atoms": null,
+          "series_b": {
+            "gemm_precision": "bf16_split3",
+            "low_precision_emulation": true,
+            "weight_bits": null,
+            "low_rank_fraction": null,
+            "saved_feature_dtype": null,
+            "saved_feature_min_elements": 1024,
+            "compensated_reduction": false,
+            "radial_table_points": null,
+            "radial_fast_exp": false,
+            "onednn_tf32": false
+          },
+          "_target_": "fairchem.core.units.mlip_unit.api.inference.InferenceSettings"
+        },
+        "approximation_manifest": {
+          "enabled": true,
+          "backbone_only": true,
+          "linear": {
+            "active": true,
+            "effective": true,
+            "gemm_precision": "bf16_split3",
+            "weight_bits": null,
+            "low_rank_fraction": null,
+            "low_precision_emulation": true,
+            "exclude_patterns": [],
+            "coverage": "ordinary nn.Linear children only; no functional, fused or SO3 contractions",
+            "backward_precision": "fp32",
+            "converted": [
+              {
+                "names": [
+                  "mix_csd"
+                ],
+                "shape": [
+                  8,
+                  24
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 768,
+                "stored_weight_bytes": 768
+              },
+              {
+                "names": [
+                  "edge_degree_embedding.rad_func.net.0"
+                ],
+                "shape": [
+                  8,
+                  24
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 768,
+                "stored_weight_bytes": 768
+              },
+              {
+                "names": [
+                  "edge_degree_embedding.rad_func.net.3"
+                ],
+                "shape": [
+                  8,
+                  8
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 256,
+                "stored_weight_bytes": 256
+              },
+              {
+                "names": [
+                  "edge_degree_embedding.rad_func.net.6"
+                ],
+                "shape": [
+                  24,
+                  8
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 768,
+                "stored_weight_bytes": 768
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.fc_m0"
+                ],
+                "shape": [
+                  80,
+                  48
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 15360,
+                "stored_weight_bytes": 15360
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.so2_m_conv.0.fc"
+                ],
+                "shape": [
+                  64,
+                  32
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 8192,
+                "stored_weight_bytes": 8192
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.so2_m_conv.1.fc"
+                ],
+                "shape": [
+                  32,
+                  16
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 2048,
+                "stored_weight_bytes": 2048
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.rad_func.net.0"
+                ],
+                "shape": [
+                  8,
+                  24
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 768,
+                "stored_weight_bytes": 768
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.rad_func.net.3"
+                ],
+                "shape": [
+                  8,
+                  8
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 256,
+                "stored_weight_bytes": 256
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.rad_func.net.6"
+                ],
+                "shape": [
+                  96,
+                  8
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 3072,
+                "stored_weight_bytes": 3072
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_2.fc_m0"
+                ],
+                "shape": [
+                  24,
+                  48
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 4608,
+                "stored_weight_bytes": 4608
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_2.so2_m_conv.0.fc"
+                ],
+                "shape": [
+                  32,
+                  32
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 4096,
+                "stored_weight_bytes": 4096
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_2.so2_m_conv.1.fc"
+                ],
+                "shape": [
+                  16,
+                  16
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 1024,
+                "stored_weight_bytes": 1024
+              },
+              {
+                "names": [
+                  "blocks.0.atom_wise.grid_mlp.0"
+                ],
+                "shape": [
+                  16,
+                  8
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 512,
+                "stored_weight_bytes": 512
+              },
+              {
+                "names": [
+                  "blocks.0.atom_wise.grid_mlp.2"
+                ],
+                "shape": [
+                  16,
+                  16
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 1024,
+                "stored_weight_bytes": 1024
+              },
+              {
+                "names": [
+                  "blocks.0.atom_wise.grid_mlp.4"
+                ],
+                "shape": [
+                  8,
+                  16
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 512,
+                "stored_weight_bytes": 512
+              }
+            ],
+            "skipped": [],
+            "original_weight_bytes": 44032,
+            "stored_weight_bytes": 44032,
+            "storage_accounting": "Per unique Linear module; excludes bias/workspaces and does not deduplicate tied parameter storage across distinct Linear modules.",
+            "warnings": [
+              "Experimental approximation; application energy/force/stress/curvature validation is required.",
+              "Forward finite checks synchronize accelerators; speedup is not guaranteed.",
+              "Reduced activation casts use surrogate coordinate derivatives; backward GEMMs stay FP32.",
+              "CPU uses rounded-input FP32 emulation, not native reduced-precision acceleration."
+            ]
+          },
+          "compensated_reduction": false,
+          "onednn_tf32": false
+        },
+        "cpu_low_precision_emulation": true,
+        "first_evaluation_seconds": 0.07190588800040132,
+        "warmup_evaluations": 1,
+        "timing": {
+          "repeats": 3,
+          "seconds": [
+            0.027759051999964868,
+            0.02875170699917362,
+            0.027378341001167428
+          ],
+          "median_seconds": 0.027759051999964868,
+          "mean_seconds": 0.027963033333435305,
+          "min_seconds": 0.027378341001167428,
+          "scope": "Private input copy, predictor call and selected-device synchronization; excludes loading, CPU output copies and validation"
+        },
+        "allocator_memory": null
+      },
+      "errors": {
+        "energy": {
+          "unit": "eV",
+          "shape": [],
+          "max_absolute_error": 1.862645149230957e-08,
+          "rms_error": 1.862645149230957e-08,
+          "error_l2_norm": 1.862645149230957e-08,
+          "reference_l2_norm": 0.0761813297867775,
+          "reference_rms": 0.0761813297867775,
+          "relative_l2_error": 2.4450152740104165e-07
+        },
+        "forces": {
+          "unit": "eV/angstrom",
+          "shape": [
+            3,
+            3
+          ],
+          "max_absolute_error": 1.862645149230957e-09,
+          "rms_error": 7.288144407075982e-10,
+          "error_l2_norm": 2.186443322122795e-09,
+          "reference_l2_norm": 0.011437177600951256,
+          "reference_rms": 0.0038123925336504185,
+          "relative_l2_error": 1.9116983213943828e-07
+        },
+        "stress": {
+          "unit": "eV/angstrom^3",
+          "shape": [
+            3,
+            3
+          ],
+          "max_absolute_error": 4.547473508864641e-12,
+          "rms_error": 1.521835338528321e-12,
+          "error_l2_norm": 4.565506015584963e-12,
+          "reference_l2_norm": 2.1516445389433124e-05,
+          "reference_rms": 7.172148463144375e-06,
+          "relative_l2_error": 2.1218681492004783e-07
+        },
+        "hessian": {
+          "unit": "eV/angstrom^2",
+          "shape": [
+            9,
+            9
+          ],
+          "max_absolute_error": 2.7939677238464355e-09,
+          "rms_error": 1.0074272525795427e-09,
+          "error_l2_norm": 9.066845273215885e-09,
+          "reference_l2_norm": 0.03095886380181898,
+          "reference_rms": 0.0034398737557576643,
+          "relative_l2_error": 2.9286750738840633e-07
+        }
+      },
+      "reference_over_candidate_median_time": 0.6646655656326543,
+      "memory_scope": "Preloaded predictors: both models and unrelated process allocations are included. PyTorch device allocator only; CPU and external library allocations are excluded."
+    },
+    "int8": {
+      "success": true,
+      "finite": true,
+      "accuracy_qualified": false,
+      "qualification_note": "No application-specific error thresholds, force finite differences or trajectory validation were applied; this is a single-structure comparison.",
+      "environment": {
+        "python": "3.12.14",
+        "torch": "2.15.0+cpu",
+        "fairchem_core": "0.1.dev1530+gb8c49cda5",
+        "ase": "3.29.0",
+        "device": "cpu",
+        "device_name": "x86_64"
+      },
+      "reference": {
+        "device": "cpu",
+        "settings": {
+          "tf32": false,
+          "activation_checkpointing": false,
+          "merge_mole": true,
+          "compile": false,
+          "compile_scope": "model",
+          "compile_dynamic": true,
+          "xpu_graph": false,
+          "xpu_graph_cache_size": 1,
+          "mole_cache_size": 0,
+          "mole_cache_max_bytes": null,
+          "wigner_cuda": null,
+          "external_graph_gen": false,
+          "internal_graph_gen_version": 2,
+          "neighbor_skin": 0.0,
+          "neighbor_cache_entries": 1,
+          "graph_search_method": "cell",
+          "graph_edge_order": "original",
+          "torch_num_threads": null,
+          "edge_chunk_size": null,
+          "use_quaternion_wigner": true,
+          "base_precision_dtype": "float32",
+          "nitro": false,
+          "execution_mode": "general",
+          "predict_untrained_forces": [],
+          "predict_untrained_stress": [],
+          "predict_untrained_hessian": [],
+          "hessian_vmap": true,
+          "hessian_chunk_size": 64,
+          "requested_properties": null,
+          "auto_add_default_untrained_tasks": true,
+          "max_atoms": null,
+          "series_b": {
+            "gemm_precision": "fp32",
+            "low_precision_emulation": false,
+            "weight_bits": null,
+            "low_rank_fraction": null,
+            "saved_feature_dtype": null,
+            "saved_feature_min_elements": 1024,
+            "compensated_reduction": false,
+            "radial_table_points": null,
+            "radial_fast_exp": false,
+            "onednn_tf32": false
+          },
+          "_target_": "fairchem.core.units.mlip_unit.api.inference.InferenceSettings"
+        },
+        "approximation_manifest": {
+          "enabled": false
+        },
+        "cpu_low_precision_emulation": false,
+        "first_evaluation_seconds": 0.06569321400093031,
+        "warmup_evaluations": 1,
+        "timing": {
+          "repeats": 3,
+          "seconds": [
+            0.021907246999035124,
+            0.021027269000114757,
+            0.025112436998824705
+          ],
+          "median_seconds": 0.021907246999035124,
+          "mean_seconds": 0.02268231766599153,
+          "min_seconds": 0.021027269000114757,
+          "scope": "Private input copy, predictor call and selected-device synchronization; excludes loading, CPU output copies and validation"
+        },
+        "allocator_memory": null
+      },
+      "candidate": {
+        "device": "cpu",
+        "settings": {
+          "tf32": false,
+          "activation_checkpointing": false,
+          "merge_mole": true,
+          "compile": false,
+          "compile_scope": "model",
+          "compile_dynamic": true,
+          "xpu_graph": false,
+          "xpu_graph_cache_size": 1,
+          "mole_cache_size": 0,
+          "mole_cache_max_bytes": null,
+          "wigner_cuda": null,
+          "external_graph_gen": false,
+          "internal_graph_gen_version": 2,
+          "neighbor_skin": 0.0,
+          "neighbor_cache_entries": 1,
+          "graph_search_method": "cell",
+          "graph_edge_order": "original",
+          "torch_num_threads": null,
+          "edge_chunk_size": null,
+          "use_quaternion_wigner": true,
+          "base_precision_dtype": "float32",
+          "nitro": false,
+          "execution_mode": "general",
+          "predict_untrained_forces": [],
+          "predict_untrained_stress": [],
+          "predict_untrained_hessian": [],
+          "hessian_vmap": true,
+          "hessian_chunk_size": 64,
+          "requested_properties": null,
+          "auto_add_default_untrained_tasks": true,
+          "max_atoms": null,
+          "series_b": {
+            "gemm_precision": "fp32",
+            "low_precision_emulation": false,
+            "weight_bits": 8,
+            "low_rank_fraction": null,
+            "saved_feature_dtype": null,
+            "saved_feature_min_elements": 1024,
+            "compensated_reduction": false,
+            "radial_table_points": null,
+            "radial_fast_exp": false,
+            "onednn_tf32": false
+          },
+          "_target_": "fairchem.core.units.mlip_unit.api.inference.InferenceSettings"
+        },
+        "approximation_manifest": {
+          "enabled": true,
+          "backbone_only": true,
+          "linear": {
+            "active": true,
+            "effective": true,
+            "gemm_precision": "fp32",
+            "weight_bits": 8,
+            "low_rank_fraction": null,
+            "low_precision_emulation": false,
+            "exclude_patterns": [],
+            "coverage": "ordinary nn.Linear children only; no functional, fused or SO3 contractions",
+            "backward_precision": "fp32",
+            "converted": [
+              {
+                "names": [
+                  "mix_csd"
+                ],
+                "shape": [
+                  8,
+                  24
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 768,
+                "stored_weight_bytes": 224
+              },
+              {
+                "names": [
+                  "edge_degree_embedding.rad_func.net.0"
+                ],
+                "shape": [
+                  8,
+                  24
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 768,
+                "stored_weight_bytes": 224
+              },
+              {
+                "names": [
+                  "edge_degree_embedding.rad_func.net.3"
+                ],
+                "shape": [
+                  8,
+                  8
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 256,
+                "stored_weight_bytes": 96
+              },
+              {
+                "names": [
+                  "edge_degree_embedding.rad_func.net.6"
+                ],
+                "shape": [
+                  24,
+                  8
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 768,
+                "stored_weight_bytes": 288
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.fc_m0"
+                ],
+                "shape": [
+                  80,
+                  48
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 15360,
+                "stored_weight_bytes": 4160
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.so2_m_conv.0.fc"
+                ],
+                "shape": [
+                  64,
+                  32
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 8192,
+                "stored_weight_bytes": 2304
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.so2_m_conv.1.fc"
+                ],
+                "shape": [
+                  32,
+                  16
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 2048,
+                "stored_weight_bytes": 640
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.rad_func.net.0"
+                ],
+                "shape": [
+                  8,
+                  24
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 768,
+                "stored_weight_bytes": 224
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.rad_func.net.3"
+                ],
+                "shape": [
+                  8,
+                  8
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 256,
+                "stored_weight_bytes": 96
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.rad_func.net.6"
+                ],
+                "shape": [
+                  96,
+                  8
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 3072,
+                "stored_weight_bytes": 1152
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_2.fc_m0"
+                ],
+                "shape": [
+                  24,
+                  48
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 4608,
+                "stored_weight_bytes": 1248
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_2.so2_m_conv.0.fc"
+                ],
+                "shape": [
+                  32,
+                  32
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 4096,
+                "stored_weight_bytes": 1152
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_2.so2_m_conv.1.fc"
+                ],
+                "shape": [
+                  16,
+                  16
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 1024,
+                "stored_weight_bytes": 320
+              },
+              {
+                "names": [
+                  "blocks.0.atom_wise.grid_mlp.0"
+                ],
+                "shape": [
+                  16,
+                  8
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 512,
+                "stored_weight_bytes": 192
+              },
+              {
+                "names": [
+                  "blocks.0.atom_wise.grid_mlp.2"
+                ],
+                "shape": [
+                  16,
+                  16
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 1024,
+                "stored_weight_bytes": 320
+              },
+              {
+                "names": [
+                  "blocks.0.atom_wise.grid_mlp.4"
+                ],
+                "shape": [
+                  8,
+                  16
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 512,
+                "stored_weight_bytes": 160
+              }
+            ],
+            "skipped": [],
+            "original_weight_bytes": 44032,
+            "stored_weight_bytes": 12800,
+            "storage_accounting": "Per unique Linear module; excludes bias/workspaces and does not deduplicate tied parameter storage across distinct Linear modules.",
+            "warnings": [
+              "Experimental approximation; application energy/force/stress/curvature validation is required.",
+              "Forward finite checks synchronize accelerators; speedup is not guaranteed."
+            ]
+          },
+          "compensated_reduction": false,
+          "onednn_tf32": false
+        },
+        "cpu_low_precision_emulation": false,
+        "first_evaluation_seconds": 0.07226350599921716,
+        "warmup_evaluations": 1,
+        "timing": {
+          "repeats": 3,
+          "seconds": [
+            0.027775627000664826,
+            0.02415113800088875,
+            0.02369028800058004
+          ],
+          "median_seconds": 0.02415113800088875,
+          "mean_seconds": 0.025205684334044538,
+          "min_seconds": 0.02369028800058004,
+          "scope": "Private input copy, predictor call and selected-device synchronization; excludes loading, CPU output copies and validation"
+        },
+        "allocator_memory": null
+      },
+      "errors": {
+        "energy": {
+          "unit": "eV",
+          "shape": [],
+          "max_absolute_error": 0.00010791793465614319,
+          "rms_error": 0.00010791793465614319,
+          "error_l2_norm": 0.00010791793465614319,
+          "reference_l2_norm": 0.0761813297867775,
+          "reference_rms": 0.0761813297867775,
+          "relative_l2_error": 0.0014165929494561553
+        },
+        "forces": {
+          "unit": "eV/angstrom",
+          "shape": [
+            3,
+            3
+          ],
+          "max_absolute_error": 3.2434239983558655e-05,
+          "rms_error": 1.5371385898714915e-05,
+          "error_l2_norm": 4.611415769614475e-05,
+          "reference_l2_norm": 0.011437177600951256,
+          "reference_rms": 0.0038123925336504185,
+          "relative_l2_error": 0.004031952576508852
+        },
+        "stress": {
+          "unit": "eV/angstrom^3",
+          "shape": [
+            3,
+            3
+          ],
+          "max_absolute_error": 9.669747669249773e-08,
+          "rms_error": 3.226776923229964e-08,
+          "error_l2_norm": 9.68033076968989e-08,
+          "reference_l2_norm": 2.1516445389433124e-05,
+          "reference_rms": 7.172148463144375e-06,
+          "relative_l2_error": 0.004499038105264343
+        },
+        "hessian": {
+          "unit": "eV/angstrom^2",
+          "shape": [
+            9,
+            9
+          ],
+          "max_absolute_error": 0.00013460777699947357,
+          "rms_error": 4.051401393509185e-05,
+          "error_l2_norm": 0.00036462612541582665,
+          "reference_l2_norm": 0.03095886380181898,
+          "reference_rms": 0.0034398737557576643,
+          "relative_l2_error": 0.011777761863289155
+        }
+      },
+      "reference_over_candidate_median_time": 0.9070896368622029,
+      "memory_scope": "Preloaded predictors: both models and unrelated process allocations are included. PyTorch device allocator only; CPU and external library allocations are excluded."
+    },
+    "int4": {
+      "success": true,
+      "finite": true,
+      "accuracy_qualified": false,
+      "qualification_note": "No application-specific error thresholds, force finite differences or trajectory validation were applied; this is a single-structure comparison.",
+      "environment": {
+        "python": "3.12.14",
+        "torch": "2.15.0+cpu",
+        "fairchem_core": "0.1.dev1530+gb8c49cda5",
+        "ase": "3.29.0",
+        "device": "cpu",
+        "device_name": "x86_64"
+      },
+      "reference": {
+        "device": "cpu",
+        "settings": {
+          "tf32": false,
+          "activation_checkpointing": false,
+          "merge_mole": true,
+          "compile": false,
+          "compile_scope": "model",
+          "compile_dynamic": true,
+          "xpu_graph": false,
+          "xpu_graph_cache_size": 1,
+          "mole_cache_size": 0,
+          "mole_cache_max_bytes": null,
+          "wigner_cuda": null,
+          "external_graph_gen": false,
+          "internal_graph_gen_version": 2,
+          "neighbor_skin": 0.0,
+          "neighbor_cache_entries": 1,
+          "graph_search_method": "cell",
+          "graph_edge_order": "original",
+          "torch_num_threads": null,
+          "edge_chunk_size": null,
+          "use_quaternion_wigner": true,
+          "base_precision_dtype": "float32",
+          "nitro": false,
+          "execution_mode": "general",
+          "predict_untrained_forces": [],
+          "predict_untrained_stress": [],
+          "predict_untrained_hessian": [],
+          "hessian_vmap": true,
+          "hessian_chunk_size": 64,
+          "requested_properties": null,
+          "auto_add_default_untrained_tasks": true,
+          "max_atoms": null,
+          "series_b": {
+            "gemm_precision": "fp32",
+            "low_precision_emulation": false,
+            "weight_bits": null,
+            "low_rank_fraction": null,
+            "saved_feature_dtype": null,
+            "saved_feature_min_elements": 1024,
+            "compensated_reduction": false,
+            "radial_table_points": null,
+            "radial_fast_exp": false,
+            "onednn_tf32": false
+          },
+          "_target_": "fairchem.core.units.mlip_unit.api.inference.InferenceSettings"
+        },
+        "approximation_manifest": {
+          "enabled": false
+        },
+        "cpu_low_precision_emulation": false,
+        "first_evaluation_seconds": 0.06828382300045632,
+        "warmup_evaluations": 1,
+        "timing": {
+          "repeats": 3,
+          "seconds": [
+            0.02225958700000774,
+            0.019883250000930275,
+            0.01813036400017154
+          ],
+          "median_seconds": 0.019883250000930275,
+          "mean_seconds": 0.02009106700036985,
+          "min_seconds": 0.01813036400017154,
+          "scope": "Private input copy, predictor call and selected-device synchronization; excludes loading, CPU output copies and validation"
+        },
+        "allocator_memory": null
+      },
+      "candidate": {
+        "device": "cpu",
+        "settings": {
+          "tf32": false,
+          "activation_checkpointing": false,
+          "merge_mole": true,
+          "compile": false,
+          "compile_scope": "model",
+          "compile_dynamic": true,
+          "xpu_graph": false,
+          "xpu_graph_cache_size": 1,
+          "mole_cache_size": 0,
+          "mole_cache_max_bytes": null,
+          "wigner_cuda": null,
+          "external_graph_gen": false,
+          "internal_graph_gen_version": 2,
+          "neighbor_skin": 0.0,
+          "neighbor_cache_entries": 1,
+          "graph_search_method": "cell",
+          "graph_edge_order": "original",
+          "torch_num_threads": null,
+          "edge_chunk_size": null,
+          "use_quaternion_wigner": true,
+          "base_precision_dtype": "float32",
+          "nitro": false,
+          "execution_mode": "general",
+          "predict_untrained_forces": [],
+          "predict_untrained_stress": [],
+          "predict_untrained_hessian": [],
+          "hessian_vmap": true,
+          "hessian_chunk_size": 64,
+          "requested_properties": null,
+          "auto_add_default_untrained_tasks": true,
+          "max_atoms": null,
+          "series_b": {
+            "gemm_precision": "fp32",
+            "low_precision_emulation": false,
+            "weight_bits": 4,
+            "low_rank_fraction": null,
+            "saved_feature_dtype": null,
+            "saved_feature_min_elements": 1024,
+            "compensated_reduction": false,
+            "radial_table_points": null,
+            "radial_fast_exp": false,
+            "onednn_tf32": false
+          },
+          "_target_": "fairchem.core.units.mlip_unit.api.inference.InferenceSettings"
+        },
+        "approximation_manifest": {
+          "enabled": true,
+          "backbone_only": true,
+          "linear": {
+            "active": true,
+            "effective": true,
+            "gemm_precision": "fp32",
+            "weight_bits": 4,
+            "low_rank_fraction": null,
+            "low_precision_emulation": false,
+            "exclude_patterns": [],
+            "coverage": "ordinary nn.Linear children only; no functional, fused or SO3 contractions",
+            "backward_precision": "fp32",
+            "converted": [
+              {
+                "names": [
+                  "mix_csd"
+                ],
+                "shape": [
+                  8,
+                  24
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 768,
+                "stored_weight_bytes": 128
+              },
+              {
+                "names": [
+                  "edge_degree_embedding.rad_func.net.0"
+                ],
+                "shape": [
+                  8,
+                  24
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 768,
+                "stored_weight_bytes": 128
+              },
+              {
+                "names": [
+                  "edge_degree_embedding.rad_func.net.3"
+                ],
+                "shape": [
+                  8,
+                  8
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 256,
+                "stored_weight_bytes": 64
+              },
+              {
+                "names": [
+                  "edge_degree_embedding.rad_func.net.6"
+                ],
+                "shape": [
+                  24,
+                  8
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 768,
+                "stored_weight_bytes": 192
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.fc_m0"
+                ],
+                "shape": [
+                  80,
+                  48
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 15360,
+                "stored_weight_bytes": 2240
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.so2_m_conv.0.fc"
+                ],
+                "shape": [
+                  64,
+                  32
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 8192,
+                "stored_weight_bytes": 1280
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.so2_m_conv.1.fc"
+                ],
+                "shape": [
+                  32,
+                  16
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 2048,
+                "stored_weight_bytes": 384
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.rad_func.net.0"
+                ],
+                "shape": [
+                  8,
+                  24
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 768,
+                "stored_weight_bytes": 128
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.rad_func.net.3"
+                ],
+                "shape": [
+                  8,
+                  8
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 256,
+                "stored_weight_bytes": 64
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.rad_func.net.6"
+                ],
+                "shape": [
+                  96,
+                  8
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 3072,
+                "stored_weight_bytes": 768
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_2.fc_m0"
+                ],
+                "shape": [
+                  24,
+                  48
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 4608,
+                "stored_weight_bytes": 672
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_2.so2_m_conv.0.fc"
+                ],
+                "shape": [
+                  32,
+                  32
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 4096,
+                "stored_weight_bytes": 640
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_2.so2_m_conv.1.fc"
+                ],
+                "shape": [
+                  16,
+                  16
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 1024,
+                "stored_weight_bytes": 192
+              },
+              {
+                "names": [
+                  "blocks.0.atom_wise.grid_mlp.0"
+                ],
+                "shape": [
+                  16,
+                  8
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 512,
+                "stored_weight_bytes": 128
+              },
+              {
+                "names": [
+                  "blocks.0.atom_wise.grid_mlp.2"
+                ],
+                "shape": [
+                  16,
+                  16
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 1024,
+                "stored_weight_bytes": 192
+              },
+              {
+                "names": [
+                  "blocks.0.atom_wise.grid_mlp.4"
+                ],
+                "shape": [
+                  8,
+                  16
+                ],
+                "rank": null,
+                "retained_singular_energy": null,
+                "original_weight_bytes": 512,
+                "stored_weight_bytes": 96
+              }
+            ],
+            "skipped": [],
+            "original_weight_bytes": 44032,
+            "stored_weight_bytes": 7296,
+            "storage_accounting": "Per unique Linear module; excludes bias/workspaces and does not deduplicate tied parameter storage across distinct Linear modules.",
+            "warnings": [
+              "Experimental approximation; application energy/force/stress/curvature validation is required.",
+              "Forward finite checks synchronize accelerators; speedup is not guaranteed."
+            ]
+          },
+          "compensated_reduction": false,
+          "onednn_tf32": false
+        },
+        "cpu_low_precision_emulation": false,
+        "first_evaluation_seconds": 0.06833314599862206,
+        "warmup_evaluations": 1,
+        "timing": {
+          "repeats": 3,
+          "seconds": [
+            0.02954212399890821,
+            0.03196789399953559,
+            0.030370967000635574
+          ],
+          "median_seconds": 0.030370967000635574,
+          "mean_seconds": 0.030626994999693125,
+          "min_seconds": 0.02954212399890821,
+          "scope": "Private input copy, predictor call and selected-device synchronization; excludes loading, CPU output copies and validation"
+        },
+        "allocator_memory": null
+      },
+      "errors": {
+        "energy": {
+          "unit": "eV",
+          "shape": [],
+          "max_absolute_error": 0.0006587468087673187,
+          "rms_error": 0.0006587468087673187,
+          "error_l2_norm": 0.0006587468087673187,
+          "reference_l2_norm": 0.0761813297867775,
+          "reference_rms": 0.0761813297867775,
+          "relative_l2_error": 0.00864708991837072
+        },
+        "forces": {
+          "unit": "eV/angstrom",
+          "shape": [
+            3,
+            3
+          ],
+          "max_absolute_error": 0.0007789474911987782,
+          "rms_error": 0.00044229383552754246,
+          "error_l2_norm": 0.0013268815065826274,
+          "reference_l2_norm": 0.011437177600951256,
+          "reference_rms": 0.0038123925336504185,
+          "relative_l2_error": 0.116014768055387
+        },
+        "stress": {
+          "unit": "eV/angstrom^3",
+          "shape": [
+            3,
+            3
+          ],
+          "max_absolute_error": 2.3223528842208907e-06,
+          "rms_error": 8.088443964478497e-07,
+          "error_l2_norm": 2.4265331893435493e-06,
+          "reference_l2_norm": 2.1516445389433124e-05,
+          "reference_rms": 7.172148463144375e-06,
+          "relative_l2_error": 0.11277574643138949
+        },
+        "hessian": {
+          "unit": "eV/angstrom^2",
+          "shape": [
+            9,
+            9
+          ],
+          "max_absolute_error": 0.0015488211065530777,
+          "rms_error": 0.00046310368536424016,
+          "error_l2_norm": 0.004167933168278161,
+          "reference_l2_norm": 0.03095886380181898,
+          "reference_rms": 0.0034398737557576643,
+          "relative_l2_error": 0.13462810505446504
+        }
+      },
+      "reference_over_candidate_median_time": 0.6546795168067641,
+      "memory_scope": "Preloaded predictors: both models and unrelated process allocations are included. PyTorch device allocator only; CPU and external library allocations are excluded."
+    },
+    "low_rank": {
+      "success": true,
+      "finite": true,
+      "accuracy_qualified": false,
+      "qualification_note": "No application-specific error thresholds, force finite differences or trajectory validation were applied; this is a single-structure comparison.",
+      "environment": {
+        "python": "3.12.14",
+        "torch": "2.15.0+cpu",
+        "fairchem_core": "0.1.dev1530+gb8c49cda5",
+        "ase": "3.29.0",
+        "device": "cpu",
+        "device_name": "x86_64"
+      },
+      "reference": {
+        "device": "cpu",
+        "settings": {
+          "tf32": false,
+          "activation_checkpointing": false,
+          "merge_mole": true,
+          "compile": false,
+          "compile_scope": "model",
+          "compile_dynamic": true,
+          "xpu_graph": false,
+          "xpu_graph_cache_size": 1,
+          "mole_cache_size": 0,
+          "mole_cache_max_bytes": null,
+          "wigner_cuda": null,
+          "external_graph_gen": false,
+          "internal_graph_gen_version": 2,
+          "neighbor_skin": 0.0,
+          "neighbor_cache_entries": 1,
+          "graph_search_method": "cell",
+          "graph_edge_order": "original",
+          "torch_num_threads": null,
+          "edge_chunk_size": null,
+          "use_quaternion_wigner": true,
+          "base_precision_dtype": "float32",
+          "nitro": false,
+          "execution_mode": "general",
+          "predict_untrained_forces": [],
+          "predict_untrained_stress": [],
+          "predict_untrained_hessian": [],
+          "hessian_vmap": true,
+          "hessian_chunk_size": 64,
+          "requested_properties": null,
+          "auto_add_default_untrained_tasks": true,
+          "max_atoms": null,
+          "series_b": {
+            "gemm_precision": "fp32",
+            "low_precision_emulation": false,
+            "weight_bits": null,
+            "low_rank_fraction": null,
+            "saved_feature_dtype": null,
+            "saved_feature_min_elements": 1024,
+            "compensated_reduction": false,
+            "radial_table_points": null,
+            "radial_fast_exp": false,
+            "onednn_tf32": false
+          },
+          "_target_": "fairchem.core.units.mlip_unit.api.inference.InferenceSettings"
+        },
+        "approximation_manifest": {
+          "enabled": false
+        },
+        "cpu_low_precision_emulation": false,
+        "first_evaluation_seconds": 0.07495782600017264,
+        "warmup_evaluations": 1,
+        "timing": {
+          "repeats": 3,
+          "seconds": [
+            0.023016684999674908,
+            0.021605201000056695,
+            0.02128687200092827
+          ],
+          "median_seconds": 0.021605201000056695,
+          "mean_seconds": 0.02196958600021996,
+          "min_seconds": 0.02128687200092827,
+          "scope": "Private input copy, predictor call and selected-device synchronization; excludes loading, CPU output copies and validation"
+        },
+        "allocator_memory": null
+      },
+      "candidate": {
+        "device": "cpu",
+        "settings": {
+          "tf32": false,
+          "activation_checkpointing": false,
+          "merge_mole": true,
+          "compile": false,
+          "compile_scope": "model",
+          "compile_dynamic": true,
+          "xpu_graph": false,
+          "xpu_graph_cache_size": 1,
+          "mole_cache_size": 0,
+          "mole_cache_max_bytes": null,
+          "wigner_cuda": null,
+          "external_graph_gen": false,
+          "internal_graph_gen_version": 2,
+          "neighbor_skin": 0.0,
+          "neighbor_cache_entries": 1,
+          "graph_search_method": "cell",
+          "graph_edge_order": "original",
+          "torch_num_threads": null,
+          "edge_chunk_size": null,
+          "use_quaternion_wigner": true,
+          "base_precision_dtype": "float32",
+          "nitro": false,
+          "execution_mode": "general",
+          "predict_untrained_forces": [],
+          "predict_untrained_stress": [],
+          "predict_untrained_hessian": [],
+          "hessian_vmap": true,
+          "hessian_chunk_size": 64,
+          "requested_properties": null,
+          "auto_add_default_untrained_tasks": true,
+          "max_atoms": null,
+          "series_b": {
+            "gemm_precision": "fp32",
+            "low_precision_emulation": false,
+            "weight_bits": null,
+            "low_rank_fraction": 0.25,
+            "saved_feature_dtype": null,
+            "saved_feature_min_elements": 1024,
+            "compensated_reduction": false,
+            "radial_table_points": null,
+            "radial_fast_exp": false,
+            "onednn_tf32": false
+          },
+          "_target_": "fairchem.core.units.mlip_unit.api.inference.InferenceSettings"
+        },
+        "approximation_manifest": {
+          "enabled": true,
+          "backbone_only": true,
+          "linear": {
+            "active": true,
+            "effective": true,
+            "gemm_precision": "fp32",
+            "weight_bits": null,
+            "low_rank_fraction": 0.25,
+            "low_precision_emulation": false,
+            "exclude_patterns": [],
+            "coverage": "ordinary nn.Linear children only; no functional, fused or SO3 contractions",
+            "backward_precision": "fp32",
+            "converted": [
+              {
+                "names": [
+                  "mix_csd"
+                ],
+                "shape": [
+                  8,
+                  24
+                ],
+                "rank": 2,
+                "retained_singular_energy": 0.4614464314122879,
+                "original_weight_bytes": 768,
+                "stored_weight_bytes": 256
+              },
+              {
+                "names": [
+                  "edge_degree_embedding.rad_func.net.0"
+                ],
+                "shape": [
+                  8,
+                  24
+                ],
+                "rank": 2,
+                "retained_singular_energy": 0.44707430335634035,
+                "original_weight_bytes": 768,
+                "stored_weight_bytes": 256
+              },
+              {
+                "names": [
+                  "edge_degree_embedding.rad_func.net.3"
+                ],
+                "shape": [
+                  8,
+                  8
+                ],
+                "rank": 2,
+                "retained_singular_energy": 0.5963221861494129,
+                "original_weight_bytes": 256,
+                "stored_weight_bytes": 128
+              },
+              {
+                "names": [
+                  "edge_degree_embedding.rad_func.net.6"
+                ],
+                "shape": [
+                  24,
+                  8
+                ],
+                "rank": 2,
+                "retained_singular_energy": 0.3989587225040975,
+                "original_weight_bytes": 768,
+                "stored_weight_bytes": 256
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.fc_m0"
+                ],
+                "shape": [
+                  80,
+                  48
+                ],
+                "rank": 12,
+                "retained_singular_energy": 0.519917198267896,
+                "original_weight_bytes": 15360,
+                "stored_weight_bytes": 6144
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.so2_m_conv.0.fc"
+                ],
+                "shape": [
+                  64,
+                  32
+                ],
+                "rank": 8,
+                "retained_singular_energy": 0.5066215459388763,
+                "original_weight_bytes": 8192,
+                "stored_weight_bytes": 3072
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.so2_m_conv.1.fc"
+                ],
+                "shape": [
+                  32,
+                  16
+                ],
+                "rank": 4,
+                "retained_singular_energy": 0.5121288767490326,
+                "original_weight_bytes": 2048,
+                "stored_weight_bytes": 768
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.rad_func.net.0"
+                ],
+                "shape": [
+                  8,
+                  24
+                ],
+                "rank": 2,
+                "retained_singular_energy": 0.4771294486125244,
+                "original_weight_bytes": 768,
+                "stored_weight_bytes": 256
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.rad_func.net.3"
+                ],
+                "shape": [
+                  8,
+                  8
+                ],
+                "rank": 2,
+                "retained_singular_energy": 0.5529783515305268,
+                "original_weight_bytes": 256,
+                "stored_weight_bytes": 128
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_1.rad_func.net.6"
+                ],
+                "shape": [
+                  96,
+                  8
+                ],
+                "rank": 2,
+                "retained_singular_energy": 0.35046047367697714,
+                "original_weight_bytes": 3072,
+                "stored_weight_bytes": 832
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_2.fc_m0"
+                ],
+                "shape": [
+                  24,
+                  48
+                ],
+                "rank": 6,
+                "retained_singular_energy": 0.5081801776224729,
+                "original_weight_bytes": 4608,
+                "stored_weight_bytes": 1728
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_2.so2_m_conv.0.fc"
+                ],
+                "shape": [
+                  32,
+                  32
+                ],
+                "rank": 8,
+                "retained_singular_energy": 0.6179146561694951,
+                "original_weight_bytes": 4096,
+                "stored_weight_bytes": 2048
+              },
+              {
+                "names": [
+                  "blocks.0.edge_wise.so2_conv_2.so2_m_conv.1.fc"
+                ],
+                "shape": [
+                  16,
+                  16
+                ],
+                "rank": 4,
+                "retained_singular_energy": 0.6308469954781349,
+                "original_weight_bytes": 1024,
+                "stored_weight_bytes": 512
+              },
+              {
+                "names": [
+                  "blocks.0.atom_wise.grid_mlp.0"
+                ],
+                "shape": [
+                  16,
+                  8
+                ],
+                "rank": 2,
+                "retained_singular_energy": 0.46501673690592116,
+                "original_weight_bytes": 512,
+                "stored_weight_bytes": 192
+              },
+              {
+                "names": [
+                  "blocks.0.atom_wise.grid_mlp.2"
+                ],
+                "shape": [
+                  16,
+                  16
+                ],
+                "rank": 4,
+                "retained_singular_energy": 0.5990055887093129,
+                "original_weight_bytes": 1024,
+                "stored_weight_bytes": 512
+              },
+              {
+                "names": [
+                  "blocks.0.atom_wise.grid_mlp.4"
+                ],
+                "shape": [
+                  8,
+                  16
+                ],
+                "rank": 2,
+                "retained_singular_energy": 0.4865935103448601,
+                "original_weight_bytes": 512,
+                "stored_weight_bytes": 192
+              }
+            ],
+            "skipped": [],
+            "original_weight_bytes": 44032,
+            "stored_weight_bytes": 17280,
+            "storage_accounting": "Per unique Linear module; excludes bias/workspaces and does not deduplicate tied parameter storage across distinct Linear modules.",
+            "warnings": [
+              "Experimental approximation; application energy/force/stress/curvature validation is required.",
+              "Forward finite checks synchronize accelerators; speedup is not guaranteed.",
+              "SVD truncation is not a retrained compressed checkpoint."
+            ]
+          },
+          "compensated_reduction": false,
+          "onednn_tf32": false
+        },
+        "cpu_low_precision_emulation": false,
+        "first_evaluation_seconds": 0.07764277800015407,
+        "warmup_evaluations": 1,
+        "timing": {
+          "repeats": 3,
+          "seconds": [
+            0.02155088200015598,
+            0.021705489998566918,
+            0.023448853000445524
+          ],
+          "median_seconds": 0.021705489998566918,
+          "mean_seconds": 0.02223507499972281,
+          "min_seconds": 0.02155088200015598,
+          "scope": "Private input copy, predictor call and selected-device synchronization; excludes loading, CPU output copies and validation"
+        },
+        "allocator_memory": null
+      },
+      "errors": {
+        "energy": {
+          "unit": "eV",
+          "shape": [],
+          "max_absolute_error": 0.05785346403717995,
+          "rms_error": 0.05785346403717995,
+          "error_l2_norm": 0.05785346403717995,
+          "reference_l2_norm": 0.0761813297867775,
+          "reference_rms": 0.0761813297867775,
+          "relative_l2_error": 0.7594178809835025
+        },
+        "forces": {
+          "unit": "eV/angstrom",
+          "shape": [
+            3,
+            3
+          ],
+          "max_absolute_error": 0.008788176462985575,
+          "rms_error": 0.004713966283694782,
+          "error_l2_norm": 0.014141898851084345,
+          "reference_l2_norm": 0.011437177600951256,
+          "reference_rms": 0.0038123925336504185,
+          "relative_l2_error": 1.2364850266824685
+        },
+        "stress": {
+          "unit": "eV/angstrom^3",
+          "shape": [
+            3,
+            3
+          ],
+          "max_absolute_error": 2.6201089667665656e-05,
+          "rms_error": 8.991780745970136e-06,
+          "error_l2_norm": 2.6975342237910407e-05,
+          "reference_l2_norm": 2.1516445389433124e-05,
+          "reference_rms": 7.172148463144375e-06,
+          "relative_l2_error": 1.2537081171947753
+        },
+        "hessian": {
+          "unit": "eV/angstrom^2",
+          "shape": [
+            9,
+            9
+          ],
+          "max_absolute_error": 0.015607236418873072,
+          "rms_error": 0.004267756268552276,
+          "error_l2_norm": 0.03840980641697048,
+          "reference_l2_norm": 0.03095886380181898,
+          "reference_rms": 0.0034398737557576643,
+          "relative_l2_error": 1.2406723535737032
+        }
+      },
+      "reference_over_candidate_median_time": 0.9953795561161326,
+      "memory_scope": "Preloaded predictors: both models and unrelated process allocations are included. PyTorch device allocator only; CPU and external library allocations are excluded."
+    },
+    "saved_bf16": {
+      "success": true,
+      "finite": true,
+      "accuracy_qualified": false,
+      "qualification_note": "No application-specific error thresholds, force finite differences or trajectory validation were applied; this is a single-structure comparison.",
+      "environment": {
+        "python": "3.12.14",
+        "torch": "2.15.0+cpu",
+        "fairchem_core": "0.1.dev1530+gb8c49cda5",
+        "ase": "3.29.0",
+        "device": "cpu",
+        "device_name": "x86_64"
+      },
+      "reference": {
+        "device": "cpu",
+        "settings": {
+          "tf32": false,
+          "activation_checkpointing": false,
+          "merge_mole": true,
+          "compile": false,
+          "compile_scope": "model",
+          "compile_dynamic": true,
+          "xpu_graph": false,
+          "xpu_graph_cache_size": 1,
+          "mole_cache_size": 0,
+          "mole_cache_max_bytes": null,
+          "wigner_cuda": null,
+          "external_graph_gen": false,
+          "internal_graph_gen_version": 2,
+          "neighbor_skin": 0.0,
+          "neighbor_cache_entries": 1,
+          "graph_search_method": "cell",
+          "graph_edge_order": "original",
+          "torch_num_threads": null,
+          "edge_chunk_size": null,
+          "use_quaternion_wigner": true,
+          "base_precision_dtype": "float32",
+          "nitro": false,
+          "execution_mode": "general",
+          "predict_untrained_forces": [],
+          "predict_untrained_stress": [],
+          "predict_untrained_hessian": [],
+          "hessian_vmap": true,
+          "hessian_chunk_size": 64,
+          "requested_properties": null,
+          "auto_add_default_untrained_tasks": true,
+          "max_atoms": null,
+          "series_b": {
+            "gemm_precision": "fp32",
+            "low_precision_emulation": false,
+            "weight_bits": null,
+            "low_rank_fraction": null,
+            "saved_feature_dtype": null,
+            "saved_feature_min_elements": 1024,
+            "compensated_reduction": false,
+            "radial_table_points": null,
+            "radial_fast_exp": false,
+            "onednn_tf32": false
+          },
+          "_target_": "fairchem.core.units.mlip_unit.api.inference.InferenceSettings"
+        },
+        "approximation_manifest": {
+          "enabled": false
+        },
+        "cpu_low_precision_emulation": false,
+        "first_evaluation_seconds": 0.06513591699876997,
+        "warmup_evaluations": 1,
+        "timing": {
+          "repeats": 3,
+          "seconds": [
+            0.023277349000636605,
+            0.020909365999614238,
+            0.020413022000866476
+          ],
+          "median_seconds": 0.020909365999614238,
+          "mean_seconds": 0.021533245667039107,
+          "min_seconds": 0.020413022000866476,
+          "scope": "Private input copy, predictor call and selected-device synchronization; excludes loading, CPU output copies and validation"
+        },
+        "allocator_memory": null
+      },
+      "candidate": {
+        "device": "cpu",
+        "settings": {
+          "tf32": false,
+          "activation_checkpointing": false,
+          "merge_mole": true,
+          "compile": false,
+          "compile_scope": "model",
+          "compile_dynamic": true,
+          "xpu_graph": false,
+          "xpu_graph_cache_size": 1,
+          "mole_cache_size": 0,
+          "mole_cache_max_bytes": null,
+          "wigner_cuda": null,
+          "external_graph_gen": false,
+          "internal_graph_gen_version": 2,
+          "neighbor_skin": 0.0,
+          "neighbor_cache_entries": 1,
+          "graph_search_method": "cell",
+          "graph_edge_order": "original",
+          "torch_num_threads": null,
+          "edge_chunk_size": null,
+          "use_quaternion_wigner": true,
+          "base_precision_dtype": "float32",
+          "nitro": false,
+          "execution_mode": "general",
+          "predict_untrained_forces": [],
+          "predict_untrained_stress": [],
+          "predict_untrained_hessian": [],
+          "hessian_vmap": true,
+          "hessian_chunk_size": 64,
+          "requested_properties": null,
+          "auto_add_default_untrained_tasks": true,
+          "max_atoms": null,
+          "series_b": {
+            "gemm_precision": "fp32",
+            "low_precision_emulation": false,
+            "weight_bits": null,
+            "low_rank_fraction": null,
+            "saved_feature_dtype": "bf16",
+            "saved_feature_min_elements": 1,
+            "compensated_reduction": false,
+            "radial_table_points": null,
+            "radial_fast_exp": false,
+            "onednn_tf32": false
+          },
+          "_target_": "fairchem.core.units.mlip_unit.api.inference.InferenceSettings"
+        },
+        "approximation_manifest": {
+          "enabled": true,
+          "backbone_only": true,
+          "saved_features": {
+            "dtype": "bf16",
+            "min_elements": 1,
+            "module_count": 7,
+            "modules": [
+              "edge_degree_embedding.rad_func.net.2",
+              "edge_degree_embedding.rad_func.net.5",
+              "blocks.0.edge_wise.act",
+              "blocks.0.edge_wise.so2_conv_1.rad_func.net.2",
+              "blocks.0.edge_wise.so2_conv_1.rad_func.net.5",
+              "blocks.0.atom_wise.grid_mlp.1",
+              "blocks.0.atom_wise.grid_mlp.3"
+            ]
+          },
+          "compensated_reduction": false,
+          "onednn_tf32": false
+        },
+        "cpu_low_precision_emulation": false,
+        "first_evaluation_seconds": 0.06561160900128016,
+        "warmup_evaluations": 1,
+        "timing": {
+          "repeats": 3,
+          "seconds": [
+            0.022262151000177255,
+            0.022600349999265745,
+            0.02241219200004707
+          ],
+          "median_seconds": 0.02241219200004707,
+          "mean_seconds": 0.02242489766649669,
+          "min_seconds": 0.022262151000177255,
+          "scope": "Private input copy, predictor call and selected-device synchronization; excludes loading, CPU output copies and validation"
+        },
+        "allocator_memory": null
+      },
+      "errors": {
+        "energy": {
+          "unit": "eV",
+          "shape": [],
+          "max_absolute_error": 3.3527612686157227e-08,
+          "rms_error": 3.3527612686157227e-08,
+          "error_l2_norm": 3.3527612686157227e-08,
+          "reference_l2_norm": 0.0761813297867775,
+          "reference_rms": 0.0761813297867775,
+          "relative_l2_error": 4.40102749321875e-07
+        },
+        "forces": {
+          "unit": "eV/angstrom",
+          "shape": [
+            3,
+            3
+          ],
+          "max_absolute_error": 1.318473368883133e-05,
+          "rms_error": 7.198786223800852e-06,
+          "error_l2_norm": 2.1596358671402553e-05,
+          "reference_l2_norm": 0.011437177600951256,
+          "reference_rms": 0.0038123925336504185,
+          "relative_l2_error": 0.001888259448695309
+        },
+        "stress": {
+          "unit": "eV/angstrom^3",
+          "shape": [
+            3,
+            3
+          ],
+          "max_absolute_error": 3.0231603886932135e-08,
+          "rms_error": 1.1302683686275481e-08,
+          "error_l2_norm": 3.3908051058826446e-08,
+          "reference_l2_norm": 2.1516445389433124e-05,
+          "reference_rms": 7.172148463144375e-06,
+          "relative_l2_error": 0.0015759132349750914
+        },
+        "hessian": {
+          "unit": "eV/angstrom^2",
+          "shape": [
+            9,
+            9
+          ],
+          "max_absolute_error": 2.1647661924362183e-05,
+          "rms_error": 4.97922637817316e-06,
+          "error_l2_norm": 4.481303740355843e-05,
+          "reference_l2_norm": 0.03095886380181898,
+          "reference_rms": 0.0034398737557576643,
+          "relative_l2_error": 0.001447502650304804
+        }
+      },
+      "reference_over_candidate_median_time": 0.9329460500592858,
+      "memory_scope": "Preloaded predictors: both models and unrelated process allocations are included. PyTorch device allocator only; CPU and external library allocations are excluded."
+    },
+    "compensated": {
+      "success": true,
+      "finite": true,
+      "accuracy_qualified": false,
+      "qualification_note": "No application-specific error thresholds, force finite differences or trajectory validation were applied; this is a single-structure comparison.",
+      "environment": {
+        "python": "3.12.14",
+        "torch": "2.15.0+cpu",
+        "fairchem_core": "0.1.dev1530+gb8c49cda5",
+        "ase": "3.29.0",
+        "device": "cpu",
+        "device_name": "x86_64"
+      },
+      "reference": {
+        "device": "cpu",
+        "settings": {
+          "tf32": false,
+          "activation_checkpointing": false,
+          "merge_mole": true,
+          "compile": false,
+          "compile_scope": "model",
+          "compile_dynamic": true,
+          "xpu_graph": false,
+          "xpu_graph_cache_size": 1,
+          "mole_cache_size": 0,
+          "mole_cache_max_bytes": null,
+          "wigner_cuda": null,
+          "external_graph_gen": false,
+          "internal_graph_gen_version": 2,
+          "neighbor_skin": 0.0,
+          "neighbor_cache_entries": 1,
+          "graph_search_method": "cell",
+          "graph_edge_order": "original",
+          "torch_num_threads": null,
+          "edge_chunk_size": null,
+          "use_quaternion_wigner": true,
+          "base_precision_dtype": "float32",
+          "nitro": false,
+          "execution_mode": "general",
+          "predict_untrained_forces": [],
+          "predict_untrained_stress": [],
+          "predict_untrained_hessian": [],
+          "hessian_vmap": true,
+          "hessian_chunk_size": 64,
+          "requested_properties": null,
+          "auto_add_default_untrained_tasks": true,
+          "max_atoms": null,
+          "series_b": {
+            "gemm_precision": "fp32",
+            "low_precision_emulation": false,
+            "weight_bits": null,
+            "low_rank_fraction": null,
+            "saved_feature_dtype": null,
+            "saved_feature_min_elements": 1024,
+            "compensated_reduction": false,
+            "radial_table_points": null,
+            "radial_fast_exp": false,
+            "onednn_tf32": false
+          },
+          "_target_": "fairchem.core.units.mlip_unit.api.inference.InferenceSettings"
+        },
+        "approximation_manifest": {
+          "enabled": false
+        },
+        "cpu_low_precision_emulation": false,
+        "first_evaluation_seconds": 0.06196398700012651,
+        "warmup_evaluations": 1,
+        "timing": {
+          "repeats": 3,
+          "seconds": [
+            0.022270252999078366,
+            0.021342193998862058,
+            0.02062272200055304
+          ],
+          "median_seconds": 0.021342193998862058,
+          "mean_seconds": 0.021411722999497822,
+          "min_seconds": 0.02062272200055304,
+          "scope": "Private input copy, predictor call and selected-device synchronization; excludes loading, CPU output copies and validation"
+        },
+        "allocator_memory": null
+      },
+      "candidate": {
+        "device": "cpu",
+        "settings": {
+          "tf32": false,
+          "activation_checkpointing": false,
+          "merge_mole": true,
+          "compile": false,
+          "compile_scope": "model",
+          "compile_dynamic": true,
+          "xpu_graph": false,
+          "xpu_graph_cache_size": 1,
+          "mole_cache_size": 0,
+          "mole_cache_max_bytes": null,
+          "wigner_cuda": null,
+          "external_graph_gen": false,
+          "internal_graph_gen_version": 2,
+          "neighbor_skin": 0.0,
+          "neighbor_cache_entries": 1,
+          "graph_search_method": "cell",
+          "graph_edge_order": "original",
+          "torch_num_threads": null,
+          "edge_chunk_size": null,
+          "use_quaternion_wigner": true,
+          "base_precision_dtype": "float32",
+          "nitro": false,
+          "execution_mode": "general",
+          "predict_untrained_forces": [],
+          "predict_untrained_stress": [],
+          "predict_untrained_hessian": [],
+          "hessian_vmap": true,
+          "hessian_chunk_size": 64,
+          "requested_properties": null,
+          "auto_add_default_untrained_tasks": true,
+          "max_atoms": null,
+          "series_b": {
+            "gemm_precision": "fp32",
+            "low_precision_emulation": false,
+            "weight_bits": null,
+            "low_rank_fraction": null,
+            "saved_feature_dtype": null,
+            "saved_feature_min_elements": 1024,
+            "compensated_reduction": true,
+            "radial_table_points": null,
+            "radial_fast_exp": false,
+            "onednn_tf32": false
+          },
+          "_target_": "fairchem.core.units.mlip_unit.api.inference.InferenceSettings"
+        },
+        "approximation_manifest": {
+          "enabled": true,
+          "backbone_only": true,
+          "compensated_reduction": true,
+          "onednn_tf32": false
+        },
+        "cpu_low_precision_emulation": false,
+        "first_evaluation_seconds": 0.0656183199989755,
+        "warmup_evaluations": 1,
+        "timing": {
+          "repeats": 3,
+          "seconds": [
+            0.02216401700025017,
+            0.022280667999439174,
+            0.023489252000217675
+          ],
+          "median_seconds": 0.022280667999439174,
+          "mean_seconds": 0.02264464566663567,
+          "min_seconds": 0.02216401700025017,
+          "scope": "Private input copy, predictor call and selected-device synchronization; excludes loading, CPU output copies and validation"
+        },
+        "allocator_memory": null
+      },
+      "errors": {
+        "energy": {
+          "unit": "eV",
+          "shape": [],
+          "max_absolute_error": 3.725290298461914e-08,
+          "rms_error": 3.725290298461914e-08,
+          "error_l2_norm": 3.725290298461914e-08,
+          "reference_l2_norm": 0.0761813297867775,
+          "reference_rms": 0.0761813297867775,
+          "relative_l2_error": 4.890030548020833e-07
+        },
+        "forces": {
+          "unit": "eV/angstrom",
+          "shape": [
+            3,
+            3
+          ],
+          "max_absolute_error": 2.3283064365386963e-09,
+          "rms_error": 1.0441436014830591e-09,
+          "error_l2_norm": 3.1324308044491774e-09,
+          "reference_l2_norm": 0.011437177600951256,
+          "reference_rms": 0.0038123925336504185,
+          "relative_l2_error": 2.738814516781348e-07
+        },
+        "stress": {
+          "unit": "eV/angstrom^3",
+          "shape": [
+            3,
+            3
+          ],
+          "max_absolute_error": 4.547473508864641e-12,
+          "rms_error": 1.7005750785354497e-12,
+          "error_l2_norm": 5.101725235606349e-12,
+          "reference_l2_norm": 2.1516445389433124e-05,
+          "reference_rms": 7.172148463144375e-06,
+          "relative_l2_error": 2.3710818135935418e-07
+        },
+        "hessian": {
+          "unit": "eV/angstrom^2",
+          "shape": [
+            9,
+            9
+          ],
+          "max_absolute_error": 3.4924596548080444e-09,
+          "rms_error": 1.13495050161661e-09,
+          "error_l2_norm": 1.021455451454949e-08,
+          "reference_l2_norm": 0.03095886380181898,
+          "reference_rms": 0.0034398737557576643,
+          "relative_l2_error": 3.2993957982234915e-07
+        }
+      },
+      "reference_over_candidate_median_time": 0.9578794495478888,
+      "memory_scope": "Preloaded predictors: both models and unrelated process allocations are included. PyTorch device allocator only; CPU and external library allocations are excluded."
+    },
+    "radial_fast_exp": {
+      "success": true,
+      "finite": true,
+      "accuracy_qualified": false,
+      "qualification_note": "No application-specific error thresholds, force finite differences or trajectory validation were applied; this is a single-structure comparison.",
+      "environment": {
+        "python": "3.12.14",
+        "torch": "2.15.0+cpu",
+        "fairchem_core": "0.1.dev1530+gb8c49cda5",
+        "ase": "3.29.0",
+        "device": "cpu",
+        "device_name": "x86_64"
+      },
+      "reference": {
+        "device": "cpu",
+        "settings": {
+          "tf32": false,
+          "activation_checkpointing": false,
+          "merge_mole": true,
+          "compile": false,
+          "compile_scope": "model",
+          "compile_dynamic": true,
+          "xpu_graph": false,
+          "xpu_graph_cache_size": 1,
+          "mole_cache_size": 0,
+          "mole_cache_max_bytes": null,
+          "wigner_cuda": null,
+          "external_graph_gen": false,
+          "internal_graph_gen_version": 2,
+          "neighbor_skin": 0.0,
+          "neighbor_cache_entries": 1,
+          "graph_search_method": "cell",
+          "graph_edge_order": "original",
+          "torch_num_threads": null,
+          "edge_chunk_size": null,
+          "use_quaternion_wigner": true,
+          "base_precision_dtype": "float32",
+          "nitro": false,
+          "execution_mode": "general",
+          "predict_untrained_forces": [],
+          "predict_untrained_stress": [],
+          "predict_untrained_hessian": [],
+          "hessian_vmap": true,
+          "hessian_chunk_size": 64,
+          "requested_properties": null,
+          "auto_add_default_untrained_tasks": true,
+          "max_atoms": null,
+          "series_b": {
+            "gemm_precision": "fp32",
+            "low_precision_emulation": false,
+            "weight_bits": null,
+            "low_rank_fraction": null,
+            "saved_feature_dtype": null,
+            "saved_feature_min_elements": 1024,
+            "compensated_reduction": false,
+            "radial_table_points": null,
+            "radial_fast_exp": false,
+            "onednn_tf32": false
+          },
+          "_target_": "fairchem.core.units.mlip_unit.api.inference.InferenceSettings"
+        },
+        "approximation_manifest": {
+          "enabled": false
+        },
+        "cpu_low_precision_emulation": false,
+        "first_evaluation_seconds": 0.10345530899940059,
+        "warmup_evaluations": 1,
+        "timing": {
+          "repeats": 3,
+          "seconds": [
+            0.03428135699869017,
+            0.02648872899953858,
+            0.035286710000946186
+          ],
+          "median_seconds": 0.03428135699869017,
+          "mean_seconds": 0.03201893199972498,
+          "min_seconds": 0.02648872899953858,
+          "scope": "Private input copy, predictor call and selected-device synchronization; excludes loading, CPU output copies and validation"
+        },
+        "allocator_memory": null
+      },
+      "candidate": {
+        "device": "cpu",
+        "settings": {
+          "tf32": false,
+          "activation_checkpointing": false,
+          "merge_mole": true,
+          "compile": false,
+          "compile_scope": "model",
+          "compile_dynamic": true,
+          "xpu_graph": false,
+          "xpu_graph_cache_size": 1,
+          "mole_cache_size": 0,
+          "mole_cache_max_bytes": null,
+          "wigner_cuda": null,
+          "external_graph_gen": false,
+          "internal_graph_gen_version": 2,
+          "neighbor_skin": 0.0,
+          "neighbor_cache_entries": 1,
+          "graph_search_method": "cell",
+          "graph_edge_order": "original",
+          "torch_num_threads": null,
+          "edge_chunk_size": null,
+          "use_quaternion_wigner": true,
+          "base_precision_dtype": "float32",
+          "nitro": false,
+          "execution_mode": "general",
+          "predict_untrained_forces": [],
+          "predict_untrained_stress": [],
+          "predict_untrained_hessian": [],
+          "hessian_vmap": true,
+          "hessian_chunk_size": 64,
+          "requested_properties": null,
+          "auto_add_default_untrained_tasks": true,
+          "max_atoms": null,
+          "series_b": {
+            "gemm_precision": "fp32",
+            "low_precision_emulation": false,
+            "weight_bits": null,
+            "low_rank_fraction": null,
+            "saved_feature_dtype": null,
+            "saved_feature_min_elements": 1024,
+            "compensated_reduction": false,
+            "radial_table_points": null,
+            "radial_fast_exp": true,
+            "onednn_tf32": false
+          },
+          "_target_": "fairchem.core.units.mlip_unit.api.inference.InferenceSettings"
+        },
+        "approximation_manifest": {
+          "enabled": true,
+          "backbone_only": true,
+          "radial": {
+            "radial_approximation": {
+              "target": "distance_expansion",
+              "kind": "local_exp",
+              "points": null,
+              "exact_fallback": true,
+              "smoothness": "C2"
+            }
+          },
+          "compensated_reduction": false,
+          "onednn_tf32": false
+        },
+        "cpu_low_precision_emulation": false,
+        "first_evaluation_seconds": 0.086207051999736,
+        "warmup_evaluations": 1,
+        "timing": {
+          "repeats": 3,
+          "seconds": [
+            0.021290376998877036,
+            0.02191335700081254,
+            0.02098400499926356
+          ],
+          "median_seconds": 0.021290376998877036,
+          "mean_seconds": 0.021395912999651046,
+          "min_seconds": 0.02098400499926356,
+          "scope": "Private input copy, predictor call and selected-device synchronization; excludes loading, CPU output copies and validation"
+        },
+        "allocator_memory": null
+      },
+      "errors": {
+        "energy": {
+          "unit": "eV",
+          "shape": [],
+          "max_absolute_error": 2.60770320892334e-08,
+          "rms_error": 2.60770320892334e-08,
+          "error_l2_norm": 2.60770320892334e-08,
+          "reference_l2_norm": 0.0761813297867775,
+          "reference_rms": 0.0761813297867775,
+          "relative_l2_error": 3.4230213836145835e-07
+        },
+        "forces": {
+          "unit": "eV/angstrom",
+          "shape": [
+            3,
+            3
+          ],
+          "max_absolute_error": 1.862645149230957e-09,
+          "rms_error": 8.265128144914874e-10,
+          "error_l2_norm": 2.479538443474462e-09,
+          "reference_l2_norm": 0.011437177600951256,
+          "reference_rms": 0.0038123925336504185,
+          "relative_l2_error": 2.1679635745695104e-07
+        },
+        "stress": {
+          "unit": "eV/angstrom^3",
+          "shape": [
+            3,
+            3
+          ],
+          "max_absolute_error": 2.0463630789890885e-12,
+          "rms_error": 9.036007819911518e-13,
+          "error_l2_norm": 2.7108023459734555e-12,
+          "reference_l2_norm": 2.1516445389433124e-05,
+          "reference_rms": 7.172148463144375e-06,
+          "relative_l2_error": 1.2598746200451628e-07
+        },
+        "hessian": {
+          "unit": "eV/angstrom^2",
+          "shape": [
+            9,
+            9
+          ],
+          "max_absolute_error": 6.51925802230835e-09,
+          "rms_error": 2.3919020997272755e-09,
+          "error_l2_norm": 2.152711889754548e-08,
+          "reference_l2_norm": 0.03095886380181898,
+          "reference_rms": 0.0034398737557576643,
+          "relative_l2_error": 6.95345896262532e-07
+        }
+      },
+      "reference_over_candidate_median_time": 1.610180834303608,
+      "memory_scope": "Preloaded predictors: both models and unrelated process allocations are included. PyTorch device allocator only; CPU and external library allocations are excluded."
+    },
+    "radial_table": {
+      "success": true,
+      "finite": true,
+      "accuracy_qualified": false,
+      "qualification_note": "No application-specific error thresholds, force finite differences or trajectory validation were applied; this is a single-structure comparison.",
+      "environment": {
+        "python": "3.12.14",
+        "torch": "2.15.0+cpu",
+        "fairchem_core": "0.1.dev1530+gb8c49cda5",
+        "ase": "3.29.0",
+        "device": "cpu",
+        "device_name": "x86_64"
+      },
+      "reference": {
+        "device": "cpu",
+        "settings": {
+          "tf32": false,
+          "activation_checkpointing": false,
+          "merge_mole": true,
+          "compile": false,
+          "compile_scope": "model",
+          "compile_dynamic": true,
+          "xpu_graph": false,
+          "xpu_graph_cache_size": 1,
+          "mole_cache_size": 0,
+          "mole_cache_max_bytes": null,
+          "wigner_cuda": null,
+          "external_graph_gen": false,
+          "internal_graph_gen_version": 2,
+          "neighbor_skin": 0.0,
+          "neighbor_cache_entries": 1,
+          "graph_search_method": "cell",
+          "graph_edge_order": "original",
+          "torch_num_threads": null,
+          "edge_chunk_size": null,
+          "use_quaternion_wigner": true,
+          "base_precision_dtype": "float32",
+          "nitro": false,
+          "execution_mode": "general",
+          "predict_untrained_forces": [],
+          "predict_untrained_stress": [],
+          "predict_untrained_hessian": [],
+          "hessian_vmap": true,
+          "hessian_chunk_size": 64,
+          "requested_properties": null,
+          "auto_add_default_untrained_tasks": true,
+          "max_atoms": null,
+          "series_b": {
+            "gemm_precision": "fp32",
+            "low_precision_emulation": false,
+            "weight_bits": null,
+            "low_rank_fraction": null,
+            "saved_feature_dtype": null,
+            "saved_feature_min_elements": 1024,
+            "compensated_reduction": false,
+            "radial_table_points": null,
+            "radial_fast_exp": false,
+            "onednn_tf32": false
+          },
+          "_target_": "fairchem.core.units.mlip_unit.api.inference.InferenceSettings"
+        },
+        "approximation_manifest": {
+          "enabled": false
+        },
+        "cpu_low_precision_emulation": false,
+        "first_evaluation_seconds": 0.06328750000102445,
+        "warmup_evaluations": 1,
+        "timing": {
+          "repeats": 3,
+          "seconds": [
+            0.018807903999913833,
+            0.020796539000002667,
+            0.02799647800020466
+          ],
+          "median_seconds": 0.020796539000002667,
+          "mean_seconds": 0.02253364033337372,
+          "min_seconds": 0.018807903999913833,
+          "scope": "Private input copy, predictor call and selected-device synchronization; excludes loading, CPU output copies and validation"
+        },
+        "allocator_memory": null
+      },
+      "candidate": {
+        "device": "cpu",
+        "settings": {
+          "tf32": false,
+          "activation_checkpointing": false,
+          "merge_mole": true,
+          "compile": false,
+          "compile_scope": "model",
+          "compile_dynamic": true,
+          "xpu_graph": false,
+          "xpu_graph_cache_size": 1,
+          "mole_cache_size": 0,
+          "mole_cache_max_bytes": null,
+          "wigner_cuda": null,
+          "external_graph_gen": false,
+          "internal_graph_gen_version": 2,
+          "neighbor_skin": 0.0,
+          "neighbor_cache_entries": 1,
+          "graph_search_method": "cell",
+          "graph_edge_order": "original",
+          "torch_num_threads": null,
+          "edge_chunk_size": null,
+          "use_quaternion_wigner": true,
+          "base_precision_dtype": "float32",
+          "nitro": false,
+          "execution_mode": "general",
+          "predict_untrained_forces": [],
+          "predict_untrained_stress": [],
+          "predict_untrained_hessian": [],
+          "hessian_vmap": true,
+          "hessian_chunk_size": 64,
+          "requested_properties": null,
+          "auto_add_default_untrained_tasks": true,
+          "max_atoms": null,
+          "series_b": {
+            "gemm_precision": "fp32",
+            "low_precision_emulation": false,
+            "weight_bits": null,
+            "low_rank_fraction": null,
+            "saved_feature_dtype": null,
+            "saved_feature_min_elements": 1024,
+            "compensated_reduction": false,
+            "radial_table_points": 257,
+            "radial_fast_exp": false,
+            "onednn_tf32": false
+          },
+          "_target_": "fairchem.core.units.mlip_unit.api.inference.InferenceSettings"
+        },
+        "approximation_manifest": {
+          "enabled": true,
+          "backbone_only": true,
+          "radial": {
+            "radial_approximation": {
+              "target": "distance_expansion",
+              "kind": "quintic_gaussian_table",
+              "points": 257,
+              "exact_fallback": true,
+              "smoothness": "C2"
+            }
+          },
+          "compensated_reduction": false,
+          "onednn_tf32": false
+        },
+        "cpu_low_precision_emulation": false,
+        "first_evaluation_seconds": 0.07329872300033458,
+        "warmup_evaluations": 1,
+        "timing": {
+          "repeats": 3,
+          "seconds": [
+            0.024903198000174598,
+            0.021079486001326586,
+            0.01999772999988636
+          ],
+          "median_seconds": 0.021079486001326586,
+          "mean_seconds": 0.02199347133379585,
+          "min_seconds": 0.01999772999988636,
+          "scope": "Private input copy, predictor call and selected-device synchronization; excludes loading, CPU output copies and validation"
+        },
+        "allocator_memory": null
+      },
+      "errors": {
+        "energy": {
+          "unit": "eV",
+          "shape": [],
+          "max_absolute_error": 0.0,
+          "rms_error": 0.0,
+          "error_l2_norm": 0.0,
+          "reference_l2_norm": 0.0761813297867775,
+          "reference_rms": 0.0761813297867775,
+          "relative_l2_error": 0.0
+        },
+        "forces": {
+          "unit": "eV/angstrom",
+          "shape": [
+            3,
+            3
+          ],
+          "max_absolute_error": 1.3969838619232178e-09,
+          "rms_error": 8.68268315916076e-10,
+          "error_l2_norm": 2.604804947748228e-09,
+          "reference_l2_norm": 0.011437177600951256,
+          "reference_rms": 0.0038123925336504185,
+          "relative_l2_error": 2.2774892885562786e-07
+        },
+        "stress": {
+          "unit": "eV/angstrom^3",
+          "shape": [
+            3,
+            3
+          ],
+          "max_absolute_error": 1.4132574572959557e-12,
+          "rms_error": 7.937272051277627e-13,
+          "error_l2_norm": 2.3811816153832877e-12,
+          "reference_l2_norm": 2.1516445389433124e-05,
+          "reference_rms": 7.172148463144375e-06,
+          "relative_l2_error": 1.1066798313036885e-07
+        },
+        "hessian": {
+          "unit": "eV/angstrom^2",
+          "shape": [
+            9,
+            9
+          ],
+          "max_absolute_error": 1.30385160446167e-08,
+          "rms_error": 3.4855681928084407e-09,
+          "error_l2_norm": 3.1370113735275965e-08,
+          "reference_l2_norm": 0.03095886380181898,
+          "reference_rms": 0.0034398737557576643,
+          "relative_l2_error": 1.0132837540837924e-06
+        }
+      },
+      "reference_over_candidate_median_time": 0.9865771394375502,
+      "memory_scope": "Preloaded predictors: both models and unrelated process allocations are included. PyTorch device allocator only; CPU and external library allocations are excluded."
+    }
+  }
+}

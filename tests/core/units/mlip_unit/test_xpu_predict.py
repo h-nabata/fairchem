@@ -143,8 +143,10 @@ def test_xpu_preset_reports_its_name():
 
 
 def test_xpu_inference_disables_and_restores_callers_autocast(monkeypatch):
+    precision = Mock(wraps=predict_module.tf32_context_manager)
+    monkeypatch.setattr(predict_module, "tf32_context_manager", precision)
     cuda_precision = Mock(side_effect=AssertionError("XPU must not touch CUDA TF32"))
-    monkeypatch.setattr(predict_module, "tf32_context_manager", cuda_precision)
+    monkeypatch.setattr(torch, "set_float32_matmul_precision", cuda_precision)
 
     class AutocastCheckingModel:
         module = SimpleNamespace(
@@ -165,6 +167,7 @@ def test_xpu_inference_disables_and_restores_callers_autocast(monkeypatch):
         result = predictor._run_inference(None, False)
         assert torch.is_autocast_enabled("xpu")
     assert result["energy"].dtype == torch.float32
+    precision.assert_called_once_with(False, device_type="xpu")
     cuda_precision.assert_not_called()
 
 

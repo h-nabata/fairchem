@@ -280,8 +280,21 @@ def test_portable_backend_full_uma_energy_force_stress(periodic):
         AtomicData.from_ase(atoms, task_name="omat"), inference_settings_xpu()
     )
     settings = replace(inference_settings_xpu(), execution_mode="umas_fast_portable")
+    # Loading normally applies execution_mode as a constructor override.
+    # prepare_for_inference alone does not change already constructed dispatch
+    # owners, and MOLE merging reconstructs the model from parent_kwargs.
+    for module in model.modules():
+        if hasattr(module, "backend"):
+            module.backend = get_execution_backend(settings.execution_mode)
+    model.parent_kwargs["execution_mode"] = settings.execution_mode
     candidate = model.prepare_for_inference(
         AtomicData.from_ase(atoms, task_name="omat"), settings
+    )
+    assert isinstance(candidate.backend, UMASFastPortableBackend)
+    assert all(
+        isinstance(module.backend, UMASFastPortableBackend)
+        for module in candidate.modules()
+        if hasattr(module, "backend")
     )
 
     def evaluate(backbone):
