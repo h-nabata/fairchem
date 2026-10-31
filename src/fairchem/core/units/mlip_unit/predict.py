@@ -14,6 +14,7 @@ import gc
 import logging
 import math
 import os
+import pickle
 import random
 import sys
 import threading
@@ -106,6 +107,7 @@ _AUXILIARY_LEVELS = {
     "hessian_vector_product": "atom",
     "embeddings": "atom",
 }
+_NITRO_PROPERTIES = frozenset({"energy", "forces", "stress"})
 
 _PREDICTOR_STATES = weakref.WeakKeyDictionary()
 _PREDICTOR_STATE_LOCK = threading.RLock()
@@ -478,6 +480,20 @@ def _checkpoint_model_name(model_config: dict) -> str:
     return "This checkpoint"
 
 
+def _same_prepared_settings(current: InferenceSettings, prepared: InferenceSettings):
+    """
+    Compare prepared policy without copying the configuration on every MD step.
+
+    Output selection is a per-call option; all other fields, including nested
+    Series B policy and mutable dataset sets, must still match the owned snapshot.
+    """
+    return all(
+        getattr(current, field.name) == getattr(prepared, field.name)
+        for field in dataclasses.fields(prepared)
+        if field.name != "requested_properties"
+    )
+
+
 class _ModelWrapper(torch.nn.Module):
     """
     Expose a model as ``.module``, like the ``AveragedModel`` that
@@ -488,8 +504,8 @@ class _ModelWrapper(torch.nn.Module):
         super().__init__()
         self.module = module
 
-    def forward(self, data: AtomicData) -> dict:
-        return self.module(data)
+    def forward(self, data: AtomicData, **kwargs) -> dict:
+        return self.module(data, **kwargs)
 
 
 class MLIPPredictUnitProtocol(Protocol):
@@ -597,6 +613,18 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         if self.inference_settings.nitro:
             before = copy.deepcopy(self.inference_settings)
             try:
+                requested = self.inference_settings.requested_properties
+                unsupported = (
+                    set(requested) - _NITRO_PROPERTIES
+                    if requested is not None
+                    else set()
+                )
+                if unsupported:
+                    self.inference_settings.execution_mode = ExecutionMode.GENERAL
+                    self.inference_settings.compile = False
+                    raise UMANitroNotSupportedError(
+                        f"Nitro cannot provide requested properties {sorted(unsupported)}"
+                    )
                 self._load_nitro_model(checkpoint)
             except UMANitroNotSupportedError as error:
                 logging.warning(f"UMA Nitro cannot serve this request: {error}.")
@@ -661,17 +689,28 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
             )
         if torch.device(self._requested_device).type != "cuda":
             raise UMANitroNotSupportedError("nitro mode requires a CUDA device")
-        try:
-            from fairchem.core.models.uma.uma_nitro import UMANitroModel
-        except ImportError as error:
+        if getattr(self, "_overrides", None):
+            # Nitro reconstructs a fixed architecture directly from checkpoint
+            # tensors; it cannot apply Hydra overrides such as a changed cutoff.
             raise UMANitroNotSupportedError(
-                f"nitro mode's kernels could not be imported ({error})"
-            ) from error
+                "Nitro cannot apply explicit model overrides; use Hydra inference"
+            )
+        # Nitro chooses its architecture-specific kernels on first import.
+        # An unrelated current GPU must not select kernels for another ordinal.
+        # This context changes neither the caller's default tensor device nor
+        # its current CUDA device after construction (including failed imports).
+        with torch.cuda.device(self.device):
+            try:
+                from fairchem.core.models.uma.uma_nitro import UMANitroModel
+            except ImportError as error:
+                raise UMANitroNotSupportedError(
+                    f"nitro mode's kernels could not be imported ({error})"
+                ) from error
 
-        UMANitroModel.validate(
-            self.inference_settings, self._inference_model_path, self._requested_device
-        )
-        self.model = _ModelWrapper(UMANitroModel.from_checkpoint(checkpoint))
+            UMANitroModel.validate(
+                self.inference_settings, self._inference_model_path, self.device
+            )
+            self.model = _ModelWrapper(UMANitroModel.from_checkpoint(checkpoint))
 
     def _fall_back_with(self, reason: str, **changes) -> None:
         """
@@ -1216,14 +1255,27 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         prepared_settings = getattr(
             self.model.module, "_prepared_inference_settings", None
         )
-        if self.lazy_model_intialized and prepared_settings is not None:
-            current = copy.deepcopy(self.inference_settings)
-            # Output selection is per-call and does not change prepared weights.
-            current.requested_properties = prepared_settings.requested_properties
-            if current != prepared_settings:
-                raise ValueError(
-                    "Inference settings cannot change after preparation; construct a new predictor. "
-                    "Use requested_properties for per-call output selection."
+        if (
+            self.lazy_model_intialized
+            and prepared_settings is not None
+            and not _same_prepared_settings(self.inference_settings, prepared_settings)
+        ):
+            raise ValueError(
+                "Inference settings cannot change after preparation; construct a new predictor. "
+                "Use requested_properties for per-call output selection."
+            )
+        if self.inference_settings.nitro and requested is not None:
+            unsupported = set(requested) - _NITRO_PROPERTIES
+            if unsupported:
+                # The normal Nitro -> multigpu fallback may choose custom CUDA
+                # backward operators without higher-order/vmap support. Select
+                # the general eager path before allocating Nitro graph buffers.
+                self._fall_back_with(
+                    "UMA Nitro cannot provide requested properties "
+                    f"{sorted(unsupported)}; selecting the general model.",
+                    nitro=False,
+                    execution_mode=ExecutionMode.GENERAL,
+                    compile=False,
                 )
         self._select_prepared_model(data)
         regress_config = getattr(self.model.module.backbone, "regress_config", None)
@@ -1286,9 +1338,31 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
                         )
                 return single_atom_result
 
+        # Nitro's merged contract only reads composition/task/charge/spin.
+        # Check CPU-origin metadata before uploading it: copying those fields
+        # to CUDA only to read them back on every ASE MD step adds host waits.
+        # The full owned input copy below is retained for model-side mutations.
+        nitro_checked = False
+        if self.inference_settings.nitro:
+            try:
+                self.model.module.on_predict_check(data)
+                nitro_checked = True
+            except MergeMoleConsistencyError as error:
+                self._fall_back(error)
+                self._initialize(data)
+
         dtype = self.inference_settings.base_precision_dtype
         if not self._warned_upcast:
             self._warned_upcast = warn_if_upcasting(data.pos.dtype, dtype)
+        inference_kwargs = {}
+        if self.inference_settings.nitro and hasattr(
+            self.model.module, "_cpu_geometry_key"
+        ):
+            # Keep this immutable capacity hint local to this request. Computing
+            # it before upload avoids reading CPU-origin geometry back from CUDA.
+            geometry_key = self.model.module._cpu_geometry_key(data, dtype)
+            if geometry_key is not None:
+                inference_kwargs["nitro_geometry_key"] = geometry_key
         # Keep the caller isolated from graph-parallel/MOLE mutations without
         # first retaining another full copy on the accelerator.
         data_device = _copy_data_to_device(data, self.device, dtype)
@@ -1298,17 +1372,20 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         _prepare_inference_gradients(self.model.module.backbone, data_device)
 
         # Model handles any per-prediction checks (e.g., MOLE consistency)
-        try:
-            self.model.module.on_predict_check(data_device)
-        except MergeMoleConsistencyError as error:
-            self._fall_back(error)
-            # The multigpu model re-merges for this input, or falls back further.
-            # _lazy_init prepares its own CPU copy even if data is already on GPU.
-            self._initialize(data)
-            self.model.module.on_predict_check(data_device)
+        if not nitro_checked:
+            try:
+                self.model.module.on_predict_check(data_device)
+            except MergeMoleConsistencyError as error:
+                self._fall_back(error)
+                # The multigpu model re-merges for this input, or falls back further.
+                # _lazy_init prepares its own CPU copy even if data is already on GPU.
+                self._initialize(data)
+                self.model.module.on_predict_check(data_device)
 
         try:
-            return self._run_inference(data_device, undo_element_references)
+            return self._run_inference(
+                data_device, undo_element_references, **inference_kwargs
+            )
         except UMANitroNotSupportedError as error:
             # e.g. a geometry whose radius graph outgrows Nitro's capacity.
             self._fall_back(error)
@@ -1432,7 +1509,9 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
             self._active_mole_key = key
             self._active_model_signature = model_tensor_signature(self.model)
 
-    def _run_inference(self, data: AtomicData, undo_refs: bool) -> dict:
+    def _run_inference(
+        self, data: AtomicData, undo_refs: bool, *, nitro_geometry_key=None
+    ) -> dict:
         """
         Execute model inference.
         """
@@ -1490,11 +1569,14 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
             precision_context = tf32_context_manager(
                 self.inference_settings.series_b.onednn_tf32, device_type="xpu"
             )
-        # Disable ambient autocast. Approximate modules choose their own operand
+        # Nitro kernels require their configured precision, independent of the
+        # caller's autocast scope. Approximate modules choose their own operand
         # precision, leaving geometry, normalization and heads in FP32.
         autocast_context = (
             torch.autocast(device_type, enabled=False)
-            if device_type == "xpu" or self.inference_settings.series_b.enabled
+            if device_type == "xpu"
+            or self.inference_settings.nitro
+            or self.inference_settings.series_b.enabled
             else nullcontext()
         )
         from fairchem.core.models.uma.nn.approximate_ops import approximate_ops_context
@@ -1508,7 +1590,10 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
             autocast_context,
             approximation_context,
         ):
-            output = inference_model(data)
+            if self.inference_settings.nitro and nitro_geometry_key is not None:
+                output = inference_model(data, geometry_key=nitro_geometry_key)
+            else:
+                output = inference_model(data)
             predictions = self._process_outputs(data, output, undo_refs)
 
         if self.inference_settings.series_b.enabled:
@@ -1634,6 +1719,10 @@ def move_tensors_to_cpu(data):
 
 
 class MLIPWorkerLocal:
+    _GEOMETRY = 0
+    _REFRESH = 1
+    _STOP = 2
+
     def __init__(
         self,
         worker_id: int,
@@ -1652,13 +1741,31 @@ class MLIPWorkerLocal:
         )
         self.master_port = get_free_port() if master_port is None else master_port
         self.is_setup = False
+        self._owns_process_group = False
         self.last_received_atomic_data = None
+        self._broadcast_group = None
 
     def get_master_address_and_port(self):
         return (self.master_address, self.master_port)
 
     def get_device_for_local_rank(self):
         return get_device_for_local_rank()
+
+    @staticmethod
+    def _cuda_device_uuid():
+        value = getattr(torch.cuda.get_device_properties(0), "uuid", None)
+        if value is None or not str(value).strip():
+            raise RuntimeError(
+                "Cannot verify rank-zero CUDA assignment: this PyTorch build "
+                "does not expose the CUDA device UUID"
+            )
+        return str(value)
+
+    def get_cuda_placement(self):
+        return {
+            "node_id": ray.get_runtime_context().get_node_id(),
+            "device_uuid": self._cuda_device_uuid(),
+        }
 
     def _distributed_setup(
         self,
@@ -1668,14 +1775,22 @@ class MLIPWorkerLocal:
         logging.info(f"Initializing worker {self.worker_id}...")
         setup_env_local_multi_gpu(self.worker_id, self.master_port, self.master_address)
 
-        device = self.predictor_config.get("device", "cpu")
-        assign_device_for_local_rank(device == "cpu", 0)
-        backend = "gloo" if device == "cpu" else "nccl"
+        device_type = torch.device(self.predictor_config.get("device", "cpu")).type
+        if device_type not in {"cpu", "cuda"}:
+            raise ValueError("Parallel workers require CPU or CUDA devices")
+        # Ray assigns one visible GPU to each remote actor. Never forward an
+        # ordinal from the driver's device namespace into that actor.
+        self.predictor_config = {**self.predictor_config, "device": device_type}
+        assign_device_for_local_rank(device_type == "cpu", 0)
+        backend = "gloo" if device_type == "cpu" else "nccl"
         dist.init_process_group(
             backend=backend,
             rank=self.worker_id,
             world_size=self.world_size,
         )
+        # The communicator already belongs to us even if subsequent model or
+        # graph-parallel initialization fails.
+        self._owns_process_group = True
         if self.gp_config is not None:
             gp_utils.setup_graph_parallel_groups(self.world_size, backend)
             gp_utils.set_gp_config(self.gp_config)
@@ -1692,19 +1807,57 @@ class MLIPWorkerLocal:
     ) -> dict[str, torch.tensor] | None:
         if not self.is_setup:
             self._distributed_setup()
-
-        out = self.predict_unit.predict(data)
-        if self.worker_id == 0:
-            return move_tensors_to_cpu(out)
+        if use_nccl and self._broadcast_group is None:
+            # Keep control messages on CPU, avoiding a CUDA scalar readback.
+            self._broadcast_group = (
+                dist.group.WORLD
+                if dist.get_backend() == "gloo"
+                else dist.new_group(backend="gloo")
+            )
 
         if self.worker_id != 0 and use_nccl:
-            self.last_received_atomic_data = data.to(self.device)
-            while True:
-                torch.distributed.broadcast(self.last_received_atomic_data.pos, src=0)
-                torch.distributed.broadcast(self.last_received_atomic_data.cell, src=0)
+            self.last_received_atomic_data = data.clone().to(self.device)
+            self.last_received_atomic_data.pos = (
+                self.last_received_atomic_data.pos.contiguous()
+            )
+            self.last_received_atomic_data.cell = (
+                self.last_received_atomic_data.cell.contiguous()
+            )
+            command = torch.empty(1, dtype=torch.int64, device="cpu")
+            try:
                 self.predict_unit.predict(self.last_received_atomic_data)
+                while True:
+                    dist.broadcast(command, src=0, group=self._broadcast_group)
+                    if command.item() == self._STOP:
+                        break
+                    if command.item() == self._REFRESH:
+                        payload = [None]
+                        dist.broadcast_object_list(
+                            payload, src=0, group=self._broadcast_group
+                        )
+                        # Only rank zero's internally serialized request arrives
+                        # here, through the trusted distributed process group.
+                        self.last_received_atomic_data = pickle.loads(payload[0]).to(
+                            self.device
+                        )
+                        self.last_received_atomic_data.pos = (
+                            self.last_received_atomic_data.pos.contiguous()
+                        )
+                        self.last_received_atomic_data.cell = (
+                            self.last_received_atomic_data.cell.contiguous()
+                        )
+                    elif command.item() == self._GEOMETRY:
+                        dist.broadcast(self.last_received_atomic_data.pos, src=0)
+                        dist.broadcast(self.last_received_atomic_data.cell, src=0)
+                    else:
+                        raise RuntimeError("Unknown parallel inference command")
+                    self.predict_unit.predict(self.last_received_atomic_data)
+            finally:
+                self.last_received_atomic_data = None
+            return None
 
-        return None
+        out = self.predict_unit.predict(data)
+        return move_tensors_to_cpu(out) if self.worker_id == 0 else None
 
 
 class MLIPWorker(MLIPWorkerLocal):
@@ -1720,6 +1873,15 @@ else:
 
 
 class ParallelMLIPPredictUnit(MLIPPredictUnitProtocol):
+    """
+    Parallel inference with Ray-owned device allocation.
+
+    ``device`` selects CPU or CUDA; an explicit CUDA ordinal does not pin a
+    physical GPU. Rank zero runs in the driver process on its logical CUDA 0.
+    CUDA construction therefore requires the reservation actor to have the
+    same node and GPU UUID as driver CUDA 0; ambiguous placements are rejected.
+    """
+
     @requires(ray_installed, message="Requires `ray[serve]` to be installed")
     def __init__(
         self,
@@ -1738,8 +1900,14 @@ class ParallelMLIPPredictUnit(MLIPPredictUnitProtocol):
     ):
         super().__init__()
 
-        if torch.device(device).type == "xpu":
+        device_type = torch.device(device).type
+        if device_type == "xpu":
             raise ValueError("ParallelMLIPPredictUnit does not support XPU devices.")
+        if device_type not in {"cpu", "cuda"}:
+            raise ValueError("ParallelMLIPPredictUnit requires CPU or CUDA devices")
+        # In parallel mode the requested device selects the backend; Ray owns
+        # per-worker ordinal allocation and CUDA_VISIBLE_DEVICES mapping.
+        device = device_type
 
         if inference_settings is not None and inference_settings.series_b.enabled:
             raise ValueError(
@@ -1772,7 +1940,10 @@ class ParallelMLIPPredictUnit(MLIPPredictUnitProtocol):
             inference_settings = InferenceSettings()
         self.inference_settings = inference_settings
         self._dataset_to_tasks = copy.deepcopy(_mlip_pred_unit.dataset_to_tasks)
-        self._validate_atoms_data_fn = _mlip_pred_unit.model.module.validate_atoms_data
+        self._validate_atoms_data_fn = self._capture_validator(
+            _mlip_pred_unit.model.module
+        )
+        del _mlip_pred_unit
 
         predict_unit_config = {
             "_target_": "fairchem.core.units.mlip_unit.predict.MLIPPredictUnit",
@@ -1812,7 +1983,38 @@ class ParallelMLIPPredictUnit(MLIPPredictUnitProtocol):
                 ray.init(logging_level=log_level)
 
         self.atomic_data_on_device = None
+        self._input_snapshot = None
+        # MOLE can fall back after a metadata change. Worker RPCs still listen
+        # for broadcasts, so transport must remain independent of model settings.
+        self._use_broadcast = self.inference_settings.merge_mole
+        self._broadcast_command = torch.empty(1, dtype=torch.int64, device="cpu")
+        self._worker_futures = []
+        self._closed = False
+        self._resources_released = False
+        self._prediction_lock = threading.RLock()
+        self._placement_groups = []
+        self._rank0_reservation = None
+        self.workers = []
+        self.local_rank0 = None
+        try:
+            self._start_workers(
+                num_workers,
+                num_workers_per_node,
+                predict_unit_config,
+                device,
+                gp_config,
+            )
+        except BaseException:
+            self._closed = True
+            try:
+                self.close()
+            except Exception:
+                logging.exception("Unable to finish parallel predictor startup cleanup")
+            raise
 
+    def _start_workers(
+        self, num_workers, num_workers_per_node, predict_unit_config, device, gp_config
+    ):
         num_nodes = math.ceil(num_workers / num_workers_per_node)
         num_workers_on_node_array = [num_workers_per_node] * num_nodes
         if num_workers % num_workers_per_node > 0:
@@ -1823,14 +2025,15 @@ class ParallelMLIPPredictUnit(MLIPPredictUnitProtocol):
 
         # first create one placement group for each node
         num_gpu_per_worker = 1 if device == "cuda" else 0
-        placement_groups = []
+        placement_groups = self._placement_groups
         for workers in num_workers_on_node_array:
             bundle = {"CPU": workers}
             if device == "cuda":
                 bundle["GPU"] = workers
             pg = ray.util.placement_group([bundle], strategy="STRICT_PACK")
             placement_groups.append(pg)
-        ray.get(pg.ready())  # Wait for each placement group to be scheduled
+        ray.get([pg.ready() for pg in placement_groups])
+        self._placement_groups = placement_groups
 
         # Need to still place worker to occupy space, otherwise ray double books this GPU
         rank0_worker = MLIPWorker.options(
@@ -1842,6 +2045,20 @@ class ParallelMLIPPredictUnit(MLIPPredictUnitProtocol):
             ),
         ).remote(0, num_workers, predict_unit_config, gp_config=gp_config)
 
+        self._rank0_reservation = rank0_worker
+        if device == "cuda":
+            placement = ray.get(rank0_worker.get_cuda_placement.remote())
+            node_id = ray.get_runtime_context().get_node_id()
+            if not node_id or placement.get("node_id") != node_id:
+                raise RuntimeError(
+                    "Rank-zero CUDA reservation is not on the driver node; "
+                    "parallel inference cannot safely use this placement"
+                )
+            if placement.get("device_uuid") != MLIPWorkerLocal._cuda_device_uuid():
+                raise RuntimeError(
+                    "Rank-zero CUDA reservation does not match driver logical CUDA 0; "
+                    "parallel inference cannot safely use this placement"
+                )
         local_gpu_or_cpu = ray.get(rank0_worker.get_device_for_local_rank.remote())
         os.environ[CURRENT_DEVICE_TYPE_STR] = local_gpu_or_cpu
 
@@ -1888,23 +2105,245 @@ class ParallelMLIPPredictUnit(MLIPPredictUnitProtocol):
                 self.workers.append(actor)
                 worker_id += 1
 
-    def predict(self, data: AtomicData) -> dict[str, torch.tensor]:
-        # put the reference in the object store only once
-        if not self.inference_settings.merge_mole or self.atomic_data_on_device is None:
-            data_ref = ray.put(data)
-            # this will put the ray works into an infinite loop listening for broadcasts
-            _futures = [
-                w.predict.remote(data_ref, use_nccl=self.inference_settings.merge_mole)
-                for w in self.workers
-            ]
-            self.atomic_data_on_device = data.clone()
-        else:
-            self.atomic_data_on_device.pos = data.pos.to(self.local_rank0.device)
-            self.atomic_data_on_device.cell = data.cell.to(self.local_rank0.device)
-            torch.distributed.broadcast(self.atomic_data_on_device.pos, src=0)
-            torch.distributed.broadcast(self.atomic_data_on_device.cell, src=0)
+    @staticmethod
+    def _capture_validator(model):
+        # UMA's standard validator delegates to a stateless function. Keeping
+        # its bound method would retain an extra, full CPU model in rank zero.
+        # Preserve custom validators which may depend on model/backbone state.
+        from fairchem.core.models.base import HydraInterfaceMixin
+        from fairchem.core.models.uma.escn_md import eSCNMDBackbone
+        from fairchem.core.units.mlip_unit.api.inference import validate_uma_atoms_data
 
-        return self.local_rank0.predict(self.atomic_data_on_device)
+        validator = model.validate_atoms_data
+        backbone_validator = getattr(
+            getattr(model, "backbone", None), "validate_atoms_data", None
+        )
+        if (
+            getattr(validator, "__func__", None)
+            is HydraInterfaceMixin.validate_atoms_data
+            and getattr(backbone_validator, "__func__", None)
+            is eSCNMDBackbone.validate_atoms_data
+        ):
+            return validate_uma_atoms_data
+        return validator
+
+    @staticmethod
+    def _same_metadata(current, previous, seen=None) -> bool:
+        if type(current) is not type(previous):
+            return False
+        if torch.is_tensor(current):
+            return (
+                current.layout == previous.layout == torch.strided
+                and current.dtype == previous.dtype
+                and torch.equal(current.detach().cpu(), previous)
+            )
+        if isinstance(current, np.ndarray):
+            return current.dtype == previous.dtype and np.array_equal(current, previous)
+        if isinstance(current, (str, bytes, int, float, bool, type(None))):
+            return current == previous
+        if not isinstance(current, (dict, list, tuple)):
+            # Unknown metadata must take the full refresh path; arbitrary
+            # __eq__ methods need not return a bool or observe internal changes.
+            return False
+        seen = set() if seen is None else seen
+        pair = (id(current), id(previous))
+        if pair in seen:
+            return True
+        seen.add(pair)
+        if isinstance(current, dict):
+            return current.keys() == previous.keys() and all(
+                ParallelMLIPPredictUnit._same_metadata(value, previous[key], seen)
+                for key, value in current.items()
+            )
+        return len(current) == len(previous) and all(
+            ParallelMLIPPredictUnit._same_metadata(value, old, seen)
+            for value, old in zip(current, previous)
+        )
+
+    @staticmethod
+    def _geometry_signature(value):
+        return (value.shape, value.dtype, value.layout)
+
+    def _can_reuse_geometry_buffers(self, data: AtomicData) -> bool:
+        snapshot = self._input_snapshot
+        if snapshot is None or data.keys() != snapshot.keys():
+            return False
+        return all(
+            self._geometry_signature(value) == snapshot[key]
+            if key in ("pos", "cell")
+            else self._same_metadata(value, snapshot[key])
+            for key, value in data
+        )
+
+    def _check_stream_workers(self):
+        if not self._worker_futures:
+            return
+        ready, _ = ray.wait(self._worker_futures, num_returns=1, timeout=0)
+        if ready:
+            ray.get(ready)  # Propagate a worker failure before starting a collective.
+            raise RuntimeError("A parallel inference worker stopped unexpectedly")
+
+    def predict(self, data: AtomicData) -> dict[str, torch.tensor]:
+        with self._prediction_lock:
+            return self._predict(data)
+
+    def _predict(self, data: AtomicData) -> dict[str, torch.tensor]:
+        if self._closed:
+            raise RuntimeError(
+                "Parallel predictor is closed; construct a new predictor"
+            )
+        starting = self.atomic_data_on_device is None
+        refresh = not self._use_broadcast or not self._can_reuse_geometry_buffers(data)
+        # Clone, validate, transfer and serialize before announcing any update.
+        # Invalid inputs leave peers waiting for the next valid request.
+        if refresh:
+            data.validate()
+            request = _clone_tensor_tree(
+                data, tensor_transform=lambda value: value.detach().cpu().clone()
+            )
+            request.pos = request.pos.contiguous()
+            request.cell = request.cell.contiguous()
+            snapshot = {
+                key: self._geometry_signature(value)
+                if key in ("pos", "cell")
+                else value
+                for key, value in request
+            }
+            payload = pickle.dumps(request, protocol=pickle.HIGHEST_PROTOCOL)
+            prepared = request.clone()
+            if self.local_rank0.is_setup:
+                prepared.to(self.local_rank0.device)
+        else:
+            if (
+                not torch.isfinite(data.pos).all()
+                or not torch.isfinite(data.cell).all()
+            ):
+                raise ValueError("Atomic positions and cell must contain finite values")
+            pos = data.pos.detach().to(self.local_rank0.device, copy=True).contiguous()
+            cell = (
+                data.cell.detach().to(self.local_rank0.device, copy=True).contiguous()
+            )
+
+        try:
+            if self._use_broadcast and not starting:
+                self._check_stream_workers()
+                command = (
+                    MLIPWorkerLocal._REFRESH if refresh else MLIPWorkerLocal._GEOMETRY
+                )
+                self._broadcast_command.fill_(command)
+                dist.broadcast(
+                    self._broadcast_command,
+                    src=0,
+                    group=self.local_rank0._broadcast_group,
+                )
+                if refresh:
+                    dist.broadcast_object_list(
+                        [payload], src=0, group=self.local_rank0._broadcast_group
+                    )
+                else:
+                    dist.broadcast(pos, src=0)
+                    dist.broadcast(cell, src=0)
+            else:
+                data_ref = ray.put(request)
+                self._worker_futures = [
+                    worker.predict.remote(data_ref, use_nccl=self._use_broadcast)
+                    for worker in self.workers
+                ]
+            if refresh:
+                self.atomic_data_on_device = prepared
+                self._input_snapshot = snapshot if self._use_broadcast else None
+            else:
+                self.atomic_data_on_device.pos = pos
+                self.atomic_data_on_device.cell = cell
+            predictions = self.local_rank0.predict(
+                self.atomic_data_on_device, use_nccl=self._use_broadcast
+            )
+            if not self._use_broadcast:
+                ray.get(self._worker_futures)
+                self._worker_futures = []
+            self.inference_settings = self.local_rank0.predict_unit.inference_settings
+            return predictions
+        except BaseException:
+            # A collective/model failure can leave ranks at different points.
+            # Do not reuse that communicator or silently return partial results.
+            self._closed = True
+            try:
+                self.close()
+            except Exception:
+                logging.exception("Unable to finish parallel predictor cleanup")
+            raise
+
+    def close(self) -> None:
+        """
+        Stop streaming workers and release this predictor's distributed resources.
+        """
+        with self._prediction_lock:
+            if self._resources_released:
+                return
+            try:
+                if (
+                    not self._closed
+                    and self._use_broadcast
+                    and self.atomic_data_on_device is not None
+                ):
+                    self._check_stream_workers()
+                    self._broadcast_command.fill_(MLIPWorkerLocal._STOP)
+                    dist.broadcast(
+                        self._broadcast_command,
+                        src=0,
+                        group=self.local_rank0._broadcast_group,
+                    )
+                    ray.get(self._worker_futures, timeout=30)
+            finally:
+                self._closed = True
+                self._resources_released = True
+                self.atomic_data_on_device = None
+                self._input_snapshot = None
+                self._worker_futures = []
+                self._validate_atoms_data_fn = None
+                errors = []
+                for worker in [*self.workers, self._rank0_reservation]:
+                    if worker is None:
+                        continue
+                    try:
+                        ray.kill(worker, no_restart=True)
+                    except BaseException as error:
+                        errors.append(error)
+                for group in self._placement_groups:
+                    try:
+                        ray.util.remove_placement_group(group)
+                    except BaseException as error:
+                        errors.append(error)
+                if self.local_rank0 is not None and (
+                    self.local_rank0.is_setup or self.local_rank0._owns_process_group
+                ):
+                    if gp_utils.initialized() or self.local_rank0.gp_config is not None:
+                        try:
+                            gp_utils.cleanup_gp()
+                        except BaseException as error:
+                            errors.append(error)
+                    try:
+                        if dist.is_initialized():
+                            dist.destroy_process_group()
+                    except BaseException as error:
+                        errors.append(error)
+                    finally:
+                        self.local_rank0.predict_unit = None
+                        self.local_rank0.is_setup = False
+                        self.local_rank0._owns_process_group = dist.is_initialized()
+                if errors:
+                    self._resources_released = False
+                    if any(not isinstance(error, Exception) for error in errors):
+                        # Cancellation must not skip later resource releases or
+                        # be converted to an ordinary RuntimeError afterward.
+                        if len(errors) == 1:
+                            raise errors[0]
+                        raise BaseExceptionGroup(
+                            "Parallel predictor resource cleanup failed", errors
+                        )
+                    raise RuntimeError(
+                        "Parallel predictor resource cleanup failed"
+                    ) from errors[0]
 
     def validate_atoms_data(self, atoms: Atoms, task_name: str) -> None:
         """
@@ -1912,6 +2351,10 @@ class ParallelMLIPPredictUnit(MLIPPredictUnitProtocol):
 
         Delegates to the model's validate_atoms_data captured at init time.
         """
+        if self._closed:
+            raise RuntimeError(
+                "Parallel predictor is closed; construct a new predictor"
+            )
         self._validate_atoms_data_fn(atoms, task_name)
 
     @property

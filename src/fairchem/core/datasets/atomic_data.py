@@ -184,8 +184,8 @@ def reshape_features(
     """Stack center and neighbor index and reshapes distances,
     takes in np.arrays and returns torch tensors"""
     edge_index = torch.LongTensor(np.vstack((n_index, c_index)))
-    edge_distances = torch.tensor(n_distance, dtype=target_dtype)
-    cell_offsets = torch.tensor(offsets, dtype=target_dtype)
+    edge_distances = torch.tensor(n_distance, dtype=target_dtype, device="cpu")
+    cell_offsets = torch.tensor(offsets, dtype=target_dtype, device="cpu")
 
     # remove distances smaller than a tolerance ~ 0. The small tolerance is
     # needed to correct for pymatgen's neighbor_list returning self atoms
@@ -419,7 +419,7 @@ class AtomicData:
     ) -> AtomicData:
         atoms = input_atoms.copy()
         calc = input_atoms.calc
-        if np.all(atoms.pbc) and atoms.cell.volume == 0:
+        if np.all(np.asarray(atoms.pbc)) and atoms.cell.volume == 0:
             raise ValueError("A fully periodic structure requires a nonsingular cell")
         # TODO: maybe compute a safe cell size if not provided.
         if molecule_cell_size is not None:
@@ -429,9 +429,9 @@ class AtomicData:
             # create a molecule box with the molecule centered on it if specified
             atoms.center(vacuum=(molecule_cell_size))
             atoms.pbc = np.array([True, True, True])
-        elif np.all(~atoms.pbc):
+        elif np.all(~np.asarray(atoms.pbc)):
             pass  # This is fine
-        elif not np.all(atoms.pbc) and atoms.cell.volume < 0.1:
+        elif not np.all(np.asarray(atoms.pbc)) and atoms.cell.volume < 0.1:
             raise ValueError(
                 "atoms must either have a cell or have a cell created by setting <molecule_cell_size>."
             )
@@ -444,6 +444,11 @@ class AtomicData:
 
         # wrap positions for CPU graph Generation
         atoms.set_positions(pos)
+        if r_edges:
+            # Pymatgen needs an invertible cell even for nonperiodic molecules.
+            # Use the same completed cell as the model, on our owned copy;
+            # retaining PBC flags prevents artificial periodic neighbors.
+            atoms.set_cell(cell)
 
         atomic_numbers = torch.from_numpy(atomic_numbers).long()
         pos = torch.from_numpy(pos)
@@ -451,7 +456,7 @@ class AtomicData:
         pos = pos.to(target_dtype)
         pbc = torch.from_numpy(pbc).bool().view(1, 3)
         cell = torch.from_numpy(cell).to(target_dtype).view(1, 3, 3)
-        natoms = torch.tensor([pos.shape[0]], dtype=torch.long)
+        natoms = torch.tensor([pos.shape[0]], dtype=torch.long, device="cpu")
 
         # graph construction
         if r_edges:
@@ -478,17 +483,17 @@ class AtomicData:
             edge_index, cell_offsets = reshape_features(
                 *split_idx_dist, target_dtype=target_dtype
             )
-            nedges = torch.tensor([edge_index.shape[1]], dtype=torch.long)
+            nedges = torch.tensor([edge_index.shape[1]], dtype=torch.long, device="cpu")
         else:
             # empty graph
-            edge_index = torch.empty((2, 0), dtype=torch.long)
-            cell_offsets = torch.empty((0, 3), dtype=target_dtype)
-            nedges = torch.tensor([0], dtype=torch.long)
+            edge_index = torch.empty((2, 0), dtype=torch.long, device="cpu")
+            cell_offsets = torch.empty((0, 3), dtype=target_dtype, device="cpu")
+            nedges = torch.tensor([0], dtype=torch.long, device="cpu")
 
         # initialized to torch.zeros(natoms) if tags missing.
         # https://docs.ase-lib.org/ase/atoms.html#ase.Atoms.get_tags
-        tags = torch.from_numpy(atoms.get_tags()).long()
-        fixed = torch.zeros(natoms, dtype=torch.long)
+        tags = torch.as_tensor(atoms.get_tags(), dtype=torch.long, device="cpu").clone()
+        fixed = torch.zeros(natoms, dtype=torch.long, device="cpu")
         if hasattr(atoms, "constraints"):
             for constraint in atoms.constraints:
                 if isinstance(constraint, FixAtoms):
@@ -497,12 +502,16 @@ class AtomicData:
         if isinstance(calc, (SinglePointCalculator, SinglePointDFTCalculator)):
             results = calc.results
             energy = (
-                torch.tensor([results["energy"]], dtype=target_dtype).view(1)
+                torch.tensor(
+                    [results["energy"]], dtype=target_dtype, device="cpu"
+                ).view(1)
                 if "energy" in results
                 else None
             )
             forces = (
-                torch.tensor(results["forces"], dtype=target_dtype).view(-1, 3)
+                torch.tensor(results["forces"], dtype=target_dtype, device="cpu").view(
+                    -1, 3
+                )
                 if "forces" in results
                 else None
             )
@@ -510,10 +519,14 @@ class AtomicData:
             if stress is not None and r_stress:
                 if stress.shape == (6,):
                     stress = torch.tensor(
-                        voigt_6_to_full_3x3_stress(stress), dtype=target_dtype
+                        voigt_6_to_full_3x3_stress(stress),
+                        dtype=target_dtype,
+                        device="cpu",
                     ).view(1, 3, 3)
                 elif stress.shape in ((3, 3), (9,)):
-                    stress = torch.tensor(stress, dtype=target_dtype).view(1, 3, 3)
+                    stress = torch.tensor(
+                        stress, dtype=target_dtype, device="cpu"
+                    ).view(1, 3, 3)
                 else:
                     raise ValueError(f"Unknown stress shape, {stress.shape}")
             else:
@@ -524,17 +537,19 @@ class AtomicData:
             stress = None
 
         energy = (
-            torch.tensor([atoms.info["energy"]], dtype=target_dtype)
+            torch.tensor([atoms.info["energy"]], dtype=target_dtype, device="cpu")
             if "energy" in atoms.info
             else energy
         )
         forces = (
-            torch.tensor(atoms.info["forces"], dtype=target_dtype)
+            torch.tensor(atoms.info["forces"], dtype=target_dtype, device="cpu")
             if "forces" in atoms.info
             else forces
         )
         stress = (
-            torch.tensor(atoms.info["stress"], dtype=target_dtype).view(1, 3, 3)
+            torch.tensor(atoms.info["stress"], dtype=target_dtype, device="cpu").view(
+                1, 3, 3
+            )
             if "stress" in atoms.info
             else stress
         )
@@ -548,7 +563,7 @@ class AtomicData:
             )
             if isinstance(value, (bool, np.bool_)) or not isinstance(value, Integral):
                 raise TypeError(f"atoms.info['{name}'] must be an integer")
-            return torch.tensor([int(value)], dtype=torch.long)
+            return torch.tensor([int(value)], dtype=torch.long, device="cpu")
 
         charge, spin = integer_metadata("charge"), integer_metadata("spin")
 

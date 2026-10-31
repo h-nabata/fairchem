@@ -7,7 +7,6 @@ LICENSE file in the root directory of this source tree.
 
 from __future__ import annotations
 
-import contextlib
 import dataclasses
 import logging
 import threading
@@ -171,18 +170,33 @@ def setup_gp(config) -> None:
 
 
 def cleanup_gp() -> None:
+    """Release initialized groups, including after an interrupted setup."""
     global _DATA_PARALLEL_GROUP
     global _GRAPH_PARALLEL_GROUP
     global _GP_CONFIG
-    assert _GRAPH_PARALLEL_GROUP is not None
-    assert _DATA_PARALLEL_GROUP is not None
-    with contextlib.suppress(ValueError):
-        dist.destroy_process_group(_DATA_PARALLEL_GROUP)
-    with contextlib.suppress(ValueError):
-        dist.destroy_process_group(_GRAPH_PARALLEL_GROUP)
-    _DATA_PARALLEL_GROUP = None
-    _GRAPH_PARALLEL_GROUP = None
-    _GP_CONFIG = None
+    errors = []
+    try:
+        for group in (_DATA_PARALLEL_GROUP, _GRAPH_PARALLEL_GROUP):
+            if group is None:
+                # destroy_process_group(None) would destroy the default group,
+                # which belongs to the caller rather than this helper.
+                continue
+            try:
+                dist.destroy_process_group(group)
+            except ValueError:
+                # Keep accepting handles already invalidated by world cleanup.
+                pass
+            except BaseException as error:
+                # Attempt both groups even if cleanup fails or is interrupted.
+                errors.append(error)
+    finally:
+        _DATA_PARALLEL_GROUP = None
+        _GRAPH_PARALLEL_GROUP = None
+        _GP_CONFIG = None
+    if len(errors) == 1:
+        raise errors[0]
+    if errors:
+        raise BaseExceptionGroup("Graph-parallel group cleanup failed", errors)
 
 
 def initialized() -> bool:

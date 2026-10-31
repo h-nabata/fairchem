@@ -172,8 +172,16 @@ def get_pbc_distances(
     # differently. A nonzero candidate can therefore round to zero here. Keep
     # topology metadata aligned when removing it, including in mixed batches.
     nonzero_mask = distances != 0
-    nonzero_idx = torch.arange(len(distances), device=distances.device)[nonzero_mask]
-    if len(nonzero_idx) != len(distances):
+    if bool(nonzero_mask.all()):
+        # Normal MD graphs contain no zero edges. Avoid creating a dynamic-size
+        # index list and gathering every already-owned geometry tensor. On an
+        # accelerator the previous boolean indexing also synchronized to learn
+        # the selected count; this replaces that with one scalar reduction.
+        # Topology may be caller-owned, so preserve its independent output copy.
+        edge_index = edge_index.clone()
+    else:
+        nonzero_idx = torch.nonzero(nonzero_mask).flatten()
+        edge_index = edge_index[:, nonzero_idx]
         cell_offsets = cell_offsets[nonzero_idx]
         kept_prefix = torch.cat(
             (
@@ -185,10 +193,9 @@ def get_pbc_distances(
         neighbors = torch.diff(kept_per_system, prepend=neighbors.new_zeros(1))
         # Selecting an already evaluated zero norm leaves its undefined second
         # derivative in the graph (0 * NaN). Recompute only surviving norms.
-        distances = distance_vectors[nonzero_idx].norm(dim=-1)
-    else:
-        distances = distances[nonzero_idx]
-    edge_index = edge_index[:, nonzero_idx]
+        distance_vectors = distance_vectors[nonzero_idx]
+        distances = distance_vectors.norm(dim=-1)
+        offsets = offsets[nonzero_idx]
 
     out = {
         "edge_index": edge_index,
@@ -198,10 +205,10 @@ def get_pbc_distances(
     }
 
     if return_distance_vec:
-        out["distance_vec"] = distance_vectors[nonzero_idx]
+        out["distance_vec"] = distance_vectors
 
     if return_offsets:
-        out["offsets"] = offsets[nonzero_idx]
+        out["offsets"] = offsets
 
     return out
 

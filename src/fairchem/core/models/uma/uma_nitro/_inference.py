@@ -63,7 +63,8 @@ import math
 import os
 import sys
 import warnings
-from contextlib import contextmanager
+import weakref
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -84,6 +85,92 @@ from fairchem.core.units.mlip_unit.api.inference import (
     NITRO_CHECKPOINT,
     UMANitroNotSupportedError,
 )
+from fairchem.core.units.mlip_unit.utils import (
+    _TF32_CONTEXT_LOCK,
+    tf32_context_manager,
+)
+
+# Kernels use process-wide tuning flags and one live capture. Share the precision
+# lock so direct model calls and MLIPPredictUnit cannot acquire these locks in
+# opposite orders. The CUDA predictor already scopes this same lock.
+_NITRO_RUNTIME_LOCK = _TF32_CONTEXT_LOCK
+
+# Constant geometry tensors need stable addresses during replay, but older
+# shapes must not accumulate over a sequence of differently sized jobs.
+_TENSOR_CACHE_LIMIT = 8
+_TENSOR_CACHE_BYTES = 64 * 1024 * 1024
+_CAPTURE_REFERENCES = None
+
+
+def _cached_nbytes(value):
+    if isinstance(value, torch.Tensor):
+        return value.numel() * value.element_size()
+    if isinstance(value, (tuple, list)):
+        return sum(_cached_nbytes(item) for item in value)
+    return 0
+
+
+def _remember_tensor(cache, key, value):
+    cache[key] = value
+    if _CAPTURE_REFERENCES is not None:
+        # Captured kernels retain addresses, not these Python owners. Eviction
+        # must never free a constant still read by the current capture.
+        _CAPTURE_REFERENCES.append(value)
+    size = sum(_cached_nbytes(item) for item in cache.values())
+    # Keep at least the current layout, even if it alone exceeds the soft byte
+    # budget; regenerating it inside capture would add work to every MD replay.
+    while len(cache) > 1 and (
+        len(cache) > _TENSOR_CACHE_LIMIT or size > _TENSOR_CACHE_BYTES
+    ):
+        removed = cache.pop(next(iter(cache)))
+        size -= _cached_nbytes(removed)
+
+
+def _weight_cache_key(tensors):
+    try:
+        return tuple((id(value), value._version) for value in tensors)
+    except RuntimeError:
+        # Inference tensors cannot expose mutation versions. Recompute instead
+        # of trusting a cached bound derived from mutable storage.
+        return None
+
+
+def _weight_cache_get(cache, key, tensors):
+    entry = cache.get(key) if key is not None else None
+    if entry is not None and all(
+        reference() is value for reference, value in zip(entry[0], tensors, strict=True)
+    ):
+        return entry[1]
+    return None
+
+
+def _weight_cache_put(cache, key, tensors, value):
+    if key is not None:
+        _remember_tensor(
+            cache, key, (tuple(weakref.ref(item) for item in tensors), value)
+        )
+
+
+def _device_lru_cache(maxsize):
+    """
+    Keep compiled CuTe handles local to the CUDA device that created them.
+    """
+
+    def decorate(function):
+        @lru_cache(maxsize=maxsize)
+        def cached(device, *args, **kwargs):
+            return function(*args, **kwargs)
+
+        @functools.wraps(function)
+        def wrapped(*args, **kwargs):
+            return cached(torch.cuda.current_device(), *args, **kwargs)
+
+        wrapped.cache_clear = cached.cache_clear
+        wrapped.cache_info = cached.cache_info
+        return wrapped
+
+    return decorate
+
 
 # This will catch the warning despite its C++ origin
 # torch.Tensor.index_reduce is in beta
@@ -206,14 +293,25 @@ EXPANDABLE_SEGMENTS = os.environ.get("UMA_NITRO_EXPANDABLE_SEGMENTS", "1") == "1
 
 def _configure_allocator():
     """
-    Put ``expandable_segments:True`` in force, whether or not CUDA is up.
+    Enable expandable segments on CUDA unless the caller chose their policy.
 
     Returns:
         ``True`` if the setting is believed to be active.
     """
-    if not EXPANDABLE_SEGMENTS:
+    if not EXPANDABLE_SEGMENTS or not torch.cuda.is_available():
         return False
-    key = "PYTORCH_CUDA_ALLOC_CONF"
+    for setting in ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF"):
+        configured = os.environ.get(setting, "")
+        for option in configured.split(","):
+            key, _, value = option.partition(":")
+            if key.strip() == "expandable_segments":
+                # Never override an allocator policy selected by the caller.
+                return value.strip().lower() == "true"
+    key = (
+        "PYTORCH_ALLOC_CONF"
+        if "PYTORCH_ALLOC_CONF" in os.environ
+        else "PYTORCH_CUDA_ALLOC_CONF"
+    )
     cur = os.environ.get(key, "")
     if "expandable_segments" not in cur:
         os.environ[key] = f"{cur},expandable_segments:True".lstrip(",")
@@ -3833,8 +3931,8 @@ def _coefficients(c):
         ``C[k, ab, cd] + C[k, cd, ab]`` for the backward's MMA. Both are padded
         from 25 columns (resp. rows) to 32.
     """
-    key = (c.data_ptr(), c.shape, c.dtype, c.device)
-    hit = _COEF_CACHE.get(key)
+    key = _weight_cache_key((c,))
+    hit = _weight_cache_get(_COEF_CACHE, key, (c,))
     if hit is not None:
         return hit
     cc = c.reshape(25, 256).to(torch.float32)
@@ -3869,7 +3967,7 @@ def _coefficients(c):
     csym[:25] = sym.reshape(25, 256)
     out = (d55.contiguous(), csym.contiguous())
     _assert_d55_pattern(out[0] if isinstance(out, tuple) else out)
-    _COEF_CACHE[key] = out
+    _weight_cache_put(_COEF_CACHE, key, (c,), out)
     return out
 
 
@@ -5805,7 +5903,7 @@ SV4_GRID = int(os.environ.get("UMA_NITRO_SV4_GRID", "105472"))
 THREADS = int(os.environ.get("UMA_NITRO_SV4_THREADS", "128"))
 
 
-@lru_cache(maxsize=16)
+@_device_lru_cache(maxsize=16)
 def _compiled_fp16(num_sph, channels, grid):
     """
     Compile and cache the fp16 scatter for a shape signature.
@@ -5902,7 +6000,7 @@ def _(grad_edge, index, scale, out):
     return None
 
 
-@lru_cache(maxsize=16)
+@_device_lru_cache(maxsize=16)
 def _compiled_gather(row, grid):
     """
     Compile and cache the gather for one shape signature.
@@ -6087,7 +6185,7 @@ def _check_gemm_operands(m, n, k, a_stride, c_stride, cct):
             )
 
 
-@lru_cache(maxsize=128)
+@_device_lru_cache(maxsize=128)
 def _cdg_compiled(m, n, k, a_stride, c_stride, tile, has_bias, has_scale, c_half=False):
     """
     Compile and cache a kernel for one shape, stride and epilogue signature.
@@ -8044,11 +8142,12 @@ def _d_colsum(v0, v1, v2):
     Returns:
         A float.
     """
-    key = (v0.data_ptr(), v1.data_ptr(), v2.data_ptr())
-    cs = _D_COLSUM.get(key)
+    tensors = (v0, v1, v2)
+    key = _weight_cache_key(tensors)
+    cs = _weight_cache_get(_D_COLSUM, key, tensors)
     if cs is None:
         cs = max(float(v.float().abs().sum(dim=1).max()) for v in (v0, v1, v2))
-        _D_COLSUM[key] = cs
+        _weight_cache_put(_D_COLSUM, key, tensors, cs)
     return cs
 
 
@@ -8123,7 +8222,7 @@ def _dm_dummy(device):
     vec = _DM_DUMMY.get(key)
     if vec is None:
         vec = torch.empty(1, device=device, dtype=torch.float32)
-        _DM_DUMMY[key] = vec
+        _remember_tensor(_DM_DUMMY, key, vec)
     return vec
 
 
@@ -8143,11 +8242,12 @@ def _dm_colsums(w0, w1, w2):
     Returns:
         A list of three floats.
     """
-    key = (w0.data_ptr(), w1.data_ptr(), w2.data_ptr())
-    cs = _DM_COLSUMS.get(key)
+    tensors = (w0, w1, w2)
+    key = _weight_cache_key(tensors)
+    cs = _weight_cache_get(_DM_COLSUMS, key, tensors)
     if cs is None:
         cs = [float(w.float().abs().sum(dim=1).max()) for w in (w0, w1, w2)]
-        _DM_COLSUMS[key] = cs
+        _weight_cache_put(_DM_COLSUMS, key, tensors, cs)
     return cs
 
 
@@ -8162,7 +8262,7 @@ def _dbeta_vec(edges, device):
     vec = _DBETA_VEC.get(key)
     if vec is None:
         vec = torch.full((edges,), D_BETA, device=device, dtype=torch.float32)
-        _DBETA_VEC[key] = vec
+        _remember_tensor(_DBETA_VEC, key, vec)
     return vec
 
 
@@ -9454,7 +9554,7 @@ def _image_scaffold(num_atoms, rep_max, device, dtype):
         image_index = torch.arange(num_atoms * num_images, device=device) % num_images
         source_offset = image_offsets[image_index]
         cached = (image_offsets, source_atom, image_index, source_offset)
-        _IMAGE_SCAFFOLD[key] = cached
+        _remember_tensor(_IMAGE_SCAFFOLD, key, cached)
     return cached
 
 
@@ -9480,7 +9580,7 @@ def _neighbor_grid(span, device):
     if grid is None:
         naxis = torch.arange(-span, span + 1, device=device, dtype=torch.int64)
         grid = torch.cartesian_prod(naxis, naxis, naxis)
-        _NEIGHBOR_GRID[key] = grid
+        _remember_tensor(_NEIGHBOR_GRID, key, grid)
     return grid
 
 
@@ -9505,7 +9605,7 @@ def _repeat_arange(count, repeats, device):
     out = _REPEAT_ARANGE.get(key)
     if out is None:
         out = torch.repeat_interleave(torch.arange(count, device=device), repeats)
-        _REPEAT_ARANGE[key] = out
+        _remember_tensor(_REPEAT_ARANGE, key, out)
     return out
 
 
@@ -10306,7 +10406,7 @@ STREAM_FORK = os.environ.get("UMA_NITRO_STREAM_FORK", "1") == "1"
 
 _SEQ_FORK = False
 _MAX_FORK = [0]
-_SIDE_STREAMS: list = []
+_SIDE_STREAMS: dict = {}
 
 # Side-stream outputs must be associated with the consuming stream before their
 # Python references are released; see ``_record_uses``.
@@ -10325,9 +10425,10 @@ def _side_streams(count):
     Returns:
         A list of ``count`` streams.
     """
-    while len(_SIDE_STREAMS) < count:
-        _SIDE_STREAMS.append(torch.cuda.Stream())
-    return _SIDE_STREAMS[:count]
+    streams = _SIDE_STREAMS.setdefault(torch.cuda.current_device(), [])
+    while len(streams) < count:
+        streams.append(torch.cuda.Stream())
+    return streams[:count]
 
 
 def _parallel(thunks):
@@ -10400,6 +10501,14 @@ EDGE_QUANTUM_MIN = int(os.environ.get("UMA_NITRO_EDGE_QUANTUM_MIN", "64"))
 EDGE_MARGIN = float(os.environ.get("UMA_NITRO_EDGE_MARGIN", "1.30"))
 
 _LIVE_EDGES: dict = {}
+_CAPACITY_CACHE_LIMIT = 128
+
+
+def _remember_capacity(cache, key, value):
+    cache[key] = value
+    while len(cache) > _CAPACITY_CACHE_LIMIT:
+        cache.pop(next(iter(cache)))
+
 
 # Positions sampled when a system has no usable cell, so the density signature costs
 # O(1) host work instead of a reduction over every atom of a large molecule.
@@ -10416,16 +10525,13 @@ def _composition_key(data):
     if z.dtype.is_floating_point:
         z = z.to(torch.int64)
     if not z.is_cpu:
-        # `forward` is handed a CPU batch and stages it itself, so this
-        # is the uncommon path -- but `.numpy()` raises on a device tensor where
-        # the density estimate above would merely have synchronized, and a
-        # confusing TypeError is a bad way to learn that. Two attribute reads on
-        # the path that matters.
+        # Direct/device-origin calls still build the key here. The predictor
+        # supplies a host key before upload when its inputs originate on CPU.
         z = z.cpu()
     return np.bincount(z.numpy()).tobytes()
 
 
-def _geometry_key(data):
+def _geometry_key(data, dtype=None):
     """
     Return a host-side key for radius-graph capacity reuse.
 
@@ -10435,6 +10541,8 @@ def _geometry_key(data):
     volume = 0.0
     cell = getattr(data, "cell", None)
     if cell is not None and cell.numel() >= 9:
+        if dtype is not None:
+            cell = cell.detach().to(dtype=dtype)
         # Written out rather than torch.det: this is nine multiplies on host floats,
         # and it avoids pulling in a linalg backend for a 3x3.
         m = cell.reshape(-1, 3, 3)[0].tolist()
@@ -10449,6 +10557,8 @@ def _geometry_key(data):
         pos = data.pos.detach()
         step = max(1, pos.shape[0] // GEOM_SAMPLES)
         sample = pos[::step]
+        if dtype is not None:
+            sample = sample.to(dtype=dtype)
         extent = (sample.amax(0) - sample.amin(0)).clamp_min(1e-6)
         volume = float(extent.prod())
     density = data.pos.shape[0] / volume
@@ -10563,6 +10673,9 @@ def _finite_guard_kernel(
             b = tl.load(s_ptr + base + o2, mask=base + o2 < ns, other=0.0)
             bad = bad | ((b - b) != 0.0)
             base += BLOCK
+    # Incomplete graphs can produce non-finite intermediates. Preserve their
+    # retriable capacity flag; only a complete graph can diagnose bad numerics.
+    bad = bad & (tl.load(flag_ptr) != 1)
     tl.atomic_max(flag_ptr + off * 0, tl.full((BLOCK,), 2, tl.int64), mask=bad)
 
 
@@ -10639,7 +10752,7 @@ def _capacity_high_water(
             "cell_capacity": max(previous["cell_capacity"], proposed["cell_capacity"]),
             "rep_max": max(previous["rep_max"], proposed["rep_max"]),
         }
-    high_water[stable_key] = selected.copy()
+    _remember_capacity(high_water, stable_key, selected.copy())
     return selected
 
 
@@ -10652,6 +10765,13 @@ def _measured_caps(backbone, tensors, dataset_name, geom_key):
     """
     natoms = tensors["pos"].shape[0]
     key = _capacity_cache_key(natoms, dataset_name, geom_key)
+    stable_key = (natoms, dataset_name, geom_key[1])
+    previous = getattr(backbone, "_uma_nitro_capacity_high_water", {}).get(stable_key)
+    if previous is not None:
+        # The padded graph checks all capacities on every evaluation. Reuse the
+        # measured allocation during MD cell/density changes until that guard
+        # requests remeasurement, instead of probing at every density bucket.
+        return previous.copy()
     cached = _LIVE_EDGES.get(key)
     if cached is None:
         # An overflowed probe reports a *truncated* edge count, so every capacity has
@@ -10664,6 +10784,7 @@ def _measured_caps(backbone, tensors, dataset_name, geom_key):
             probe = plan_capacities(natoms, rep_max=rep, edges_per_atom=per_atom)
             probe["cell_capacity"] = cell_cap
             with torch.no_grad():
+                _RUNTIME_COUNTERS["capacity_probes"] += 1
                 built = _graph_padded(
                     tensors["pos"],
                     tensors["cell"],
@@ -10685,7 +10806,7 @@ def _measured_caps(backbone, tensors, dataset_name, geom_key):
         live = int(built[-1][-1])
         del built
         cached = (live, cell_cap, rep)
-        _LIVE_EDGES[key] = cached
+        _remember_capacity(_LIVE_EDGES, key, cached)
     live, cell_cap, rep = cached
 
     quantum = max(EDGE_QUANTUM_MIN, 1 << max(0, live.bit_length() - EDGE_BUCKET_BITS))
@@ -10697,7 +10818,7 @@ def _measured_caps(backbone, tensors, dataset_name, geom_key):
     if os.environ.get("UMA_NITRO_CAP_DEBUG"):
         print(
             f"[uma_nitro] natoms={natoms} live={live} cap={caps['edge_capacity']} "
-            f"pad={caps['edge_capacity'] / live:.4f} q={quantum} "
+            f"pad={caps['edge_capacity'] / max(1, live):.4f} q={quantum} "
             f"cell_cap={cell_cap} rep_max={rep}"
         )
     return caps
@@ -14686,7 +14807,7 @@ def _head_derivatives(energy_part, pos, cell, batch):
     return {"energy": energy_part, "forces": forces, "stress": stress}
 
 
-@functools.cache
+@lru_cache(maxsize=32)
 def _device_buffer(name, shape, dtype, device):
     """
     Return a cached device buffer for one named input.
@@ -14710,23 +14831,23 @@ def _device_buffer(name, shape, dtype, device):
     return torch.empty(shape, dtype=dtype, device=device)
 
 
-@functools.cache
-def _pinned_buffer(name, slot, shape, dtype):
+@lru_cache(maxsize=32)
+def _pinned_buffer(name, slot, shape, dtype, device):
     """
     Return a field-specific cached pinned staging buffer.
 
-    Buffers are keyed by field and slot to prevent aliasing between asynchronous
-    host-to-device copies.
+    Buffers are keyed by field, slot and destination device to prevent aliasing
+    between asynchronous copies guarded by different devices' staging events.
     """
-    return torch.empty(shape, dtype=dtype).pin_memory()
+    return torch.empty(shape, dtype=dtype, device="cpu").pin_memory()
 
 
 _STAGE_SLOTS = 2
 _stage_slot = 0
 
 
-@functools.cache
-def _staging_ready(slot):
+@lru_cache(maxsize=64)
+def _staging_ready(slot, device):
     """
     Return the event guarding reuse of one staging slot.
     """
@@ -14740,62 +14861,57 @@ def _move_inputs(data, device, dtype):
     tensors = {}
     global _stage_slot
     slot = _stage_slot
-    _stage_slot = (_stage_slot + 1) % _STAGE_SLOTS
-    ready = _staging_ready(slot)
-    ready.synchronize()
-    for name in (
-        "atomic_numbers",
-        "pos",
-        "cell",
-        "natoms",
-        "batch",
-        "pbc",
-        "charge",
-        "spin",
-    ):
-        source = getattr(data, name)
-        if source.is_floating_point():
-            source = source.to(dtype)
-        if source.device.type == "cpu":
-            staging = _pinned_buffer(name, slot, tuple(source.shape), source.dtype)
-            staging.copy_(source)
-            # Persistent device buffer, not a fresh .to(): a replayed CUDA graph
-            # re-executes recorded kernels against the pointers captured at
-            # capture time, so every input must live at a stable address and be
-            # refreshed by copy_ rather than reallocated.
-            dev = _device_buffer(name, tuple(source.shape), source.dtype, str(device))
-            # no_grad: the persistent pos/cell buffers keep requires_grad=True
-            # across calls, and copy_ into a leaf that requires grad is illegal.
-            with torch.no_grad():
-                dev.copy_(staging, non_blocking=True)
-            tensors[name] = dev
-        else:
+    ready = None
+    try:
+        for name in (
+            "atomic_numbers",
+            "pos",
+            "cell",
+            "natoms",
+            "batch",
+            "pbc",
+            "charge",
+            "spin",
+        ):
+            source = getattr(data, name)
+            if source.is_floating_point():
+                source = source.to(dtype)
+            if source.device.type == "cpu":
+                if ready is None:
+                    # GPU-resident MD requests do not use host staging and must
+                    # not incur an otherwise unnecessary host event wait.
+                    ready = _staging_ready(slot, str(device))
+                    ready.synchronize()
+                    _stage_slot = (_stage_slot + 1) % _STAGE_SLOTS
+                staging = _pinned_buffer(
+                    name, slot, tuple(source.shape), source.dtype, str(device)
+                )
+                staging.copy_(source)
+                source = staging
+            # Stable pointers support replay. Capture keys also include these
+            # addresses so bounded-cache eviction cannot replay stale inputs.
             dev = _device_buffer(name, tuple(source.shape), source.dtype, str(device))
             with torch.no_grad():
                 dev.copy_(source, non_blocking=True)
             tensors[name] = dev
-
-    ready.record()
+    except BaseException:
+        # A later field can fail after earlier H2D copies have been queued.
+        # Preserve the original error, but do not reuse/free their pinned slot
+        # while those copies are still reading it.
+        if ready is not None:
+            with suppress(Exception):
+                ready.record()
+                ready.synchronize()
+        raise
+    if ready is not None:
+        ready.record()
     tensors["pos"].requires_grad_(True)
     tensors["cell"].requires_grad_(True)
     return tensors
 
 
-@contextmanager
 def _tf32_context():
-    original_matmul = torch.backends.cuda.matmul.allow_tf32
-    original_cudnn = torch.backends.cudnn.allow_tf32
-    original_precision = torch.get_float32_matmul_precision()
-    precision = "high" if _USE_TF32 else "highest"
-    try:
-        torch.backends.cuda.matmul.allow_tf32 = _USE_TF32
-        torch.backends.cudnn.allow_tf32 = _USE_TF32
-        torch.set_float32_matmul_precision(precision)
-        yield
-    finally:
-        torch.backends.cuda.matmul.allow_tf32 = original_matmul
-        torch.backends.cudnn.allow_tf32 = original_cudnn
-        torch.set_float32_matmul_precision(original_precision)
+    return tf32_context_manager(_USE_TF32, device_type="cuda")
 
 
 # ``_compiled_graph_builder`` is removed for the same reason: it called
@@ -14861,6 +14977,55 @@ def _forward_tensors(backbone, head, tensors, dataset_name, graph):
 # Independent CUDA graphs may share a pool only when replayed in capture order;
 # capacity keys can be revisited in any order, so a key change replaces the graph.
 _GRAPH_STATE = {}
+_RUNTIME_COUNTERS = {
+    "captures": 0,
+    "replays": 0,
+    "capacity_probes": 0,
+    "capacity_overflows": 0,
+}
+
+
+def runtime_cache_info():
+    """
+    Return owned scalar diagnostics for this process, without synchronizing CUDA.
+
+    Counters include all Nitro models in this process. Take before/after snapshots
+    around a benchmark; no input/output tensors or CUDA handles are exposed.
+    """
+    with _NITRO_RUNTIME_LOCK:
+        key = next(iter(_GRAPH_STATE), None)
+        capacities = dict(key[3]) if isinstance(key, tuple) and len(key) > 4 else None
+        return {
+            **_RUNTIME_COUNTERS,
+            "live_graphs": len(_GRAPH_STATE),
+            "active_capacities": capacities,
+            "device_buffers": _device_buffer.cache_info().currsize,
+            "pinned_buffers": _pinned_buffer.cache_info().currsize,
+            "staging_events": _staging_ready.cache_info().currsize,
+            "capacity_records": len(_LIVE_EDGES),
+            "constant_entries": sum(len(cache) for cache in _constant_caches()),
+            "constant_bytes": sum(
+                _cached_nbytes(value)
+                for cache in _constant_caches()
+                for value in cache.values()
+            ),
+            "captured_constant_bytes": _cached_nbytes(_GRAPH_REFERENCES),
+            "captured_input_bytes": _cached_nbytes(_GRAPH_INPUTS),
+        }
+
+
+def _constant_caches():
+    return (
+        _IMAGE_SCAFFOLD,
+        _NEIGHBOR_GRID,
+        _REPEAT_ARANGE,
+        _DBETA_VEC,
+        _DM_DUMMY,
+        _COEF_CACHE,
+        _D_COLSUM,
+        _DM_COLSUMS,
+    )
+
 
 # Monotonically increasing, never reused. `id()` would be wrong here in the one way
 # that matters: a freed model's graphs stay in `_GRAPH_STATE` holding its weights'
@@ -14892,6 +15057,9 @@ def _model_token(model):
         _NEXT_MODEL_TOKEN[0] += 1
         token = _NEXT_MODEL_TOKEN[0]
         model._uma_nitro_graph_token = token
+        finalizer = weakref.finalize(model, _release_token_runtime, token)
+        finalizer.atexit = False
+        model._uma_nitro_runtime_finalizer = finalizer
     return token
 
 
@@ -14901,6 +15069,10 @@ _USE_GRAPH = os.environ.get("UMA_NITRO_NO_CUDAGRAPH") != "1"
 # The pool of the sole live graph. A differently keyed graph is captured only after
 # this pool and its graph have been released.
 _GRAPH_POOL = None
+_GRAPH_DEVICE = None
+_GRAPH_REFERENCES = ()
+_GRAPH_INPUTS = ()
+_GRAPH_OUTPUT_READY = None
 
 
 def _flush_graphs():
@@ -14910,25 +15082,67 @@ def _flush_graphs():
     Replays and the output clones queued after them are asynchronous, so all device
     work must finish before graph executables or pool tensors are released.
     """
-    global _GRAPH_POOL
-    torch.cuda.synchronize()
-    for graph, _ in _GRAPH_STATE.values():
-        graph.reset()
-    _GRAPH_STATE.clear()
-    _GRAPH_POOL = None
-    torch.cuda.empty_cache()
+    global _GRAPH_POOL, _GRAPH_DEVICE, _GRAPH_REFERENCES, _GRAPH_INPUTS
+    global _GRAPH_OUTPUT_READY
+    with _NITRO_RUNTIME_LOCK, (
+        torch.cuda.device(_GRAPH_DEVICE) if _GRAPH_DEVICE is not None else nullcontext()
+    ):
+        torch.cuda.synchronize()
+        for graph, _ in _GRAPH_STATE.values():
+            graph.reset()
+        _GRAPH_STATE.clear()
+        _GRAPH_POOL = None
+        _GRAPH_DEVICE = None
+        _GRAPH_REFERENCES = ()
+        _GRAPH_INPUTS = ()
+        _GRAPH_OUTPUT_READY = None
+        torch.cuda.empty_cache()
 
 
-_WARMUP_STREAM: list = []
+def _release_runtime(model):
+    """
+    Release the graph/input allocations owned by this model, not another one.
+    """
+    token = getattr(model, "_uma_nitro_graph_token", None)
+    finalizer = getattr(model, "_uma_nitro_runtime_finalizer", None)
+    if finalizer is not None:
+        finalizer.detach()
+    _release_token_runtime(token)
+
+
+def _release_token_runtime(token):
+    """
+    Token-only finalization avoids keeping the model alive through its cleanup.
+    """
+    with _NITRO_RUNTIME_LOCK:
+        owns_graph = any(
+            isinstance(key, tuple) and len(key) > 4 and key[4] == token
+            for key in _GRAPH_STATE
+        )
+        if _GRAPH_STATE and not owns_graph:
+            return
+        if _GRAPH_STATE:
+            _flush_graphs()
+        # Normal forward checks synchronize its guard; staging failures wait
+        # before propagating. No in-flight copy can still own these buffers.
+        _device_buffer.cache_clear()
+        _pinned_buffer.cache_clear()
+        _staging_ready.cache_clear()
+        for cache in _constant_caches():
+            cache.clear()
+
+
+_WARMUP_STREAM: dict = {}
 
 
 def _warmup_stream():
     """
     Return the process-wide capture-warmup stream, creating it on first use.
     """
-    if not _WARMUP_STREAM:
-        _WARMUP_STREAM.append(torch.cuda.Stream())
-    return _WARMUP_STREAM[0]
+    device = torch.cuda.current_device()
+    if device not in _WARMUP_STREAM:
+        _WARMUP_STREAM[device] = torch.cuda.Stream()
+    return _WARMUP_STREAM[device]
 
 
 WARM_SEQ = os.environ.get("UMA_NITRO_WARM_SEQ", "1") == "1"
@@ -14964,43 +15178,71 @@ def _capture(build):
     # pool cannot claim. Cached rather than fresh -- see `_WARMUP_STREAM`.
     side = _warmup_stream()
     side.wait_stream(torch.cuda.current_stream())
-    global _GRAPH_POOL, _SEQ_FORK
+    global _GRAPH_POOL, _GRAPH_DEVICE, _SEQ_FORK
+    global _CAPTURE_REFERENCES, _GRAPH_REFERENCES
     dev = torch.cuda.current_device()
-    with torch.cuda.stream(side):
-        _SEQ_FORK = WARM_SEQ
-        try:
-            for _ in range(3):
-                build()
-        finally:
-            _SEQ_FORK = False
-    torch.cuda.current_stream().wait_stream(side)
-    torch.cuda.synchronize()
-    if WARM_SEQ and _MAX_FORK[0]:
-        _side_streams(_MAX_FORK[0])
-        if WARM_SEQ_PROBE:
-            probe = torch.zeros((8, 8), device=f"cuda:{dev}")
-            for stream in _side_streams(_MAX_FORK[0]):
-                stream.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(stream):
-                    probe.mm(probe)
-                torch.cuda.current_stream().wait_stream(stream)
-            del probe
+    graph = None
+    _CAPTURE_REFERENCES = [
+        value for cache in _constant_caches() for value in cache.values()
+    ]
+    try:
+        with torch.cuda.stream(side):
+            _SEQ_FORK = WARM_SEQ
+            try:
+                for _ in range(3):
+                    build()
+            finally:
+                _SEQ_FORK = False
+        torch.cuda.current_stream().wait_stream(side)
         torch.cuda.synchronize()
+        if WARM_SEQ and _MAX_FORK[0]:
+            _side_streams(_MAX_FORK[0])
+            if WARM_SEQ_PROBE:
+                probe = torch.zeros((8, 8), device=f"cuda:{dev}")
+                for stream in _side_streams(_MAX_FORK[0]):
+                    stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(stream):
+                        probe.mm(probe)
+                    torch.cuda.current_stream().wait_stream(stream)
+                del probe
+            torch.cuda.synchronize()
 
-    # Only one graph is retained. A new key flushes this graph and its pool before
-    # capture, so independently replayed graphs never share allocator state.
-    graph = torch.cuda.CUDAGraph()
-    if _CAPTURE_POOL:
-        # Same stream as the warmup: a pool's blocks are stream-bound.
-        with torch.cuda.graph(graph, pool=_CAPTURE_POOL[0], stream=side):
-            outputs = build()
-        _GRAPH_POOL = _CAPTURE_POOL[0]
+        # Warmups have completed. Retain the constants read by the actual
+        # capture, including new entries evicted from bounded lookup caches.
+        _CAPTURE_REFERENCES = [
+            value for cache in _constant_caches() for value in cache.values()
+        ]
+        # Independently replayed graphs must not share allocator state.
+        graph = torch.cuda.CUDAGraph()
+        if _CAPTURE_POOL:
+            with torch.cuda.graph(graph, pool=_CAPTURE_POOL[0], stream=side):
+                outputs = build()
+            _GRAPH_POOL = _CAPTURE_POOL[0]
+        else:
+            assert _GRAPH_POOL is None
+            with torch.cuda.graph(graph, stream=_cap_stream(side)):
+                outputs = build()
+            _GRAPH_POOL = graph.pool()
+        torch.cuda.synchronize()
+    except BaseException:
+        # Warmup/capture may have queued work on side streams before throwing.
+        # Join before temporary tensors or a partially created graph disappear.
+        with suppress(Exception):
+            torch.cuda.current_stream().wait_stream(side)
+            torch.cuda.synchronize()
+        if graph is not None:
+            with suppress(Exception):
+                graph.reset()
+        _GRAPH_POOL = None
+        _GRAPH_DEVICE = None
+        _GRAPH_REFERENCES = ()
+        raise
     else:
-        assert _GRAPH_POOL is None
-        with torch.cuda.graph(graph, stream=_cap_stream(side)):
-            outputs = build()
-        _GRAPH_POOL = graph.pool()
-    torch.cuda.synchronize()
+        _GRAPH_REFERENCES = tuple(_CAPTURE_REFERENCES)
+    finally:
+        _CAPTURE_REFERENCES = None
+    _GRAPH_DEVICE = dev
+    _RUNTIME_COUNTERS["captures"] += 1
     return graph, outputs
 
 
@@ -15015,7 +15257,7 @@ def _get_or_capture_graph(key, build):
     return state
 
 
-def _forward_once(model, data, core):
+def _forward_once(model, data, core, geometry_key=None):
     """
     Run one UMA Nitro inference attempt.
 
@@ -15026,20 +15268,28 @@ def _forward_once(model, data, core):
         model: The prepared ``UMANitroModel``.
         data: A single-system ``AtomicData``.
         core: The tensor compute, normally ``_forward_tensors``.
+        geometry_key: Optional immutable capacity key computed before input upload.
 
     Returns:
         Normalized ``energy`` ``(1,)``, ``forces`` ``(N, 3)`` and ``stress``
         ``(1, 9)``.
     """
+    global _GRAPH_INPUTS, _GRAPH_OUTPUT_READY
     backbone = model.backbone
     head = model.head
     dataset_name = data.dataset[0]
     device = backbone.sphere_embedding.weight.device
     dtype = backbone.sphere_embedding.weight.dtype
+    if _GRAPH_OUTPUT_READY is not None:
+        # The preceding guard waited for graph compute, but its output clones
+        # were queued afterward. Another caller may use a different CUDA stream;
+        # order shared-buffer reuse after those copies without blocking the host.
+        torch.cuda.current_stream().wait_event(_GRAPH_OUTPUT_READY)
     with record_function("move_inputs"):
         tensors = _move_inputs(data, device, dtype)
 
-    geometry_key = _geometry_key(data)
+    if geometry_key is None:
+        geometry_key = _geometry_key(data)
     caps = _measured_caps(backbone, tensors, dataset_name, geometry_key)
     capacity_cache_key = _capacity_cache_key(
         tensors["pos"].shape[0], dataset_name, geometry_key
@@ -15086,7 +15336,7 @@ def _forward_once(model, data, core):
             built["_overflow"], capacity_cache_key, tensors["pos"].shape[0]
         )
         del built["_overflow"]
-        return built
+        return {name: value.detach().clone() for name, value in built.items()}
 
     key = (
         tuple(tensors["pos"].shape),
@@ -15094,8 +15344,15 @@ def _forward_once(model, data, core):
         dataset_name,
         tuple(sorted(caps.items())),
         _model_token(model),
+        tuple(
+            (name, value.device, value.dtype, tuple(value.shape), value.data_ptr())
+            for name, value in tensors.items()
+        ),
     )
     state = _get_or_capture_graph(key, _build)
+    # Input buffers can leave the bounded lookup cache while this graph is
+    # still alive. Keep its storage until synchronized graph teardown as well.
+    _GRAPH_INPUTS = tuple(tensors.values())
     graph, outputs = state
     # Shape guard. Unlike the device assert -- which catches a geometry outgrowing a
     # correct capacity -- this catches a *plumbing* mistake: a capacity that never
@@ -15107,6 +15364,7 @@ def _forward_once(model, data, core):
     )
     with record_function("graph_replay"):
         graph.replay()
+        _RUNTIME_COUNTERS["replays"] += 1
     _check_graph_flag(outputs["_overflow"], capacity_cache_key, tensors["pos"].shape[0])
     # Clone: every replay overwrites these graph-pool tensors in place, so handing
     # them out directly would make successive calls alias one another -- the
@@ -15116,28 +15374,56 @@ def _forward_once(model, data, core):
     # graph alive, so a caller retaining predictions across calls retains one full
     # forward graph each -- the leak upstream #2136 fixes at the predict() boundary for
     # conservative models. Nothing here differentiates the outputs again.
-    return {k: v.detach().clone() for k, v in outputs.items() if k != "_overflow"}
+    result = {k: v.detach().clone() for k, v in outputs.items() if k != "_overflow"}
+    if _GRAPH_OUTPUT_READY is None:
+        _GRAPH_OUTPUT_READY = torch.cuda.Event()
+    _GRAPH_OUTPUT_READY.record()
+    return result
 
 
-def _nitro_forward(model, data, core=_forward_tensors):
+def _nitro_forward(model, data, core=_forward_tensors, *, geometry_key=None):
     """
     Run UMA Nitro inference, rebuilding if the radius graph outgrows its capacity.
     """
-    retries = 0
-    while True:
-        try:
-            return _forward_once(model, data, core)
-        except _GraphCapacityOverflow as error:
-            _LIVE_EDGES.pop(error.cache_key, None)
-            if _GRAPH_STATE:
-                _flush_graphs()
-            if retries >= _CAPACITY_RECOVERY_RETRIES:
-                raise UMANitroNotSupportedError(
-                    "UMA Nitro: radius-graph capacity still overflowing after "
-                    f"{retries} remeasurement(s) at {error.natoms} atoms.\n"
-                    f"{_OVERFLOW_HELP}"
-                ) from None
-            retries += 1
+    backbone = getattr(model, "backbone", None)
+    weight = getattr(getattr(backbone, "sphere_embedding", None), "weight", None)
+    device_scope = (
+        torch.cuda.device(weight.device)
+        if isinstance(weight, torch.Tensor) and weight.is_cuda
+        else nullcontext()
+    )
+    with _NITRO_RUNTIME_LOCK, device_scope, torch.inference_mode(
+        False
+    ), torch.enable_grad():
+        retries = 0
+        while True:
+            try:
+                if geometry_key is None:
+                    return _forward_once(model, data, core)
+                return _forward_once(model, data, core, geometry_key=geometry_key)
+            except _GraphCapacityOverflow as error:
+                _RUNTIME_COUNTERS["capacity_overflows"] += 1
+                _LIVE_EDGES.pop(error.cache_key, None)
+                high_water = getattr(backbone, "_uma_nitro_capacity_high_water", None)
+                if high_water is not None:
+                    natoms, dataset, geom_key = error.cache_key
+                    high_water.pop((natoms, dataset, geom_key[1]), None)
+                if _GRAPH_STATE:
+                    _flush_graphs()
+                if retries >= _CAPACITY_RECOVERY_RETRIES:
+                    raise UMANitroNotSupportedError(
+                        "UMA Nitro: radius-graph capacity still overflowing after "
+                        f"{retries} remeasurement(s) at {error.natoms} atoms.\n"
+                        f"{_OVERFLOW_HELP}"
+                    ) from None
+                retries += 1
+            except BaseException:
+                # A validation/allocation failure can follow successful async
+                # staging but precede the synchronizing overflow check.
+                if isinstance(weight, torch.Tensor) and weight.is_cuda:
+                    with suppress(Exception):
+                        torch.cuda.synchronize()
+                raise
 
 
 _FLAG_COUPLINGS = (
@@ -15221,11 +15507,15 @@ def set_force_precision(force_fp32: bool) -> None:
         force_fp32: Whether force and stress intermediates use fp32. Captured
             graphs are flushed so a change takes effect.
     """
-    g = globals()
-    for _name in _FORCE_PATH_FP16_FLAGS:
-        g[_name] = not force_fp32
-    if _GRAPH_STATE:
-        _flush_graphs()
+    with _NITRO_RUNTIME_LOCK:
+        g = globals()
+        changed = any(g[_name] != (not force_fp32) for _name in _FORCE_PATH_FP16_FLAGS)
+        if not changed:
+            return
+        for _name in _FORCE_PATH_FP16_FLAGS:
+            g[_name] = not force_fp32
+        if _GRAPH_STATE:
+            _flush_graphs()
 
 
 # ============================================================================
@@ -15317,11 +15607,34 @@ def _gate_expand_index(lmax: int, mmax: int, m_prime: bool) -> torch.Tensor:
     )
 
 
+class _NitroCacheState:
+    """
+    Serialize weights, without derived kernel layouts or captured-graph identity.
+
+    Omitting these tensors before deepcopy/pickle avoids both duplicating large
+    device caches and following a stale transient autograd graph. The layouts
+    are rebuilt lazily from the copied model's own weights.
+    """
+
+    def __getstate__(self):
+        state = super().__getstate__()
+        for name in tuple(state):
+            if name.startswith("_uma_nitro_"):
+                del state[name]
+        if "_w_block" in state.get("_buffers", {}):
+            state["_buffers"] = {**state["_buffers"], "_w_block": None}
+        return state
+
+
+class _NitroLinear(_NitroCacheState, nn.Linear):
+    pass
+
+
 def _frozen_linear(in_features: int, out_features: int, bias: bool = True):
     """
     Return an uninitialized ``nn.Linear``; its values come from the checkpoint.
     """
-    return nn.Linear(in_features, out_features, bias=bias, device="meta").to_empty(
+    return _NitroLinear(in_features, out_features, bias=bias, device="meta").to_empty(
         device="cpu"
     )
 
@@ -15344,7 +15657,7 @@ class _RadialMLP(nn.Module):
         self.net = _radial_net(channels)
 
 
-class _EquivariantRMSNorm(nn.Module):
+class _EquivariantRMSNorm(_NitroCacheState, nn.Module):
     def __init__(self, lmax: int, num_channels: int) -> None:
         super().__init__()
         self.lmax = lmax
@@ -15364,7 +15677,7 @@ class _EquivariantRMSNorm(nn.Module):
         )
 
 
-class _SO3Linear(nn.Module):
+class _SO3Linear(_NitroCacheState, nn.Module):
     def __init__(self, in_features: int, out_features: int, lmax: int) -> None:
         super().__init__()
         self.out_features = out_features
@@ -15383,7 +15696,7 @@ class _GateActivation(nn.Module):
         )
 
 
-class _SO2mConv(nn.Module):
+class _SO2mConv(_NitroCacheState, nn.Module):
     """
     One ``m > 0`` SO(2) linear in block-diagonal form, ``[[W1, -W2], [W2, W1]]``.
     """
@@ -15532,7 +15845,7 @@ class _UnifiedRadialMLP(nn.Module):
             )
 
 
-class _Backbone(nn.Module):
+class _Backbone(_NitroCacheState, nn.Module):
     def __init__(self, dataset_mapping: dict[str, str]) -> None:
         super().__init__()
         lmax = mmax = _LMAX_MMAX
@@ -15705,6 +16018,9 @@ def _validate_settings(settings) -> None:
         "merge_mole=False": not settings.merge_mole,
         "activation checkpointing": settings.activation_checkpointing,
         "external graph generation": settings.external_graph_gen,
+        "edge_chunk_size (Nitro cannot honor a chunked memory budget)": (
+            settings.edge_chunk_size is not None
+        ),
         "a precision other than float32": (
             settings.base_precision_dtype != torch.float32
         ),
@@ -15730,7 +16046,7 @@ def _load_tensor(module: nn.Module, name: str, value: torch.Tensor) -> None:
         target.copy_(value)
 
 
-class UMANitroModel(nn.Module):
+class UMANitroModel(_NitroCacheState, nn.Module):
     """
     Standalone UMA-S model built from checkpoint weights.
 
@@ -15743,6 +16059,7 @@ class UMANitroModel(nn.Module):
     as it does for the multigpu preset's fast path.
     """
 
+    @torch.inference_mode(False)
     def __init__(self, model_config: dict, state_dict: dict[str, torch.Tensor]):
         super().__init__()
         # The architecture is fixed (see verify_checkpoint_file); the config only
@@ -15750,8 +16067,17 @@ class UMANitroModel(nn.Module):
         dataset_mapping = model_config["backbone"]["dataset_mapping"]
         ((head_name, head_config),) = model_config["heads"].items()
         self.supports_single_atoms = bool(model_config.get("supports_single_atoms"))
-        self.backbone = _Backbone(dataset_mapping)
-        self.head = _EnergyHead(_SPHERE_CHANNELS, _HIDDEN_CHANNELS)
+        # Nitro's preparation and fixed kernels require CPU FP32 weights,
+        # regardless of the embedding application's default device/dtype.
+        with torch.device("cpu"):
+            self.backbone = _Backbone(dataset_mapping)
+            # The analytic Wigner coefficient table is intentionally FP64 at
+            # preparation, matching HydraModel's reference layout. Only the
+            # inference device/precision conversion later casts this buffer.
+            coefficients = self.backbone.wigner_c_l2
+            self.backbone.float()
+            self.backbone.wigner_c_l2 = coefficients
+            self.head = _EnergyHead(_SPHERE_CHANNELS, _HIDDEN_CHANNELS).float()
         wrapped_head = "head_cls" in head_config
         self._head_prefix = (
             f"output_heads.{head_name}.head."
@@ -15769,6 +16095,8 @@ class UMANitroModel(nn.Module):
         # Unmerged MOLE tensors stay on the CPU, outside the module tree, until
         # prepare_for_inference merges them for the first system.
         self._experts = self._load_state_dict(state_dict)
+        self.requires_grad_(False)
+        self.eval()
 
     @classmethod
     def from_checkpoint(cls, checkpoint) -> UMANitroModel:
@@ -15781,8 +16109,9 @@ class UMANitroModel(nn.Module):
         Returns:
             The unprepared model, with its checkpoint tasks set up.
         """
-        model = cls(checkpoint.model_config, checkpoint.ema_state_dict)
-        model.setup_tasks(checkpoint.tasks_config)
+        with torch.inference_mode(False), torch.device("cpu"):
+            model = cls(checkpoint.model_config, checkpoint.ema_state_dict)
+            model.setup_tasks(checkpoint.tasks_config)
         return model
 
     def _load_state_dict(self, state_dict: dict) -> dict[str, torch.Tensor]:
@@ -15814,7 +16143,9 @@ class UMANitroModel(nn.Module):
             if key.rsplit(".", 1)[0] in mole_layers or key.startswith(
                 ("backbone.routing_mlp.", "backbone.composition_embedding.")
             ):
-                experts[key] = value.to("cpu", torch.float32)
+                # .to() alone aliases a CPU FP32 checkpoint. The unmerged model
+                # must not change when a caller reuses or edits that checkpoint.
+                experts[key] = value.to("cpu", torch.float32, copy=True)
                 continue
             name = key.replace(self._head_prefix, "head.", 1)
             if name not in parameters:
@@ -15851,15 +16182,20 @@ class UMANitroModel(nn.Module):
         """
         import hydra
 
-        self._tasks = {}
-        self.add_tasks([hydra.utils.instantiate(config) for config in tasks_config])
+        with torch.inference_mode(False), torch.device("cpu"):
+            tasks = [hydra.utils.instantiate(config) for config in tasks_config]
+        self._replace_tasks(tasks, existing={})
 
     def add_tasks(self, tasks) -> None:
         """
         Register tasks; Nitro always computes energy, forces and stress.
         """
+        self._replace_tasks(tasks, existing=self._tasks)
+
+    def _replace_tasks(self, tasks, *, existing) -> None:
         from fairchem.core.models.base import _get_dataset_to_tasks_map
 
+        updated = dict(existing)
         for task in tasks:
             if task.property not in _SUPPORTED_PROPERTIES:
                 raise ValueError(
@@ -15869,8 +16205,10 @@ class UMANitroModel(nn.Module):
             unknown = set(task.datasets) - set(self._head_expert_index)
             if unknown:
                 raise ValueError(f"task {task.name!r} uses unknown datasets {unknown}")
-            self._tasks.setdefault(task.name, task)
-        self._dataset_to_tasks = _get_dataset_to_tasks_map(self._tasks.values())
+            updated.setdefault(task.name, task)
+        dataset_to_tasks = _get_dataset_to_tasks_map(updated.values())
+        self._tasks = updated
+        self._dataset_to_tasks = dataset_to_tasks
 
     def validate_atoms_data(self, atoms, task_name: str) -> None:
         from fairchem.core.units.mlip_unit.api.inference import validate_uma_atoms_data
@@ -15906,16 +16244,35 @@ class UMANitroModel(nn.Module):
 
         if data.natoms.numel() != 1:
             raise MergeMoleConsistencyError("UMA Nitro evaluates one system per call")
-        counts = torch.bincount(
-            data.atomic_numbers.long().cpu(), minlength=_MAX_NUM_ELEMENTS
-        )
+        atomic_numbers = data.atomic_numbers.detach().cpu()
+        if (
+            atomic_numbers.ndim != 1
+            or atomic_numbers.numel() == 0
+            or data.natoms.item() != atomic_numbers.numel()
+            or not torch.isfinite(atomic_numbers).all()
+            or not torch.equal(atomic_numbers, atomic_numbers.long())
+            or (atomic_numbers < 0).any()
+            or (atomic_numbers >= _MAX_NUM_ELEMENTS).any()
+        ):
+            raise ValueError(
+                "UMA Nitro requires valid integral atomic numbers and natoms"
+            )
+        metadata = []
+        for name, limits in (("charge", (-100, 100)), ("spin", (0, 100))):
+            value = getattr(data, name)
+            if value.numel() != 1:
+                raise ValueError(f"UMA Nitro requires one integral {name}")
+            scalar = value.item()
+            if not math.isfinite(scalar) or scalar != int(scalar):
+                raise ValueError(f"UMA Nitro requires one finite integral {name}")
+            if not limits[0] <= scalar <= limits[1]:
+                raise ValueError(f"UMA Nitro {name} must be in {limits}")
+            metadata.append(int(scalar))
+        if len(data.dataset) != 1:
+            raise MergeMoleConsistencyError("UMA Nitro evaluates one task per call")
+        counts = torch.bincount(atomic_numbers.long(), minlength=_MAX_NUM_ELEMENTS)
         reduced = counts.double() / counts.sum()
-        return (
-            reduced,
-            int(data.charge.reshape(-1)[0]),
-            int(data.spin.reshape(-1)[0]),
-            data.dataset[0],
-        )
+        return (reduced, *metadata, data.dataset[0])
 
     def on_predict_check(self, data) -> None:
         """
@@ -15927,9 +16284,24 @@ class UMANitroModel(nn.Module):
             MergeMoleConsistencyError,
         )
 
+        snapshot = getattr(self, "_uma_nitro_merge_snapshot", None)
+        fields = (data.atomic_numbers, data.charge, data.spin, data.natoms)
+        if (
+            snapshot is not None
+            and tuple(data.dataset) == snapshot[0]
+            and all(
+                value.shape == saved.shape
+                and value.dtype == saved.dtype
+                and value.device == saved.device
+                and torch.equal(value, saved)
+                for value, saved in zip(fields, snapshot[1], strict=True)
+            )
+        ):
+            return
+
         reduced, charge, spin, dataset = self._merge_key(data)
         merged = self._merged_key
-        if not torch.allclose(reduced, merged[0], rtol=1e-5, atol=0.0):
+        if not torch.equal(reduced, merged[0]):
             raise MergeMoleConsistencyError("Compositions differ from merged model")
         if charge != merged[1]:
             raise MergeMoleConsistencyError("Charge differs from merged model")
@@ -15937,7 +16309,22 @@ class UMANitroModel(nn.Module):
             raise MergeMoleConsistencyError("Spin differs from merged model")
         if dataset != merged[3]:
             raise MergeMoleConsistencyError("Task differs from merged model")
+        self._remember_merge_inputs(data)
 
+    def _remember_merge_inputs(self, data) -> None:
+        # Compare owned values, not Tensor._version: CPU NumPy views and .data
+        # writes can change metadata without incrementing the version counter.
+        self._uma_nitro_merge_snapshot = (
+            tuple(data.dataset),
+            tuple(
+                value.detach().clone()
+                for value in (data.atomic_numbers, data.charge, data.spin, data.natoms)
+            ),
+        )
+
+    @torch.inference_mode(False)
+    @torch.no_grad()
+    @torch.autocast("cpu", enabled=False)
     def prepare_for_inference(self, data, settings) -> UMANitroModel:
         """
         Merge the MOLE experts for ``data``'s system and select fp32 forces.
@@ -15951,6 +16338,7 @@ class UMANitroModel(nn.Module):
         """
         _validate_settings(settings)
         if self._merged_key is not None:
+            self.on_predict_check(data)
             return self
         key = self._merge_key(data)
         dataset = key[3]
@@ -15968,13 +16356,16 @@ class UMANitroModel(nn.Module):
                 continue
             if name.startswith("head."):
                 # The head selects the task's expert with a one-hot mixture.
-                mix = torch.zeros(1, weights.shape[0], dtype=weights.dtype)
+                mix = torch.zeros(
+                    1, weights.shape[0], dtype=weights.dtype, device=weights.device
+                )
                 mix[0, self._head_expert_index[dataset]] = 1.0
             else:
                 mix = coefficients
             _load_tensor(self, name, torch.einsum("eoi, be->boi", weights, mix)[0])
         self._experts = {}
         self._merged_key = key
+        self._remember_merge_inputs(data)
         set_force_precision(True)
         return self
 
@@ -16022,14 +16413,38 @@ class UMANitroModel(nn.Module):
         # The checkpoint's routing uses the default softmax coefficient norm.
         return torch.softmax(x, dim=1) + 0.005
 
-    def forward(self, data) -> dict[str, dict[str, torch.Tensor]]:
+    @staticmethod
+    def _cpu_geometry_key(data, dtype):
+        """
+        Build a per-request key before CPU inputs are uploaded, at inference dtype.
+        """
+        fields = (
+            data.pos,
+            data.atomic_numbers,
+            getattr(data, "cell", None),
+            getattr(data, "pbc", None),
+        )
+        if any(value is not None and not value.is_cpu for value in fields):
+            return None
+        return _geometry_key(data, dtype=dtype)
+
+    def forward(self, data, *, geometry_key=None) -> dict[str, dict[str, torch.Tensor]]:
         """
         Predict normalized energy, forces and stress for one system.
 
         Returns:
             ``{task_name: {property: tensor}}`` for the system's task.
         """
-        raw = _nitro_forward(self, data)
+        requested = data.get("_requested_properties")
+        if requested is not None and set(requested) - _SUPPORTED_PROPERTIES:
+            raise UMANitroNotSupportedError(
+                "UMA Nitro supports requested energy, forces and stress only"
+            )
+        raw = (
+            _nitro_forward(self, data)
+            if geometry_key is None
+            else _nitro_forward(self, data, geometry_key=geometry_key)
+        )
         # Element references in the predict unit read the full-system fields the
         # composable backbone records on ``data``; Nitro never partitions a graph.
         data["atomic_numbers_full"] = data["atomic_numbers"]
@@ -16043,8 +16458,31 @@ class UMANitroModel(nn.Module):
         """
         Free captured CUDA graphs before this model is discarded.
         """
-        if _GRAPH_STATE:
-            _flush_graphs()
+        with _NITRO_RUNTIME_LOCK:
+            _release_runtime(self)
+            self._clear_kernel_caches()
+
+    def _clear_kernel_caches(self) -> None:
+        for module in self.modules():
+            for name in tuple(vars(module)):
+                if name.startswith("_uma_nitro_"):
+                    delattr(module, name)
+            if isinstance(module, _SO2mConv):
+                module._w_block = None
+
+    def _apply(self, fn, recurse=True):
+        # Derived layouts are ordinary Tensor attributes, so Module.to() cannot
+        # move them. Drop captured addresses and rebuild from moved weights.
+        with _NITRO_RUNTIME_LOCK:
+            self.release_inference_resources()
+            return super()._apply(fn, recurse=recurse)
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        with _NITRO_RUNTIME_LOCK:
+            self.release_inference_resources()
+            result = super().load_state_dict(state_dict, strict=strict, assign=assign)
+            self.requires_grad_(False)
+            return result
 
 
 def _expert_key(parameter_name: str, head_prefix: str) -> str:

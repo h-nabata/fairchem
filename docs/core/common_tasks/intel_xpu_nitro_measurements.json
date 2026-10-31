@@ -1,0 +1,189 @@
+{
+  "scope": "CPU component microbenchmarks, not GPU or end-to-end MD throughput; concurrent audit workload. Positive allocation sums are not peak memory.",
+  "baseline_commit": "496f8a4e851c1c2fe63aada052dcedeb66481058",
+  "graph": {
+    "torch": "2.15.0+cpu",
+    "threads": 2,
+    "device": "cpu",
+    "repeats": 12,
+    "synthetic_geometry": [
+      {
+        "atoms": 1000,
+        "edges": 50000,
+        "forward": {
+          "baseline_ms": 2.9561030023614876,
+          "candidate_ms": 1.4545015001203865
+        },
+        "profile": {
+          "baseline": {
+            "positive_self_allocation_bytes": 5650000,
+            "op_counts": {
+              "aten::index": 7,
+              "aten::arange": 2,
+              "aten::nonzero": 1
+            }
+          },
+          "candidate": {
+            "positive_self_allocation_bytes": 3450002,
+            "op_counts": {
+              "aten::index": 2,
+              "aten::all": 1,
+              "aten::_local_scalar_dense": 1
+            }
+          }
+        },
+        "forward_backward": {
+          "baseline_ms": 5.3266069990058895,
+          "candidate_ms": 3.5498545003065374
+        }
+      },
+      {
+        "atoms": 15000,
+        "edges": 750000,
+        "forward": {
+          "baseline_ms": 53.214207000564784,
+          "candidate_ms": 29.088442999636754
+        },
+        "profile": {
+          "baseline": {
+            "positive_self_allocation_bytes": 84750000,
+            "op_counts": {
+              "aten::index": 7,
+              "aten::arange": 2,
+              "aten::nonzero": 1
+            }
+          },
+          "candidate": {
+            "positive_self_allocation_bytes": 51750002,
+            "op_counts": {
+              "aten::index": 2,
+              "aten::all": 1,
+              "aten::_local_scalar_dense": 1
+            }
+          }
+        },
+        "forward_backward": {
+          "baseline_ms": 83.76365649746731,
+          "candidate_ms": 55.060887498257216
+        }
+      }
+    ],
+    "warm_verlet": [
+      {
+        "atoms": 1000,
+        "edges": 28000,
+        "cap": 0,
+        "baseline_ms": 3.7172464981267694,
+        "candidate_ms": 3.168952502164757
+      },
+      {
+        "atoms": 1000,
+        "edges": 28000,
+        "cap": 300,
+        "baseline_ms": 5.719757500628475,
+        "candidate_ms": 4.442056499101454
+      }
+    ]
+  },
+  "torchsim_conversion": [
+    {
+      "atoms": 1000,
+      "clone_metadata": true,
+      "device": "cpu",
+      "results": {
+        "baseline": {
+          "median_ms_per_conversion": 0.8566038999560988,
+          "operators_over_20_conversions": {
+            "aten::_local_scalar_dense": 540,
+            "aten::bincount": 40,
+            "aten::repeat_interleave": 80,
+            "aten::clone": 380
+          }
+        },
+        "updated": {
+          "median_ms_per_conversion": 0.43510774994501844,
+          "operators_over_20_conversions": {
+            "aten::_local_scalar_dense": 40,
+            "aten::clone": 40
+          }
+        }
+      }
+    },
+    {
+      "atoms": 15000,
+      "clone_metadata": true,
+      "device": "cpu",
+      "results": {
+        "baseline": {
+          "median_ms_per_conversion": 1.4028230500116479,
+          "operators_over_20_conversions": {
+            "aten::_local_scalar_dense": 540,
+            "aten::bincount": 40,
+            "aten::repeat_interleave": 80,
+            "aten::clone": 380
+          }
+        },
+        "updated": {
+          "median_ms_per_conversion": 0.6268176999583375,
+          "operators_over_20_conversions": {
+            "aten::_local_scalar_dense": 40,
+            "aten::clone": 40
+          }
+        }
+      }
+    }
+  ],
+  "nitro_metadata_check": {
+    "kind": "CPU metadata validation only; concurrent audit workload, not GPU inference",
+    "rows": [
+      {
+        "atoms": 150,
+        "baseline_seconds": 3.4369101995253005e-05,
+        "snapshot_seconds": 7.699875000980683e-06,
+        "speed_ratio": 4.4635921999870956
+      },
+      {
+        "atoms": 1000,
+        "baseline_seconds": 4.578648498863913e-05,
+        "snapshot_seconds": 8.834376498271013e-06,
+        "speed_ratio": 5.182763605060307
+      },
+      {
+        "atoms": 15000,
+        "baseline_seconds": 7.262539002113044e-05,
+        "snapshot_seconds": 1.973541399638634e-05,
+        "speed_ratio": 3.679952699975209
+      }
+    ]
+  },
+  "frozen_strided_linear": {
+    "scope": "FP32 CPU 2 threads; source [E,9,128], slice 3:7 reshaped [E,2,256], frozen weight [128,256], no_grad, torch.utils.benchmark blocked_autorange min_run_time=0.6s; temporary contiguous copy increases allocation",
+    "rows": [
+      {
+        "edges": 8192,
+        "baseline_median_ms": 36.415,
+        "folded_median_ms": 14.582,
+        "baseline_iqr_ms": 10.442,
+        "folded_iqr_ms": 0.442,
+        "baseline_positive_self_allocation_bytes": 8388608,
+        "folded_positive_self_allocation_bytes": 25165824,
+        "max_abs_difference": 3.814697265625e-05
+      },
+      {
+        "edges": 65536,
+        "baseline_median_ms": 228.272,
+        "folded_median_ms": 156.432,
+        "baseline_iqr_ms": 18.55,
+        "folded_iqr_ms": 7.125,
+        "baseline_positive_self_allocation_bytes": 67108864,
+        "folded_positive_self_allocation_bytes": 201326592,
+        "max_abs_difference": 3.814697265625e-05
+      }
+    ]
+  },
+  "prepared_settings_comparison": {
+    "scope": "CPU only, 7 repetitions x 10000 calls",
+    "baseline_median_us": 70.75,
+    "candidate_median_us": 4.71
+  }
+}

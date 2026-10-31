@@ -49,7 +49,7 @@ class _SimStateConverter:
     """
     Cache validated, immutable batch metadata while refreshing geometry each call.
 
-    Cache keys retain the original tensors and check PyTorch's mutation versions,
+    Cache keys retain the current tensors and check PyTorch's mutation versions,
     so allocator address reuse cannot produce a false hit. Owned value snapshots
     also detect writes through NumPy/DLPack or ``.data`` that bypass mutation
     counters. Returned batches never expose the private cached template.
@@ -123,7 +123,10 @@ class _SimStateConverter:
             state.positions.device,
             target_dtype,
             task_name,
-            tuple(name in state.system_extras for name in ("charge", "spin")),
+            tuple(
+                (state.has_extras(name), name in state.system_extras)
+                for name in ("charge", "spin")
+            ),
             None if state.cell is None else (state.cell.shape, state.cell.device),
         )
         try:
@@ -133,15 +136,19 @@ class _SimStateConverter:
             # than treating an unobservable mutation as immutable metadata.
             self.clear()
             return _simstate_to_atomicdata_batch(state, task_name, target_dtype)
+        same_owners = self._owners is not None and all(
+            old is new for old, new in zip(self._owners, owners)
+        )
         hit = (
             self._template is not None
             and self._signature == signature
-            and self._versions == versions
-            and all(old is new for old, new in zip(self._owners, owners))
+            and (not same_owners or self._versions == versions)
             and all(
-                new is None
+                (old is None and new is None)
                 or (
-                    old.dtype == new.dtype
+                    old is not None
+                    and new is not None
+                    and old.dtype == new.dtype
                     and old.device == new.device
                     and torch.equal(old, new)
                 )
@@ -177,6 +184,11 @@ class _SimStateConverter:
                 self._ready_event.record(backend.current_stream(self._cache_device))
             return batch
 
+        # Integrators may clone a state while retaining the same composition.
+        # Exact snapshot comparison permits reuse without rebuilding metadata;
+        # replace owners so the cache does not pin an obsolete state's storage.
+        self._owners = owners
+        self._versions = versions
         positions = state.positions.to(target_dtype)
         n_systems = self._template.natoms.numel()
         cell = (

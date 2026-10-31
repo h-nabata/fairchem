@@ -139,3 +139,6 @@ CI=true OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 python -m pytest \
 
 この記録は、記載したバージョンと試験経路で確認した結果であり、全ライブラリ・設定・
 入力の組合せで不具合がないという保証ではない。
+
+続くNitro・大規模MD経路の監査、追加修正と実機測定手順は
+[UMA-Nitro・MD整合性監査](intel_xpu_nitro_audit.md)を参照。

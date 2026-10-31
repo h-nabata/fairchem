@@ -278,12 +278,17 @@ class MicrobatchPredictor:
 
     def _predict_many(self, structures, *, edge_counts=None):
         plan = plan_microbatches(structures, self.limits, edge_counts=edge_counts)
+        nitro = getattr(
+            getattr(self.predictor, "inference_settings", None), "nitro", False
+        )
+        # Nitro is a single-system engine. Coalescing independent MD frames
+        # would permanently disable it before any useful fused work can run.
         plan = [
             group
             for indices in plan
             for group in (
                 [[i] for i in indices]
-                if any(self._dense_hessian(structures[i]) for i in indices)
+                if nitro or any(self._dense_hessian(structures[i]) for i in indices)
                 else [indices]
             )
         ]

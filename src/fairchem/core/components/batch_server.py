@@ -315,6 +315,7 @@ class BatchPredictServerMixin:
         if not items:
             return []
         settings = getattr(predict_unit, "inference_settings", None)
+        nitro = getattr(settings, "nitro", False)
         requested = getattr(settings, "requested_properties", None)
         tasks = getattr(predict_unit, "dataset_to_tasks", {})
         groups = defaultdict(list)
@@ -342,7 +343,9 @@ class BatchPredictServerMixin:
             )
             key = (
                 _compatibility_key(data),
-                index if dense_hessian else None,
+                # Keep explicitly selected Nitro active for independent MD
+                # requests; its ordinary composition checks still apply.
+                index if dense_hessian or nitro else None,
             )
             groups[key].append(index)
         if len(groups) > 1:

@@ -167,7 +167,6 @@ def test_reports_every_unsupported_setting():
         {"compile": False},
         {"hessian_vmap": True},
         {"hessian_vmap": False},
-        {"edge_chunk_size": 1000},
         {"use_quaternion_wigner": False},
         {"torch_num_threads": 2},
         {"auto_add_default_untrained_tasks": False},

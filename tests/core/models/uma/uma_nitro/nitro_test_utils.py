@@ -216,6 +216,7 @@ UNSUPPORTED_SETTINGS = [
     ({"base_precision_dtype": torch.float64}, "float32"),
     ({"tf32": False}, "tf32=False"),
     ({"predict_untrained_hessian": {"omat"}}, "Hessian"),
+    ({"edge_chunk_size": 1000}, "chunked memory budget"),
 ]
 
 

@@ -205,9 +205,12 @@ class VerletNeighborCache:
                         for name, value in metadata.items()
                     },
                     "pos": data.pos.detach().clone(),
-                    "edges": edges.detach().clone(),
-                    "cells": cells.detach().clone(),
-                    "counts": counts.detach().clone(),
+                    # Graph-v2 constructs owned output tensors. Retain those
+                    # directly instead of briefly holding two full outer lists
+                    # during each rebuild; public outputs are selected below.
+                    "edges": edges.detach(),
+                    "cells": cells.detach(),
+                    "counts": counts.detach(),
                     "event": None,
                 }
                 entry["event"] = self._stream_event(data.pos.device)
@@ -238,19 +241,23 @@ class VerletNeighborCache:
             distance_error = rounding * (2 * distance2.sqrt() + rounding)
             if bool(((distance2 - cutoff * cutoff).abs() <= distance_error).any()):
                 self.boundary_fallbacks += 1
-                return radius_graph_pbc_v2(data, cutoff, max_neighbors, strict, pbc=pbc)
+                return radius_graph_pbc_v2(
+                    data, cutoff, max_neighbors, strict, pbc=pbc, method=method
+                )
             keep = (distance2 <= cutoff * cutoff) & (distance2 != 0)
             edges, cells, distance2 = edges[:, keep], cells[keep], distance2[keep]
             distance_error = distance_error[keep]
             if len(data.pos) == 0:
                 return edges, cells, torch.zeros_like(data.natoms, dtype=torch.long)
+            needs_capping = False
             if max_neighbors > 0 and len(distance2) > 1:
                 degrees = torch.zeros(
                     len(data.pos), dtype=torch.long, device=data.pos.device
                 )
                 degrees.scatter_add_(0, edges[1], torch.ones_like(edges[1]))
                 overfull = degrees > max_neighbors
-                if bool(overfull.any()):
+                needs_capping = bool(overfull.any())
+                if needs_capping:
                     # Order statistics move by at most the largest input error.
                     # Guard both strict k/k+1 selection and the non-strict
                     # (k+1)th-distance + 0.01 degeneracy threshold. Checking
@@ -284,7 +291,7 @@ class VerletNeighborCache:
                         self.cap_fallbacks += 1
                         self.tie_fallbacks += int(strict)
                         return radius_graph_pbc_v2(
-                            data, cutoff, max_neighbors, strict, pbc=pbc
+                            data, cutoff, max_neighbors, strict, pbc=pbc, method=method
                         )
             mask, counts = get_max_neighbors_mask(
                 data.natoms,
@@ -293,4 +300,9 @@ class VerletNeighborCache:
                 max_neighbors,
                 enforce_max_strictly=strict,
             )
+            if not needs_capping:
+                # Cutoff filtering above already owns these outputs. Selecting
+                # every edge again wastes two gathers and dynamic-size index
+                # synchronization on the ordinary uncapped/under-cap MD path.
+                return edges, cells, counts
             return edges[:, mask], cells[mask], counts

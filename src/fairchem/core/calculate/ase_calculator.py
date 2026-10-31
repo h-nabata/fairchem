@@ -14,6 +14,7 @@ from functools import partial
 from typing import TYPE_CHECKING, Literal
 
 import numpy as np
+import torch
 from ase.calculators.calculator import (
     Calculator,
     PropertyNotImplementedError,
@@ -318,7 +319,7 @@ class FAIRChemCalculator(Calculator):
             raise ValueError("Atoms object has no atoms inside.")
 
         # Check if the atoms object has periodic boundary conditions (PBC) set correctly
-        if np.all(atoms.pbc) and np.allclose(atoms.cell, 0):
+        if np.all(np.asarray(atoms.pbc)) and np.allclose(atoms.cell, 0):
             raise AllZeroUnitCellError
 
         # Validate input data
@@ -340,6 +341,25 @@ class FAIRChemCalculator(Calculator):
             }
             if "energy" in self.implemented_properties:
                 requested.add("energy")
+            if (
+                getattr(self.predictor.inference_settings, "nitro", False)
+                and requested <= {"energy", "forces", "stress"}
+                and not torch.is_inference_mode_enabled()
+            ):
+                # Nitro computes E/F/stress together. Retain its cheap extra
+                # results so ASE integrators do not replay the same geometry
+                # when they ask for stress or forces after energy. Generic
+                # backends still compute only the requested derivatives.
+                requested.update(
+                    {"energy", "forces"}.intersection(self.implemented_properties)
+                )
+                volume = atoms.cell.volume
+                if (
+                    "stress" in self.implemented_properties
+                    and np.isfinite(volume)
+                    and volume > 0
+                ):
+                    requested.add("stress")
             pred = self.predictor.predict(
                 data, requested_properties=tuple(sorted(requested))
             )
