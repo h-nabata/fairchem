@@ -25,6 +25,7 @@ from fairchem.core.units.mlip_unit.api.inference import (
     MergeMoleConsistencyError,
     UMANitroNotSupportedError,
 )
+from fairchem.core.units.mlip_unit.inference_runtime import NumericCoreRuntime
 from fairchem.core.units.mlip_unit.predict import (
     MLIPPredictUnit,
     _copy_data_to_device,
@@ -247,7 +248,10 @@ class _FallbackModule(torch.nn.Module):
 
 
 @pytest.mark.parametrize("chained", [False, True])
-def test_fallback_releases_model_and_intermediates_before_reload(chained):
+@pytest.mark.parametrize("numeric_runtime", [False, True])
+def test_fallback_releases_model_and_intermediates_before_reload(
+    chained, numeric_runtime
+):
     released = []
     predictor = MLIPPredictUnit.__new__(MLIPPredictUnit)
     super(MLIPPredictUnit, predictor).__init__()
@@ -255,6 +259,11 @@ def test_fallback_releases_model_and_intermediates_before_reload(chained):
     predictor.inference_settings = InferenceSettings(merge_mole=True)
     predictor._requested_device = "cpu"
     predictor.lazy_model_intialized = True
+    if numeric_runtime:
+        predictor._numeric_runtimes = [
+            NumericCoreRuntime(predictor.model.module.forward)
+        ]
+        predictor.model.module._numeric_runtimes = predictor._numeric_runtimes
     old = weakref.ref(predictor.model.module)
     temporary_ref = None
 

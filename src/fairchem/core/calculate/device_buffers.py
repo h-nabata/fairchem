@@ -315,7 +315,7 @@ class DeviceBatchStager:
                         ):
                             # Explicit type matters on hosts exposing multiple backends.
                             host = torch.empty(
-                                tensor.numel(), dtype=tensor.dtype
+                                tensor.numel(), dtype=tensor.dtype, device="cpu"
                             ).pin_memory(device=self.device.type)
                             slot.host[path] = host
                         host_view = host[: tensor.numel()].view(tensor.shape)

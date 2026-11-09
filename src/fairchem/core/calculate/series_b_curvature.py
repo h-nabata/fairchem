@@ -256,10 +256,16 @@ def lanczos_modes(
             else:
                 q = residual / norm
         q_matrix = torch.stack(basis, dim=1)
+        # Stacking copies the vectors. Release each source collection before
+        # stacking the other one, avoiding four simultaneous dimension-by-
+        # iteration buffers for large matrix-free problems.
+        del basis, q
         hq_matrix = torch.stack(products, dim=1)
+        del products, hq
         # Only the small projected eigensolve runs on CPU FP64. There is no
         # requirement for an accelerator FP64 eigh kernel.
         projected = (q_matrix.T @ hq_matrix).to(device="cpu", dtype=torch.float64)
+        del hq_matrix
         if not torch.isfinite(projected).all():
             raise ValueError(
                 "Curvature projection overflowed; rescale the HVP operator"

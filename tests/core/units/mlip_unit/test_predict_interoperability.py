@@ -258,6 +258,29 @@ def test_copied_prepared_predictor_has_its_own_cache_generation():
         torch.testing.assert_close(actual[prop], expected[prop], atol=2e-5, rtol=2e-4)
 
 
+def test_output_selection_reuses_prepared_model_and_composition_cache():
+    unit = _public_predictor(2)
+    data = _data()
+    expected = unit.predict(data, requested_properties=("energy", "forces"))
+    first_model = unit.model
+    alternate = _data()
+    alternate.charge += 1
+    unit.predict(alternate, requested_properties=("energy",))
+
+    unit.inference_settings.requested_properties = ("forces",)
+    actual = unit.predict(data)
+    assert set(actual) == {"forces"}
+    torch.testing.assert_close(actual["forces"], expected["forces"])
+    assert unit.model is first_model
+    assert len(unit._prepared_models) == 2
+    assert unit._prepared_models.hits == 1
+    unit.inference_settings.requested_properties = ("energy",)
+    energy = unit.predict(data)
+    assert set(energy) == {"energy"}
+    torch.testing.assert_close(energy["energy"], expected["energy"])
+    assert unit.model is first_model
+
+
 def test_clearing_prepared_cache_waits_for_active_prediction():
     unit = _public_predictor(2)
     entered, release, cleared = Event(), Event(), Event()

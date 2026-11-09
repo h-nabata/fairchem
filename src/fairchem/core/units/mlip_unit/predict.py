@@ -735,6 +735,9 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         del release
         self.lazy_model_intialized = False
         self._preparation_failed = True
+        # Numeric runtimes keep bound block/backbone methods (and graph pools).
+        # Release the predictor's extra ownership before allocating a new model.
+        self._numeric_runtimes = []
         del self.model
         gc.collect()
         device_type = torch.device(self._requested_device).type
@@ -944,12 +947,21 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
             self._active_model_signature = None
 
     def _mole_key(self, data):
+        # Output selection does not change merged weights. It remains mutable
+        # after preparation and must not create duplicate cache entries.
+        settings_key = repr(
+            tuple(
+                (field.name, getattr(self.inference_settings, field.name))
+                for field in dataclasses.fields(self.inference_settings)
+                if field.name != "requested_properties"
+            )
+        )
         return mole_composition_key(
             data,
             device=self.device,
             dtype=self.inference_settings.base_precision_dtype,
             model_id=getattr(self.model.module, "model_id", None),
-            settings_key=repr(self.inference_settings),
+            settings_key=settings_key,
         )
 
     @torch.inference_mode(False)
@@ -2203,13 +2215,21 @@ class ParallelMLIPPredictUnit(MLIPPredictUnitProtocol):
             )
             request.pos = request.pos.contiguous()
             request.cell = request.cell.contiguous()
-            snapshot = {
-                key: self._geometry_signature(value)
-                if key in ("pos", "cell")
-                else value
-                for key, value in request
-            }
-            payload = pickle.dumps(request, protocol=pickle.HIGHEST_PROTOCOL)
+            snapshot = (
+                {
+                    key: self._geometry_signature(value)
+                    if key in ("pos", "cell")
+                    else value
+                    for key, value in request
+                }
+                if self._use_broadcast
+                else None
+            )
+            # Validate broadcast metadata serialization before even the first
+            # request, so later refreshes support the same metadata. RPC mode
+            # uses Ray's object store and never consumes this control payload.
+            if self._use_broadcast:
+                payload = pickle.dumps(request, protocol=pickle.HIGHEST_PROTOCOL)
             prepared = request.clone()
             if self.local_rank0.is_setup:
                 prepared.to(self.local_rank0.device)

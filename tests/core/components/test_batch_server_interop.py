@@ -75,6 +75,34 @@ def test_split_bad_shape_and_declared_level_are_validated():
         _server()._split_predictions({"forces": torch.zeros(2, 3)}, batch, predictor)
 
 
+def test_split_heterogeneous_outputs_avoids_atom_masks_and_owns_storage():
+    structures = [
+        AtomicData.from_ase(Atoms("H" * size), task_name="omol") for size in (1, 3, 2)
+    ]
+    batch = atomicdata_list_to_batch(structures)
+    predictions = {
+        "energy": torch.arange(3.0),
+        # Exercise noncontiguous atom outputs, too.
+        "forces": torch.arange(36.0).reshape(3, 12)[:, ::2].T,
+    }
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as p:
+        results = _server()._split_predictions(predictions, batch)
+    operations = {event.key for event in p.key_averages()}
+    # Boolean indexing scans the whole batch for each request, and its dynamic
+    # nonzero output synchronizes accelerators. Contiguous system slices avoid it.
+    assert "aten::nonzero" not in operations
+    assert "aten::index" not in operations
+    start = 0
+    for result, size in zip(results, (1, 3, 2), strict=True):
+        torch.testing.assert_close(
+            result["forces"], predictions["forces"][start : start + size]
+        )
+        assert result["forces"].untyped_storage().nbytes() == size * 3 * 4
+        start += size
+    predictions["forces"].fill_(-1)
+    assert results[1]["forces"].min() >= 0
+
+
 class MixedTaskPredictor:
     device = torch.device("cpu")
     dataset_to_tasks: ClassVar[dict] = {
@@ -134,6 +162,56 @@ def test_actual_uma_hessians_are_isolated_per_server_request():
     for result, oracle in zip(actual, expected, strict=True):
         assert result["hessian"].shape == (1, 6, 6)
         torch.testing.assert_close(result["hessian"], oracle)
+
+
+@pytest.mark.parametrize("default_requested", [None, ("energy",)])
+def test_actual_uma_per_request_properties_override_defaults_without_cross_talk(
+    default_requested,
+):
+    from tests.core.calculate.test_batch_interoperability import _uma
+
+    predictor = _uma()
+    predictor.inference_settings.requested_properties = default_requested
+    items = [_data(1), _data(2), _data(0.8)]
+    for data, properties in zip(
+        items, [("hessian",), ("hessian",), ("energy",)], strict=True
+    ):
+        data._requested_properties = properties
+    expected = [
+        predictor.predict(data, False, requested_properties=data._requested_properties)
+        for data in items
+    ]
+
+    actual = _server()._run_batched_inference(items, predictor, False)
+
+    for result, oracle in zip(actual, expected, strict=True):
+        assert result.keys() == oracle.keys()
+        for name in oracle:
+            torch.testing.assert_close(result[name], oracle[name])
+    assert items[0]._requested_properties == ("hessian",)
+
+
+def test_server_rejects_property_selection_for_predictors_without_support():
+    predictor = MixedTaskPredictor()
+    data = _data()
+    data._requested_properties = ("energy",)
+    with pytest.raises(ValueError, match="does not support requested_properties"):
+        _server()._run_batched_inference([data], predictor, False)
+    assert not predictor.calls
+
+
+def test_server_none_property_field_uses_defaults_without_leaking_metadata():
+    data = _data()
+    data._requested_properties = None
+
+    def predict(batch, undo_element_references):
+        assert "_requested_properties" not in batch
+        return {"energy": torch.ones(batch.num_graphs)}
+
+    predictor = SimpleNamespace(predict=predict)
+    result = _server()._run_batched_inference([data], predictor, False)
+    assert result[0]["energy"].item() == 1
+    assert data._requested_properties is None
 
 
 def test_declared_hessians_use_singletons_but_explicit_energy_can_batch():

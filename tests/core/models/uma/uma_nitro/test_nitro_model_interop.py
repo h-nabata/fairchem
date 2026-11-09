@@ -8,6 +8,7 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 import copy
+import io
 import pickle
 from types import SimpleNamespace
 
@@ -145,6 +146,81 @@ def test_dtype_move_and_weight_load_discard_derived_layouts(
         assert not hasattr(linear, "_uma_nitro_wt")
         assert so2._w_block is None
     assert releases == [model, model]
+
+
+@pytest.mark.parametrize("prepared", [False, True])
+@pytest.mark.parametrize("assign", [False, True])
+def test_native_state_dict_restores_all_weights_and_the_merge_contract(
+    nitro_random_checkpoint, prepared, assign
+):
+    source = nitro.UMANitroModel.from_checkpoint(nitro_random_checkpoint)
+    target = nitro.UMANitroModel.from_checkpoint(nitro_random_checkpoint)
+    water = _water()
+    carbon_dioxide = batch((molecule("CO2"), "omol"))
+    # Distinguish the source's sole radial-weight storage and its unregistered
+    # expert weights from the independently initialized destination model.
+    source.backbone._unified_radial_mlp.W1_cat.add_(0.125)
+    expert_name = "backbone.composition_embedding.weight"
+    source._experts[expert_name].add_(0.25)
+    if prepared:
+        source.prepare_for_inference(water, nitro_settings())
+        target.prepare_for_inference(carbon_dioxide, nitro_settings())
+    stream = io.BytesIO()
+    torch.save(source.state_dict(), stream)
+    stream.seek(0)
+    state = torch.load(stream, weights_only=True)
+    target.load_state_dict(state, assign=assign)
+
+    if not prepared:
+        # Loading must own the retained CPU experts, even with assign=True;
+        # reusing or editing the caller's state dict cannot change the merge.
+        state["_extra_state"]["experts"][expert_name].zero_()
+    source.prepare_for_inference(water, nitro_settings())
+    target.prepare_for_inference(water, nitro_settings())
+    for expected, actual in zip(
+        (*source.parameters(), *source.buffers()),
+        (*target.parameters(), *target.buffers()),
+        strict=True,
+    ):
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    assert not any(value.requires_grad for value in target.parameters())
+    with pytest.raises(MergeMoleConsistencyError, match="Compositions"):
+        target.on_predict_check(carbon_dioxide)
+
+
+def test_native_state_dict_owns_the_restored_merge_metadata(nitro_random_checkpoint):
+    source = nitro.UMANitroModel.from_checkpoint(nitro_random_checkpoint)
+    source.prepare_for_inference(_water(), nitro_settings())
+    target = nitro.UMANitroModel.from_checkpoint(nitro_random_checkpoint)
+    state = source.state_dict()
+    target.load_state_dict(state)
+    state["_extra_state"]["merged_key"][0].zero_()
+    target.on_predict_check(_water())
+
+
+@pytest.mark.parametrize("assign", [False, True])
+def test_parent_state_load_releases_nitro_caches_and_freezes_parameters(
+    nitro_random_checkpoint, monkeypatch, assign
+):
+    parent = torch.nn.Module()
+    model = parent.model = nitro.UMANitroModel.from_checkpoint(nitro_random_checkpoint)
+    model.prepare_for_inference(_water(), nitro_settings())
+    state = copy.deepcopy(parent.state_dict())
+    model._uma_nitro_graph_token = 913
+    model.backbone._uma_nitro_merged_radial = (torch.ones(3),)
+    model.head.energy_block[0]._uma_nitro_wt = torch.ones(2)
+    model.requires_grad_(True)
+    releases = []
+    monkeypatch.setattr(nitro, "_release_runtime", releases.append)
+    parent.load_state_dict(state, assign=assign)
+    assert releases == [model]
+    assert not any(
+        name.startswith("_uma_nitro_")
+        for module in model.modules()
+        for name in vars(module)
+    )
+    assert not any(parameter.requires_grad for parameter in model.parameters())
+    model.on_predict_check(_water())
 
 
 def test_repeated_preparation_checks_the_original_merged_contract(

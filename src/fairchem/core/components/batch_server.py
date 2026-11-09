@@ -310,18 +310,29 @@ class BatchPredictServerMixin:
         """
         Run batched inference with OOM splitting.
         """
-        from fairchem.core.calculate.batched_inference import _compatibility_key
+        from fairchem.core.calculate.batched_inference import (
+            _compatibility_key,
+            _normalize_requested_properties,
+        )
 
         if not items:
             return []
         settings = getattr(predict_unit, "inference_settings", None)
         nitro = getattr(settings, "nitro", False)
-        requested = getattr(settings, "requested_properties", None)
+        default_requested = getattr(settings, "requested_properties", None)
         tasks = getattr(predict_unit, "dataset_to_tasks", {})
         groups = defaultdict(list)
         for index, data in enumerate(items):
             if data.num_graphs != 1:
                 raise ValueError("Each server request must contain exactly one system")
+            requested = _normalize_requested_properties(
+                data.get("_requested_properties", None)
+            )
+            if requested is not None and not getattr(
+                predict_unit, "supports_requested_properties", False
+            ):
+                raise ValueError("The predictor does not support requested_properties")
+            requested = default_requested if requested is None else requested
             # A property need not exist for every dataset. Mixing datasets can
             # produce a shortened collated tensor that cannot be assigned back
             # to the right request by its shape alone.
@@ -364,10 +375,23 @@ class BatchPredictServerMixin:
         while data_deque:
             oom = False
             current = data_deque.popleft()
-            batch = atomicdata_list_to_batch(current)
+            # Property selection is a per-call option, not per-atom metadata.
+            # Forward it explicitly so global predictor defaults cannot replace
+            # it and collation cannot duplicate or nest the requested names.
+            requested = _normalize_requested_properties(
+                current[0].get("_requested_properties", None)
+            )
+            batch = atomicdata_list_to_batch(
+                current, exclude_keys=["_requested_properties"]
+            )
+            predict_kwargs = (
+                {} if requested is None else {"requested_properties": requested}
+            )
             try:
                 preds = predict_unit.predict(
-                    batch, undo_element_references=undo_element_references
+                    batch,
+                    undo_element_references=undo_element_references,
+                    **predict_kwargs,
                 )
                 results.extend(self._split_predictions(preds, batch, predict_unit))
                 preds = None
@@ -535,10 +559,15 @@ class BatchPredictServerMixin:
                 levels[task.property] = task.level
         system_count = batch.num_graphs
         atom_count = batch.num_nodes
-        batch_by_device = {}
+        # AtomicData validates contiguous system ordering. Count-based slices
+        # avoid rescanning every atom and allocating a dynamic boolean-index
+        # result for each request/property (and avoid accelerator nonzero syncs).
+        atom_sizes = batch.natoms.tolist()
+        atom_start = 0
         split_preds = []
         for i in range(system_count):
             system_predictions = {}
+            atom_end = atom_start + atom_sizes[i]
 
             for key, pred in predictions.items():
                 if not torch.is_tensor(pred) or pred.ndim == 0:
@@ -551,10 +580,7 @@ class BatchPredictServerMixin:
                     system_predictions[key] = pred[i : i + 1]
                 elif pred.shape[0] == atom_count and level != "system":
                     # Per-atom prediction
-                    if pred.device not in batch_by_device:
-                        batch_by_device[pred.device] = batch.batch.to(pred.device)
-                    mask = batch_by_device[pred.device] == i
-                    system_predictions[key] = pred[mask]
+                    system_predictions[key] = pred[atom_start:atom_end]
                 else:
                     raise ValueError(
                         f"Cannot split prediction for key '{key}': "
@@ -571,6 +597,7 @@ class BatchPredictServerMixin:
                     )
 
             split_preds.append(system_predictions)
+            atom_start = atom_end
 
         return split_preds
 

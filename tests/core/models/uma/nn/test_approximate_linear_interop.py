@@ -38,6 +38,35 @@ def _assert_state_equal(model, expected):
             assert actual[key] == value
 
 
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"weight_bits": 4},
+        {"weight_bits": 8},
+        {"low_rank_fraction": 0.25},
+        {"gemm_precision": "bf16", "low_precision_emulation": True},
+    ],
+)
+def test_preparation_inside_inference_mode_preserves_later_input_derivatives(options):
+    original = nn.Sequential(nn.Linear(8, 8)).eval().requires_grad_(False)
+    reference, candidate = copy.deepcopy(original), copy.deepcopy(original)
+    apply_linear_approximations(reference, **options)
+    with torch.inference_mode():
+        apply_linear_approximations(candidate, **options)
+        assert torch.is_inference_mode_enabled()
+    assert all(not tensor.is_inference() for tensor in candidate.buffers())
+    inputs = torch.randn(2, 8, requires_grad=True)
+
+    def derivatives(model):
+        value = model(inputs)
+        first = torch.autograd.grad(value.square().sum(), inputs, create_graph=True)[0]
+        second = torch.autograd.grad(first.sum(), inputs)[0]
+        return value, first, second
+
+    for actual, expected in zip(derivatives(candidate), derivatives(reference)):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("assign", [False, True])
 @pytest.mark.parametrize("direct", [False, True])
 def test_bad_packed_metadata_does_not_partially_overwrite_live_state(assign, direct):

@@ -8,6 +8,7 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 import copy
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from threading import Event, RLock
@@ -69,6 +70,29 @@ class VersionedStudent(torch.nn.Linear):
 
     def forward(self, inputs):
         return super().forward(inputs) * self.extra["scale"]
+
+
+def test_teacher_outputs_are_released_before_collecting_the_next_structure():
+    previous = []
+
+    class CheckedTeacher(Teacher):
+        def predict(self, data, requested_properties=None):
+            assert all(reference() is None for reference in previous)
+            output = super().predict(data, requested_properties)
+            previous.extend(weakref.ref(value) for value in output.values())
+            return output
+
+    teacher = CheckedTeacher(HarmonicStudent(2.0))
+    dataset = collect_teacher_labels(
+        teacher, [_data(), _data(1.2)], teacher_id="memory-lifetime"
+    )
+    assert len(dataset.samples) == 2
+    assert all(reference() is None for reference in previous)
+    for sample in dataset.samples:
+        expected = teacher.predict(sample.data.clone(), ("energy", "forces"))
+        for name, value in expected.items():
+            torch.testing.assert_close(sample.targets[name], value)
+        del value, expected
 
 
 def test_recursive_metadata_is_owned_detached_and_cast_for_each_training_step():

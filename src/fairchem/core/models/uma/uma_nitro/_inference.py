@@ -10465,19 +10465,35 @@ def _parallel(thunks):
     for stream in streams:
         stream.wait_event(fork)
     results = [None] * len(thunks)
-    for index, thunk in enumerate(thunks):
-        if index == 0:
-            results[index] = thunk()
-        else:
-            with torch.cuda.stream(streams[index - 1]):
+    try:
+        for index, thunk in enumerate(thunks):
+            if index == 0:
                 results[index] = thunk()
+            else:
+                with torch.cuda.stream(streams[index - 1]):
+                    results[index] = thunk()
+    except BaseException:
+        # A later branch may fail after earlier ones queued async work. Join
+        # those branches before unwinding releases main-stream input owners.
+        # An invalidated CUDA capture may also reject the join; preserve the
+        # original failure for the caller's synchronized capture cleanup.
+        with suppress(Exception):
+            _join_parallel(streams, main, results)
+        raise
+    _join_parallel(streams, main, results)
+    return results
+
+
+def _join_parallel(streams, main, results):
+    """
+    Order branch completion and returned tensor lifetimes on the calling stream.
+    """
     for stream in streams:
         join = torch.cuda.Event()
         join.record(stream)
         main.wait_event(join)
     # Thunk 0 ran on `main`, so only side-stream results need declaring.
     _record_uses(results[1:], main)
-    return results
 
 
 def _record_uses(values, stream):
@@ -15392,9 +15408,13 @@ def _nitro_forward(model, data, core=_forward_tensors, *, geometry_key=None):
         if isinstance(weight, torch.Tensor) and weight.is_cuda
         else nullcontext()
     )
-    with _NITRO_RUNTIME_LOCK, device_scope, torch.inference_mode(
-        False
-    ), torch.enable_grad():
+    with (
+        _NITRO_RUNTIME_LOCK,
+        device_scope,
+        torch.inference_mode(False),
+        torch.enable_grad(),
+        torch.autocast("cuda", enabled=False),
+    ):
         retries = 0
         while True:
             try:
@@ -15841,7 +15861,9 @@ class _UnifiedRadialMLP(nn.Module):
             self.register_buffer(
                 name,
                 combine([getattr(net[layer], attr).detach() for net in nets], dim=0),
-                persistent=False,
+                # The original per-block modules are removed below. These are
+                # the only remaining radial weights, not disposable caches.
+                persistent=True,
             )
 
 
@@ -16479,10 +16501,67 @@ class UMANitroModel(_NitroCacheState, nn.Module):
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
         with _NITRO_RUNTIME_LOCK:
-            self.release_inference_resources()
             result = super().load_state_dict(state_dict, strict=strict, assign=assign)
             self.requires_grad_(False)
             return result
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        # Parent/wrapper loads recurse through this hook, bypassing the public
+        # load_state_dict override. Invalidate captured addresses in both paths.
+        with _NITRO_RUNTIME_LOCK:
+            self.release_inference_resources()
+            # assign=True preserves destination requires_grad, so freezing before
+            # recursion also covers parameters loaded through a parent module.
+            self.requires_grad_(False)
+            super()._load_from_state_dict(
+                state_dict,
+                prefix,
+                local_metadata,
+                strict,
+                missing_keys,
+                unexpected_keys,
+                error_msgs,
+            )
+
+    def get_extra_state(self):
+        """
+        Preserve the expert weights and composition contract in native state dicts.
+
+        Before merging, the CPU expert tensors are the only copies of their
+        weights. After merging, the composition/charge/spin/task key is necessary
+        to reject inputs for which the saved merged weights would be invalid.
+        Runtime handles and derived kernel layouts are deliberately excluded.
+        """
+        return {
+            "version": 1,
+            "experts": dict(self._experts),
+            "merged_key": self._merged_key,
+        }
+
+    @torch.inference_mode(False)
+    def set_extra_state(self, state):
+        """
+        Restore model-owned CPU experts and merge metadata from a native state dict.
+        """
+        if state.get("version") != 1:
+            raise ValueError("unsupported UMA Nitro state-dict metadata version")
+        self._experts = {
+            name: value.detach().to("cpu", torch.float32, copy=True)
+            for name, value in state["experts"].items()
+        }
+        key = state["merged_key"]
+        self._merged_key = (
+            None if key is None else (key[0].detach().to("cpu", copy=True), *key[1:])
+        )
 
 
 def _expert_key(parameter_name: str, head_prefix: str) -> str:

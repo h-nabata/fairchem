@@ -582,6 +582,38 @@ def test_virtual_staging_interruption_finishes_copies_or_quarantines_slot(
         stager.close()
 
 
+def test_virtual_staging_host_allocation_ignores_foreign_default_device(monkeypatch):
+    # Virtual copy-path check: target storage lives on CPU, and stream/pinning
+    # calls are stubs. All torch factories keep their real ambient-device behavior.
+    source = _structure()
+    stager = DeviceBatchStager("cpu", slots=1)
+    pinned = []
+
+    def pin_host(tensor, *, device):
+        assert tensor.device.type == "cpu"
+        pinned.append(device)
+        return tensor
+
+    monkeypatch.setattr(torch.Tensor, "pin_memory", pin_host)
+    monkeypatch.setattr(device_buffers, "device_scope", lambda device: nullcontext())
+    stager._copy_stream = SimpleNamespace(synchronize=lambda: None)
+    stager._backend = SimpleNamespace(
+        stream=lambda stream: nullcontext(),
+        Event=lambda: SimpleNamespace(record=lambda stream: None),
+    )
+    with torch.device("meta"):
+        lease = stager.stage(source)
+    assert pinned
+    assert set(pinned) == {"cpu"}
+    stager.device = torch.device("cpu")
+    stager._backend = None
+    stager._copy_stream = None
+    stager._slots[0].ready = None
+    with lease as restored:
+        torch.testing.assert_close(restored.pos, source.pos)
+    stager.close()
+
+
 @pytest.mark.parametrize("interruption", [KeyboardInterrupt, SystemExit])
 def test_metadata_copy_interruption_does_not_leak_staging_lease(interruption):
     primary = interruption("cancelled metadata copy")

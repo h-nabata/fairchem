@@ -17,6 +17,64 @@ from fairchem.core.common import utils
 from fairchem.core.common.registry import registry
 
 
+def test_public_uma_import_without_optional_application_packages():
+    """
+    A base installation must not require serving or scientific-workflow extras.
+    """
+    script = textwrap.dedent(
+        """
+        import importlib.abc
+        import importlib.util
+        import sys
+        import torch
+
+        blocked = {"ray", "pymatgen", "pyarrow", "pandas", "quacc", "torch_sim"}
+        for name in tuple(sys.modules):
+            if name.split(".")[0] in blocked:
+                del sys.modules[name]
+
+        class MissingOptionalPackages(importlib.abc.MetaPathFinder):
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname.split(".")[0] in blocked:
+                    raise ModuleNotFoundError("optional package absent: " + fullname)
+
+        # An absent package's discovery probe returns None; import raises.
+        # In particular, wandb probes pandas before deciding to use it.
+        original_find_spec = importlib.util.find_spec
+        def find_spec(name, *args, **kwargs):
+            if name.split(".")[0] in blocked:
+                return None
+            return original_find_spec(name, *args, **kwargs)
+
+        importlib.util.find_spec = find_spec
+        sys.meta_path.insert(0, MissingOptionalPackages())
+        from fairchem.core import FAIRChemCalculator, pretrained_mlip
+        from fairchem.core.calculate import InferenceBatcher
+        from fairchem.core.common.registry import registry
+        from fairchem.core.common.utils import setup_imports
+
+        setup_imports({"skip_experimental_imports": True})
+        assert registry.get_model_class("escnmd_backbone") is not None
+        assert callable(pretrained_mlip.get_predict_unit)
+        assert FAIRChemCalculator is not None
+        try:
+            InferenceBatcher(None)
+        except RuntimeError as exc:
+            assert "ray[serve]" in str(exc)
+        else:
+            raise AssertionError("Missing Ray must fail at the serving entry point")
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=90,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_uma_import_does_not_require_cuda_extensions():
     """An installed but broken CUDA extension must not prevent portable UMA use."""
     script = textwrap.dedent(

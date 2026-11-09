@@ -14,6 +14,8 @@ import numpy as np
 import pytest
 import torch
 from ase.build import molecule
+from ase.calculators.singlepoint import SinglePointCalculator
+from ase.constraints import FixAtoms, FixConstraint
 
 from fairchem.core.datasets.atomic_data import (
     AtomicData,
@@ -240,3 +242,56 @@ def test_empty_system_fails_with_explicit_diagnostic():
     data.natoms.zero_()
     with pytest.raises(ValueError, match="at least one atom"):
         data.validate()
+
+
+def test_external_graph_wrapping_does_not_reapply_fixed_atom_constraints():
+    atoms = molecule("H2")
+    atoms.cell = [5, 6, 7]
+    atoms.pbc = True
+    atoms.positions += [5, 0, 0]
+    expected = AtomicData.from_ase(atoms, r_edges=True, radius=2, max_neigh=20)
+    atoms.set_constraint(FixAtoms(indices=[0]))
+    original_positions = atoms.positions.copy()
+
+    actual = AtomicData.from_ase(atoms, r_edges=True, radius=2, max_neigh=20)
+
+    torch.testing.assert_close(actual.pos, expected.pos)
+    torch.testing.assert_close(actual.edge_index, expected.edge_index)
+    torch.testing.assert_close(actual.cell_offsets, expected.cell_offsets)
+    torch.testing.assert_close(actual.fixed, torch.tensor([1, 0]))
+    np.testing.assert_array_equal(atoms.positions, original_positions)
+
+
+class _UnchangedCellConstraint(FixConstraint):
+    def adjust_cell(self, atoms, cell):
+        # Cell constraints are actions of an optimizer/MD integrator, not a
+        # coordinate-conversion operation. Preserve the caller's original cell.
+        cell[:] = atoms.cell
+
+
+def test_external_graph_cell_completion_bypasses_ase_cell_constraints():
+    atoms = molecule("H2")
+    expected = AtomicData.from_ase(atoms, r_edges=True, radius=2, max_neigh=20)
+    atoms.set_constraint(_UnchangedCellConstraint())
+
+    actual = AtomicData.from_ase(atoms, r_edges=True, radius=2, max_neigh=20)
+
+    torch.testing.assert_close(actual.cell, expected.cell)
+    torch.testing.assert_close(actual.edge_index, expected.edge_index)
+    torch.testing.assert_close(actual.cell_offsets, expected.cell_offsets)
+    assert not atoms.cell.array.any()
+
+
+@pytest.mark.parametrize("name", ["forces", "stress"])
+@pytest.mark.parametrize("source", ["info", "calculator"])
+def test_explicitly_disabled_ase_labels_are_not_read(name, source):
+    atoms = molecule("H2")
+    malformed_label = np.zeros((7, 7))
+    if source == "info":
+        atoms.info[name] = malformed_label
+    else:
+        atoms.calc = SinglePointCalculator(atoms, **{name: malformed_label})
+
+    data = AtomicData.from_ase(atoms, **{f"r_{name}": False})
+
+    assert name not in data

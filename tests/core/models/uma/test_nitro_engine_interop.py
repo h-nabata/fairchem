@@ -213,6 +213,65 @@ def test_streams_and_staging_events_are_device_specific(monkeypatch):
     assert nitro._side_streams(2) == first
 
 
+@pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt])
+@pytest.mark.parametrize("join_fails", [False, True])
+def test_parallel_failure_still_joins_outstanding_side_streams(
+    monkeypatch, error_type, join_fails
+):
+    order = []
+    current = ["main"]
+
+    class Event:
+        def record(self, stream):
+            if join_fails and stream.name != "main":
+                raise RuntimeError("capture was invalidated")
+            self.source = stream.name
+
+    class Stream:
+        def __init__(self, name):
+            self.name = name
+
+        def wait_event(self, event):
+            order.append((self.name, "wait", event.source))
+
+    @contextmanager
+    def scope(stream):
+        previous = current[0]
+        current[0] = stream.name
+        try:
+            yield
+        finally:
+            current[0] = previous
+
+    main = Stream("main")
+    side = [Stream("side1"), Stream("side2")]
+    monkeypatch.setattr(nitro, "STREAM_FORK", True)
+    monkeypatch.setattr(nitro, "_SEQ_FORK", False)
+    monkeypatch.setattr(nitro, "_side_streams", lambda count: side)
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: main)
+    monkeypatch.setattr(torch.cuda, "stream", scope)
+    monkeypatch.setattr(
+        nitro,
+        "_record_uses",
+        lambda values, stream: order.append((stream.name, "retain", values)),
+    )
+
+    def failing_branch():
+        assert current[0] == "side2"
+        raise error_type("later branch failed")
+
+    with pytest.raises(error_type, match="later branch failed"):
+        nitro._parallel([lambda: "main_result", lambda: "side_result", failing_branch])
+    if not join_fails:
+        assert order[-3:] == [
+            ("main", "wait", "side1"),
+            ("main", "wait", "side2"),
+            ("main", "retain", ["side_result", None]),
+        ]
+    assert current[0] == "main"
+
+
 def test_compiled_handle_cache_is_device_specific_and_bounded(monkeypatch):
     current = [0]
     monkeypatch.setattr(torch.cuda, "current_device", lambda: current[0])
@@ -683,6 +742,27 @@ def test_runtime_temporarily_enables_conservative_derivatives(monkeypatch, scope
         )
         assert not torch.is_grad_enabled()
         assert torch.is_inference_mode_enabled() == expected_mode
+
+
+@pytest.mark.parametrize("raise_inside", [False, True])
+def test_direct_runtime_excludes_ambient_cuda_autocast(monkeypatch, raise_inside):
+    # The dispatch/TLS contract is testable without executing a CUDA kernel.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    def forward(*args):
+        assert not torch.is_autocast_enabled("cuda")
+        if raise_inside:
+            raise RuntimeError("inference failed")
+        return "complete"
+
+    monkeypatch.setattr(nitro, "_forward_once", forward)
+    with torch.autocast("cuda", dtype=torch.float16):
+        if raise_inside:
+            with pytest.raises(RuntimeError, match="inference failed"):
+                nitro._nitro_forward(object(), None)
+        else:
+            assert nitro._nitro_forward(object(), None) == "complete"
+        assert torch.is_autocast_enabled("cuda")
 
 
 @pytest.mark.parametrize("periodic", [False, True])

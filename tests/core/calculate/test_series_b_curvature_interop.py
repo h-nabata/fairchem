@@ -7,15 +7,45 @@ LICENSE file in the root directory of this source tree.
 
 from __future__ import annotations
 
+import weakref
+
 import pytest
 import torch
 
+from fairchem.core.calculate import series_b_curvature
 from fairchem.core.calculate.series_b_curvature import (
     HutchinsonOptions,
     LanczosOptions,
     hutchinson_estimates,
     lanczos_modes,
 )
+
+
+def test_lanczos_releases_product_copies_before_the_projected_eigensolve(monkeypatch):
+    references = []
+    original_product = series_b_curvature._product
+    original_eigh = torch.linalg.eigh
+
+    def product(*args):
+        result = original_product(*args)
+        references.append(weakref.ref(result))
+        return result
+
+    def eigh(matrix):
+        assert len(references) == 4
+        assert all(reference() is None for reference in references)
+        return original_eigh(matrix)
+
+    monkeypatch.setattr(series_b_curvature, "_product", product)
+    monkeypatch.setattr(torch.linalg, "eigh", eigh)
+    diagonal = torch.tensor([-2.0, 1.0, 3.0, 5.0], dtype=torch.float64)
+    result = lanczos_modes(
+        lambda vector: diagonal * vector,
+        torch.zeros_like(diagonal),
+        options=LanczosOptions(num_modes=4, max_iterations=4),
+    )
+    torch.testing.assert_close(result.eigenvalues, diagonal)
+    assert result.converged.all()
 
 
 @pytest.mark.parametrize(

@@ -547,6 +547,7 @@ class ApproximateLinear(nn.Module):
         return value.reshape(*leading, self.out_features)
 
 
+@torch.inference_mode(False)
 def apply_linear_approximations(
     model: nn.Module,
     *,
@@ -565,6 +566,8 @@ def apply_linear_approximations(
     Reapplying to an already transformed model raises rather than silently mixing
     policies. Exclusions use case-sensitive shell patterns on qualified names.
     Low-rank plus integer quantization is deliberately unsupported initially.
+    Prepared buffers retain normal tensor semantics even when this helper is
+    called inside inference_mode, so later coordinate derivatives remain valid.
     """
     if not isinstance(gemm_precision, str) or gemm_precision not in GEMM_PRECISIONS:
         raise ValueError(f"Unsupported gemm_precision: {gemm_precision!r}")

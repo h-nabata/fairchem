@@ -208,6 +208,23 @@ def test_parallel_original_paths_and_owned_geometry(transport, merge, workers):
         unit.predict(data)
 
 
+def test_rpc_requests_skip_unused_control_serialization(transport, monkeypatch):
+    unit, references, events, _, _ = transport(merge=False)
+
+    def unused_dump(*args, **kwargs):
+        pytest.fail("RPC requests must not build an unused control payload")
+
+    monkeypatch.setattr(module.pickle, "dumps", unused_dump)
+    data = _data()
+    unit.predict(data)
+    data.charge += 1
+    unit.predict(data)
+    assert not events
+    assert unit._input_snapshot is None
+    for reference in references:
+        _assert_request(reference.requests[-1], data)
+
+
 @pytest.mark.parametrize(
     "change",
     ["order", "charge", "spin", "dataset", "pbc", "count", "dtype", "extra", "edges"],

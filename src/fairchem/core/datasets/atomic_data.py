@@ -442,13 +442,15 @@ class AtomicData:
         cell = np.array(atoms.get_cell(complete=True), copy=True)
         pos = wrap_positions(pos, cell, pbc=pbc, eps=0)
 
-        # wrap positions for CPU graph Generation
-        atoms.set_positions(pos)
         if r_edges:
+            # Only external graph construction needs updated ASE coordinates.
+            # Do not reapply optimizer/MD constraints: FixAtoms would restore
+            # unwrapped positions, unlike the model coordinates above.
+            atoms.set_positions(pos, apply_constraint=False)
             # Pymatgen needs an invertible cell even for nonperiodic molecules.
             # Use the same completed cell as the model, on our owned copy;
             # retaining PBC flags prevents artificial periodic neighbors.
-            atoms.set_cell(cell)
+            atoms.set_cell(cell, apply_constraint=False)
 
         atomic_numbers = torch.from_numpy(atomic_numbers).long()
         pos = torch.from_numpy(pos)
@@ -512,7 +514,7 @@ class AtomicData:
                 torch.tensor(results["forces"], dtype=target_dtype, device="cpu").view(
                     -1, 3
                 )
-                if "forces" in results
+                if r_forces and "forces" in results
                 else None
             )
             stress = results.get("stress", None)
@@ -543,14 +545,14 @@ class AtomicData:
         )
         forces = (
             torch.tensor(atoms.info["forces"], dtype=target_dtype, device="cpu")
-            if "forces" in atoms.info
+            if r_forces and "forces" in atoms.info
             else forces
         )
         stress = (
             torch.tensor(atoms.info["stress"], dtype=target_dtype, device="cpu").view(
                 1, 3, 3
             )
-            if "stress" in atoms.info
+            if r_stress and "stress" in atoms.info
             else stress
         )
 

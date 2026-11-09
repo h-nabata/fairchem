@@ -188,6 +188,9 @@ def collect_teacher_labels(
         samples.append(
             DistillationSample(data, {name: output[name] for name in properties})
         )
+        # Labels own detached CPU copies. Keeping the previous prediction here
+        # would overlap its accelerator storage/graph with the next evaluation.
+        del output
     return DistillationDataset(
         tuple(samples),
         {
