@@ -72,6 +72,90 @@ def test_series_b_defaults_serialization_and_server_identity_are_isolated():
     assert asdict(SeriesBSettings()) == asdict(InferenceSettings().series_b)
 
 
+@pytest.mark.parametrize("dtype", [torch.float64, "float64"])
+def test_fp64_saved_features_policy_is_explicit_and_serializable(dtype):
+    settings = replace(
+        inference_settings_xpu(),
+        base_precision_dtype=dtype,
+        series_b=SeriesBSettings(saved_feature_dtype="fp32"),
+    )
+    assert settings.series_b.fp64_saved_features_only
+    assert not settings.series_b.linear_enabled
+    restored = hydra.utils.instantiate(OmegaConf.create(settings.to_omegaconf()))
+    assert restored == settings
+    assert restored.base_precision_dtype is torch.float64
+    baseline = replace(settings, series_b=SeriesBSettings())
+    assert (
+        ModelSpec("local.pt", source="path", inference_settings=settings).model_id
+        != ModelSpec("local.pt", source="path", inference_settings=baseline).model_id
+    )
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"gemm_precision": "bf16"},
+        {"weight_bits": 8},
+        {"low_rank_fraction": 0.5},
+        {"compensated_reduction": True},
+        {"radial_fast_exp": True},
+        {"radial_table_points": 257},
+        {"onednn_tf32": True},
+    ],
+)
+def test_fp64_saved_features_cannot_enable_other_fp32_approximations(options):
+    policy = SeriesBSettings(saved_feature_dtype="fp32", **options)
+    assert not policy.fp64_saved_features_only
+    with pytest.raises(ValueError, match="float32|FP64"):
+        replace(
+            inference_settings_xpu(),
+            base_precision_dtype=torch.float64,
+            series_b=policy,
+        )
+
+
+def test_fp32_base_rejects_fp32_saved_storage_instead_of_silent_noop():
+    with pytest.raises(ValueError, match="float64|FP64"):
+        replace(
+            inference_settings_xpu(),
+            series_b=SeriesBSettings(saved_feature_dtype="fp32"),
+        )
+
+
+def test_public_fp64_predictor_compresses_only_backward_features():
+    reference = _public_predictor()
+    reference.inference_settings = replace(
+        reference.inference_settings,
+        base_precision_dtype=torch.float64,
+    )
+    candidate = _public_predictor()
+    candidate.inference_settings = replace(
+        candidate.inference_settings,
+        base_precision_dtype=torch.float64,
+        series_b=SeriesBSettings(
+            saved_feature_dtype="fp32", saved_feature_min_elements=1
+        ),
+    )
+    data = _data().to(dtype=torch.float64)
+    expected = reference.predict(
+        data.clone(), requested_properties=("energy", "forces")
+    )
+    actual = candidate.predict(data.clone(), requested_properties=("energy", "forces"))
+    manifest = candidate.approximation_manifest
+    assert manifest["base_precision_dtype"] == "float64"
+    assert "linear" not in manifest
+    assert manifest["saved_features"]["source_dtype"] == "float64"
+    assert manifest["saved_features"]["derivatives_approximate"]
+    torch.testing.assert_close(actual["energy"], expected["energy"], rtol=0, atol=0)
+    torch.testing.assert_close(
+        actual["forces"], expected["forces"], rtol=2e-5, atol=2e-7
+    )
+    for value in actual.values():
+        assert value.dtype == torch.float64
+    for parameter in candidate.model.module.parameters():
+        assert parameter.dtype == torch.float64
+
+
 @pytest.mark.parametrize(
     "changes",
     [

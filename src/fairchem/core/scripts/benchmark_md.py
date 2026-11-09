@@ -16,6 +16,7 @@ import math
 import os
 import sys
 import time
+from dataclasses import replace
 from numbers import Integral
 from pathlib import Path
 
@@ -239,6 +240,11 @@ def main(argv=None):
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--inference-settings", default="high-precision")
     parser.add_argument(
+        "--dtype",
+        choices=("float32", "float64"),
+        help="Override the preset's base precision; otherwise preserve the preset",
+    )
+    parser.add_argument(
         "--input", type=Path, help="ASE-readable input; otherwise build cubic Si"
     )
     parser.add_argument("--repeat", type=int, nargs=3, default=(5, 5, 5))
@@ -259,6 +265,7 @@ def main(argv=None):
         "requested_settings": args.inference_settings,
         "requested_model": args.model,
         "requested_device": args.device,
+        "requested_dtype": args.dtype,
         "task": args.task,
         "requested_steps": args.steps,
     }
@@ -284,6 +291,25 @@ def main(argv=None):
         from ase.io import read
 
         from fairchem.core import FAIRChemCalculator, pretrained_mlip
+        from fairchem.core.units.mlip_unit.api.inference import (
+            guess_inference_settings,
+        )
+
+        settings = guess_inference_settings(args.inference_settings)
+        if args.dtype is not None:
+            settings = replace(settings, base_precision_dtype=args.dtype)
+        report["base_precision_dtype"] = str(settings.base_precision_dtype)
+        if settings.base_precision_dtype == torch.float64:
+            if settings.nitro:
+                raise ValueError(
+                    "Nitro MD does not support base_precision_dtype=float64"
+                )
+            if torch.device(args.device).type == "xpu":
+                from fairchem.core.units.mlip_unit.inference_runtime import (
+                    probe_fp64_support,
+                )
+
+                report["fp64_compute_probe"] = probe_fp64_support(args.device)
 
         if any(value < 1 for value in args.repeat):
             raise ValueError("repeat dimensions must be positive")
@@ -295,7 +321,7 @@ def main(argv=None):
         predictor = pretrained_mlip.get_predict_unit(
             args.model,
             device=args.device,
-            inference_settings=args.inference_settings,
+            inference_settings=settings,
             seed=args.seed,
         )
         calculator = FAIRChemCalculator(predictor, task_name=args.task)

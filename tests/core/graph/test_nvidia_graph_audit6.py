@@ -17,6 +17,7 @@ import torch
 from ase import Atoms
 from ase.neighborlist import neighbor_list
 
+from fairchem.core.datasets.atomic_data import AtomicData
 from fairchem.core.graph import radius_graph_pbc_nvidia as nvidia
 from fairchem.core.graph.radius_graph_pbc import radius_graph_pbc_v2
 
@@ -32,6 +33,39 @@ def _data(positions, cell=None, pbc=False, dtype=torch.float64):
         natoms=torch.tensor([len(pos)]),
         batch=torch.zeros(len(pos), dtype=torch.long),
     )
+
+
+@pytest.mark.parametrize("dtype,edge_count", [(torch.float32, 2), (torch.float64, 0)])
+def test_ase_external_graph_uses_requested_coordinate_precision(dtype, edge_count):
+    if not nvidia.nvalchemiops_installed():
+        pytest.skip("nvalchemiops is not installed")
+    atoms = Atoms("H2", positions=[[0, 0, 0], [1 + 2**-25, 0, 0]])
+    original = atoms.positions.copy()
+    data = AtomicData.from_ase(
+        atoms,
+        r_edges=True,
+        radius=1.0,
+        max_neigh=10,
+        target_dtype=dtype,
+        external_graph_method="nvidia",
+    )
+    assert data.pos.dtype == dtype
+    assert data.edge_index.shape[1] == edge_count
+    assert data.nedges.item() == edge_count
+    np.testing.assert_array_equal(atoms.positions, original)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_ase_native_neighbor_distances_retain_coordinate_dtype(dtype):
+    if not nvidia.nvalchemiops_installed():
+        pytest.skip("nvalchemiops is not installed")
+    atoms = Atoms("H2", positions=[[0, 0, 0], [1 + 2**-25, 0, 0]])
+    _, _, distances, _ = nvidia.get_neighbors_nvidia_atoms(
+        atoms, 1.1, 10, target_dtype=dtype
+    )
+    expected = torch.tensor(1 + 2**-25, dtype=dtype).numpy()
+    assert distances.dtype == expected.dtype
+    np.testing.assert_array_equal(distances, np.full(2, expected, dtype=expected.dtype))
 
 
 def _tuples(edge_index, offsets):

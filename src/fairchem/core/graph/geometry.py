@@ -136,7 +136,9 @@ def minimum_image_displacement(
 
     eye = torch.eye(3, dtype=cell_per_atom.dtype, device=cell_per_atom.device)
     off_diag_max = (cell_per_atom * (1.0 - eye)).abs().max()
-    if off_diag_max < 1e-10:
+    # A tiny nonzero shear can accumulate over many periodic images. Treating
+    # it as diagonal discards meaningful FP64 geometry for large displacements.
+    if off_diag_max == 0:
         diag = torch.diagonal(cell_per_atom, dim1=1, dim2=2)
         frac = dr / diag
         frac = torch.where(pbc_per_atom, frac - torch.round(frac), frac)

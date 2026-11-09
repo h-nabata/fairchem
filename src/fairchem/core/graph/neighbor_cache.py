@@ -224,20 +224,21 @@ class VerletNeighborCache:
             self._entry = entry
             edges, cells = entry["edges"], entry["cells"]
             shifts = edge_cell_offsets(data.cell, cells, entry["counts"])
+            # Advanced indexing owns these endpoint buffers. Reuse them for the
+            # roundoff bound instead of gathering both coordinates a second time.
+            source_pos = data.pos[edges[0]]
+            target_pos = data.pos[edges[1]]
             # Match graph-v2's subtraction order, not get_pbc_distances' order.
-            distance2 = (
-                (data.pos[edges[1]] - (data.pos[edges[0]] + shifts)).square().sum(-1)
-            )
+            distance2 = (target_pos - (source_pos + shifts)).square().sum(-1)
             # Last-bit differences between batched offset products must not
             # decide whether a cutoff-boundary edge exists. Ambiguous cases
             # use the fresh graph's arithmetic and traversal.
             rounding = (
                 16
                 * torch.finfo(data.pos.dtype).eps
-                * (
-                    data.pos[edges[0]].abs() + data.pos[edges[1]].abs() + shifts.abs()
-                ).sum(-1)
+                * source_pos.abs_().add_(target_pos.abs_()).add_(shifts.abs()).sum(-1)
             )
+            del source_pos, target_pos, shifts
             distance_error = rounding * (2 * distance2.sqrt() + rounding)
             if bool(((distance2 - cutoff * cutoff).abs() <= distance_error).any()):
                 self.boundary_fallbacks += 1

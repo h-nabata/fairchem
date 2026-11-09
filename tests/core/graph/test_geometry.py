@@ -111,6 +111,17 @@ def test_precomputed_op_matches_general_find_mic():
     _assert_matches_general_find_mic(dr, _SKEWED_CELL, pbc, batch, minkowski_op=op)
 
 
+def test_fp64_minimum_image_preserves_tiny_shear_for_large_displacements():
+    cell = torch.tensor(
+        [[[1.0, 0.0, 0.0], [5e-11, 1.0, 0.0], [0.0, 0.0, 1.0]]],
+        dtype=torch.float64,
+    )
+    dr = torch.tensor([[0.25, 1_000_000.25, 0.2]], dtype=torch.float64)
+    pbc = torch.ones((1, 3), dtype=torch.bool)
+    batch = torch.zeros(1, dtype=torch.long)
+    _assert_matches_general_find_mic(dr, cell, pbc, batch, atol=1e-10)
+
+
 # ── Multi-system batch ──
 
 

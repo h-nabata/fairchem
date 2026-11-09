@@ -263,7 +263,8 @@ def test_cell_offsets_match_reference_and_higher_derivatives(systems):
     assert torch.autograd.gradgradcheck(function, (cell, offsets))
 
 
-def test_cached_graph_keeps_current_geometry_and_second_derivatives():
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_cached_graph_keeps_current_geometry_and_second_derivatives(dtype):
     data = _data(
         [
             Atoms(
@@ -274,8 +275,9 @@ def test_cached_graph_keeps_current_geometry_and_second_derivatives():
             )
         ]
     )
-    data.pos = data.pos.double().requires_grad_()
-    data.cell = data.cell.double().requires_grad_()
+    data.pos = data.pos.to(dtype).requires_grad_()
+    data.cell = data.cell.to(dtype).requires_grad_()
+    original_pos, original_cell = data.pos.clone(), data.cell.clone()
     cache = VerletNeighborCache(0.5)
 
     def evaluate(cached):
@@ -289,8 +291,12 @@ def test_cached_graph_keeps_current_geometry_and_second_derivatives():
         )
         return energy, first, second
 
-    actual, expected = evaluate(True), evaluate(False)
-    torch.testing.assert_close(actual, expected)
+    for _ in range(2):
+        actual, expected = evaluate(True), evaluate(False)
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(data.pos, original_pos, rtol=0, atol=0)
+        torch.testing.assert_close(data.cell, original_cell, rtol=0, atol=0)
+    assert cache.stats["hits"] == 1
     assert not cache._entry["pos"].requires_grad
     assert cache._entry["pos"].data_ptr() != data.pos.data_ptr()
 

@@ -17,6 +17,127 @@ from fairchem.core.common import utils
 from fairchem.core.common.registry import registry
 
 
+@pytest.mark.parametrize(
+    "module_name",
+    ["fairchem.core", "fairchem.core.calculate", "fairchem.core.common.registry"],
+)
+def test_configuration_imports_do_not_initialize_compute_or_serving(module_name):
+    """
+    Registry/configuration imports and introspection must stay lightweight.
+    """
+    script = textwrap.dedent(
+        f"""
+        import importlib
+        import importlib.abc
+        import sys
+
+        class UnexpectedHeavyImport(importlib.abc.MetaPathFinder):
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname.split(".")[0] in {{"torch", "ray", "wandb"}}:
+                    raise AssertionError("unexpected dependency: " + fullname)
+
+        sys.meta_path.insert(0, UnexpectedHeavyImport())
+        module = importlib.import_module({module_name!r})
+        for name in getattr(module, "__all__", ()):
+            assert name in dir(module)
+        try:
+            module.not_a_fairchem_export
+        except AttributeError as exc:
+            assert "not_a_fairchem_export" in str(exc)
+            assert module.__name__ in str(exc)
+        else:
+            raise AssertionError("Unknown attributes must raise AttributeError")
+        assert not any(name in sys.modules for name in ("torch", "ray", "wandb"))
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("leaf_first", [False, True])
+def test_lazy_public_exports_preserve_identity_and_pickle(leaf_first):
+    """
+    Both import orders and star imports must expose the original public objects.
+    """
+    script = textwrap.dedent(
+        """
+        import importlib
+        import pickle
+        import sys
+        import types
+
+        exports = {
+            "fairchem.core": {
+                "FAIRChemCalculator": ("fairchem.core.calculate.ase_calculator", "FAIRChemCalculator"),
+                "DFTD3Calculator": ("fairchem.core.calculate.dftd3_calculator", "DFTD3Calculator"),
+                "pretrained_mlip": ("fairchem.core.calculate.pretrained_mlip", None),
+                "clear_cache": ("fairchem.core._config", "clear_cache"),
+            },
+            "fairchem.core.calculate": {
+                "FAIRChemCalculator": ("fairchem.core.calculate.ase_calculator", "FAIRChemCalculator"),
+                "FormationEnergyCalculator": ("fairchem.core.calculate.ase_calculator", "FormationEnergyCalculator"),
+                "DFTD3Calculator": ("fairchem.core.calculate.dftd3_calculator", "DFTD3Calculator"),
+                "InferenceBatcher": ("fairchem.core.calculate._batch", "InferenceBatcher"),
+                "InferenceSettings": ("fairchem.core.units.mlip_unit.api.inference", "InferenceSettings"),
+                "ModelSpec": ("fairchem.core.units.mlip_unit.api.model_spec", "ModelSpec"),
+                "get_local_inference_raycluster": ("fairchem.core.calculate._ray_inference_cluster", "get_local_inference_raycluster"),
+                "get_slurm_inference_raycluster": ("fairchem.core.calculate._ray_inference_cluster", "get_slurm_inference_raycluster"),
+                "setup_batch_predict_server": ("fairchem.core.components.batch_server", "setup_batch_predict_server"),
+                "setup_multiplexed_batch_predict_server": ("fairchem.core.components.batch_server", "setup_multiplexed_batch_predict_server"),
+            },
+        }
+        leaf_first = sys.argv[1] == "True"
+        if leaf_first:
+            for names in reversed(list(exports.values())):
+                for module_name, _ in reversed(list(names.values())):
+                    importlib.import_module(module_name)
+        else:
+            from fairchem.core.calculate import ModelSpec
+            assert "fairchem.core.components.batch_server" not in sys.modules
+
+        for package_name, names in exports.items():
+            package = importlib.import_module(package_name)
+            assert set(package.__all__) == set(names)
+            assert set(names) <= set(dir(package))
+            namespace = {}
+            exec("from " + package_name + " import *", namespace)
+            assert set(namespace) - {"__builtins__"} == set(names)
+            for name, (module_name, attribute) in names.items():
+                module = importlib.import_module(module_name)
+                canonical = module if attribute is None else getattr(module, attribute)
+                assert getattr(package, name) is canonical
+                assert getattr(package, name) is namespace[name]
+                if not isinstance(canonical, types.ModuleType):
+                    assert pickle.loads(pickle.dumps(canonical)) is canonical
+
+        import fairchem.core as core
+        import fairchem.core.calculate as calculate
+        from fairchem.core.components.batch_server import ModelSpec as ServerSpec
+        assert core.calculate is calculate
+        assert core.pretrained_mlip is calculate.pretrained_mlip
+        assert calculate.ModelSpec is ServerSpec
+        spec = calculate.ModelSpec("test-model", source="registry", device="cpu")
+        restored = pickle.loads(pickle.dumps(spec))
+        assert type(restored) is ServerSpec
+        assert restored.model_id == spec.model_id
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(leaf_first)],
+        capture_output=True,
+        text=True,
+        timeout=90,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_public_uma_import_without_optional_application_packages():
     """
     A base installation must not require serving or scientific-workflow extras.

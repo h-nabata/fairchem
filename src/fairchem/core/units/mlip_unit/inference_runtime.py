@@ -18,6 +18,94 @@ import torch
 from torch.utils import _pytree
 
 
+def probe_fp64_support(device: str | torch.device) -> dict:
+    """
+    Check the active device's FP64 operators without changing precision policy.
+
+    Device capability flags alone cannot establish that the installed runtime
+    implements every operator. This small cold-start probe checks matrix
+    multiplication, indexed reduction, elementary geometry, and two input
+    derivatives against CPU FP64, including bits below FP32 resolution. It is
+    not a throughput benchmark or a proof that every model kernel is supported.
+    No emulation environment flags, global dtype, or random state are changed.
+    """
+    device = torch.device(device)
+    if device.type not in {"cpu", "cuda", "xpu"}:
+        raise ValueError("FP64 probe supports cpu, cuda and xpu")
+    if device.type != "cpu" and not getattr(torch, device.type).is_available():
+        raise RuntimeError(f"FP64 execution probe requires an available {device.type}")
+    reported_has_fp64 = None
+    if device.type == "xpu":
+        if device.index is None:
+            device = torch.device("xpu", torch.xpu.current_device())
+        reported_has_fp64 = getattr(
+            torch.xpu.get_device_properties(device), "has_fp64", None
+        )
+    elif device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+
+    def evaluate(target):
+        epsilon = 2.0**-40
+        value = torch.tensor(
+            [[1.0 + epsilon, 0.25], [0.5, 1.0 - epsilon]],
+            dtype=torch.float64,
+            device=target,
+            requires_grad=True,
+        )
+        product = value @ value
+        indices = torch.tensor([0, 0, 1, 1], device=target, dtype=torch.long)
+        reduced = torch.zeros(2, device=target, dtype=torch.float64).index_add(
+            0, indices, value.reshape(-1)
+        )
+        distance = (value[0] - value[1]).square().sum().sqrt()
+        objective = product.square().sum() + reduced.square().sum() + distance.sin()
+        gradient = torch.autograd.grad(objective, value, create_graph=True)[0]
+        curvature = torch.autograd.grad(gradient.sum(), value)[0]
+        outputs = {
+            "matmul": product,
+            "index_add": reduced,
+            "geometry": distance,
+            "first_derivative": gradient,
+            "second_derivative": curvature,
+        }
+        if any(value.device != target for value in outputs.values()):
+            raise RuntimeError("FP64 operators changed the requested device")
+        return {name: value.detach().cpu() for name, value in outputs.items()}
+
+    try:
+        with (
+            torch.inference_mode(False),
+            torch.enable_grad(),
+            torch.autocast("cpu", enabled=False),
+            torch.autocast(device.type, enabled=False),
+        ):
+            expected = evaluate(torch.device("cpu"))
+            actual = expected if device.type == "cpu" else evaluate(device)
+        tolerance = 32 * torch.finfo(torch.float64).eps
+        for name, value in actual.items():
+            if value.dtype != torch.float64 or not torch.isfinite(value).all():
+                raise RuntimeError(f"{name} did not return finite FP64 values")
+            if not torch.allclose(
+                value, expected[name], rtol=tolerance, atol=tolerance
+            ):
+                raise RuntimeError(f"{name} differs from the CPU FP64 reference")
+        if not (actual["matmul"][0, 0] > 1.125 and actual["index_add"][0] > 1.25):
+            raise RuntimeError("operators lost values below FP32 resolution")
+    except (RuntimeError, TypeError, NotImplementedError) as error:
+        raise RuntimeError(
+            f"FP64 execution probe failed on {device}: {error}. "
+            "No lower-precision or CPU fallback was applied."
+        ) from error
+    return {
+        "passed": True,
+        "device": str(device),
+        "dtype": "float64",
+        "reported_has_fp64": reported_has_fp64,
+        "checks": list(actual),
+        "preserves_sub_fp32_bits": True,
+    }
+
+
 @dataclass(eq=False)
 class _TensorIdentity:
     """

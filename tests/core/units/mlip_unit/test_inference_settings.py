@@ -19,6 +19,7 @@ from fairchem.core.units.mlip_unit.api.inference import (
     guess_inference_settings,
     inference_settings_batch,
     inference_settings_default,
+    inference_settings_fp64,
     inference_settings_high_precision,
     inference_settings_multigpu,
     inference_settings_nitro,
@@ -36,6 +37,28 @@ from fairchem.core.units.mlip_unit.predict import (
 def test_default_dtype_is_float32():
     settings = InferenceSettings()
     assert settings.base_precision_dtype is torch.float32
+
+
+@pytest.mark.parametrize("name", ["fp64", "xpu-fp64"])
+def test_fp64_named_modes_preserve_precision_and_use_eager_portable_path(name):
+    settings = guess_inference_settings(name)
+    assert settings == inference_settings_fp64()
+    assert settings.base_precision_dtype is torch.float64
+    assert settings.execution_mode == "general"
+    assert settings.merge_mole
+    assert not any(
+        (
+            settings.tf32,
+            settings.compile,
+            settings.xpu_graph,
+            settings.nitro,
+            settings.series_b.enabled,
+        )
+    )
+    restored = InferenceSettings(
+        **{k: v for k, v in settings.to_omegaconf().items() if k != "_target_"}
+    )
+    assert restored == settings
 
 
 def test_named_modes_use_expected_paths():
@@ -234,7 +257,8 @@ def test_settings_change_names_changed_fields_and_precision():
 
 @pytest.mark.parametrize("name", sorted(set(NAME_TO_INFERENCE_SETTING) - {"default"}))
 def test_presets_describe_as_their_name(name):
-    assert describe_inference_settings(guess_inference_settings(name)) == name
+    canonical_name = "fp64" if name == "xpu-fp64" else name
+    assert describe_inference_settings(guess_inference_settings(name)) == canonical_name
 
 
 def test_default_describes_as_nitro():

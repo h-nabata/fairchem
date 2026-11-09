@@ -77,6 +77,7 @@ from fairchem.core.units.mlip_unit.inference_runtime import (
     configure_numeric_runtime,
     model_tensor_signature,
     mole_composition_key,
+    probe_fp64_support,
 )
 from fairchem.core.units.mlip_unit.mlip_unit import OutputSpec, Task
 from fairchem.core.units.mlip_unit.series_b_runtime import (
@@ -922,10 +923,10 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
             )
         if settings.tf32:
             raise ValueError("XPU inference requires tf32=False.")
-        if settings.base_precision_dtype != torch.float32:
-            raise ValueError(
-                "XPU inference currently supports base_precision_dtype=float32."
-            )
+        if settings.base_precision_dtype == torch.float64:
+            # Verify the installed operators before loading a large checkpoint.
+            # Driver capability flags alone do not validate GEMM or derivatives.
+            self.fp64_probe = probe_fp64_support(self.device)
         if settings.execution_mode is None:
             settings.execution_mode = ExecutionMode.GENERAL
 
@@ -1232,6 +1233,13 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         undo_element_references: bool = True,
         requested_properties: tuple[str, ...] | list[str] | None = None,
     ) -> dict[str, torch.tensor]:
+        """
+        Return completed predictions, computing requested derivatives internally.
+
+        Conservative evaluation outputs are detached after post-processing so
+        retaining them does not retain forward autograd graphs. Use the raw
+        model API for differentiable training losses or custom derivatives.
+        """
         self._restore_failed_preparation()
         if requested_properties is not None and (
             isinstance(requested_properties, (str, bytes, Mapping))
@@ -1552,7 +1560,7 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
             )
             if inductor_config.use_fast_math or intel_fast_math:
                 raise ValueError(
-                    "Strict FP32 XPU compilation requires Inductor use_fast_math=False "
+                    "Strict XPU compilation requires Inductor use_fast_math=False "
                     "and Intel Triton fast_math=False. The predictor does not change "
                     "these process-global settings."
                 )
@@ -1704,6 +1712,15 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
                     value if prop == "embeddings" else value * task.normalizer.rmsd
                 )
                 check_finite(task, pred_output[key], prop, _AUXILIARY_LEVELS[prop])
+        # Conservative evaluation needs autograd internally for forces and
+        # requested higher derivatives. Completed predictions must not retain
+        # those forward graphs when callers save a trajectory of outputs.
+        # Keep the training/direct-force contracts and raw model API unchanged.
+        if (
+            not self.model.training
+            and not self.model.module.backbone.regress_config.direct_forces
+        ):
+            pred_output = {name: value.detach() for name, value in pred_output.items()}
         return pred_output
 
 

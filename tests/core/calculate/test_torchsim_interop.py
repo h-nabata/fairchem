@@ -263,7 +263,9 @@ def test_actual_uma_passes_torchsim_model_interface_validator(
     )
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.int64])
+@pytest.mark.parametrize(
+    "dtype", [torch.float16, torch.bfloat16, torch.int64, False, 0]
+)
 def test_wrapper_rejects_unsupported_simulation_dtype(monkeypatch, dtype):
     with pytest.raises(ValueError, match="float32 or float64"):
         _wrapper(monkeypatch, dtype=dtype)
@@ -298,6 +300,60 @@ def test_transfer_preserves_high_precision_cell(monkeypatch):
     wrapper = _wrapper(monkeypatch, predictor, dtype=torch.float64)
     wrapper._device = torch.device("cpu:0")
     wrapper(state)
+
+
+@pytest.mark.parametrize("dtype", [None, torch.float32, torch.float64])
+def test_simulation_dtype_defaults_to_network_precision_without_implicit_rounding(
+    monkeypatch, dtype
+):
+    from fairchem.core.units.mlip_unit.api.inference import InferenceSettings
+
+    predictor = HarmonicPredictor()
+    predictor.inference_settings = InferenceSettings(base_precision_dtype=torch.float64)
+    state = _state(torch.float64)
+    state.positions[0, 0] = 1 + 2**-35
+    expected_dtype = torch.float64 if dtype is None else dtype
+    wrapper = _wrapper(monkeypatch, predictor, dtype=dtype)
+    assert wrapper.dtype == expected_dtype
+    result = wrapper(state)
+    torch.testing.assert_close(
+        result["forces"], -state.positions.to(expected_dtype), rtol=0, atol=0
+    )
+    assert result["energy"].dtype == expected_dtype
+
+
+@pytest.mark.parametrize("periodic", [False, True])
+def test_actual_fp64_uma_torchsim_defaults_preserve_geometry_and_outputs(
+    monkeypatch, periodic
+):
+    from tests.core.calculate.test_ase_interop_jobs import _real_calculator
+
+    predictor = _real_calculator().predictor
+    predictor.inference_settings.base_precision_dtype = torch.float64
+    predictor.model.double()
+    reference = copy.deepcopy(predictor)
+    state = _state(torch.float64, periodic)
+    state.positions[0, 0] = 1 + 2**-35
+    expected_data = interface._simstate_to_atomicdata_batch(
+        state, "omol", torch.float64
+    )
+    properties = ("energy", "forces", "stress") if periodic else ("energy", "forces")
+    expected = reference.predict(expected_data, requested_properties=properties)
+    predict = predictor.predict
+
+    def capture(data, **kwargs):
+        torch.testing.assert_close(data.pos, expected_data.pos, rtol=0, atol=0)
+        torch.testing.assert_close(data.cell, expected_data.cell, rtol=0, atol=0)
+        return predict(data, **kwargs)
+
+    predictor.predict = capture
+    wrapper = _wrapper(monkeypatch, predictor, compute_stress=periodic)
+    actual = wrapper(state)
+    assert wrapper.dtype == torch.float64
+    for name, value in expected.items():
+        target = value.reshape(1, 3, 3) if name == "stress" else value
+        assert actual[name].dtype == torch.float64
+        torch.testing.assert_close(actual[name], target, rtol=1e-12, atol=1e-12)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])

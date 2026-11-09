@@ -17,6 +17,8 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from fairchem.core import FAIRChemCalculator
+from fairchem.core.calculate import pretrained_mlip
 from fairchem.core.units import mlip_unit
 from fairchem.core.units.mlip_unit import MLIPPredictUnit, load_predict_unit
 from fairchem.core.units.mlip_unit import predict as predict_module
@@ -104,7 +106,6 @@ def test_xpu_parallel_configuration_is_rejected_before_construction(
         ({"execution_mode": "umas_fast_gpu"}, "require CUDA"),
         ({"internal_graph_gen_version": 3}, "NVIDIA-specific"),
         ({"tf32": True}, "tf32=False"),
-        ({"base_precision_dtype": torch.float64}, "float32"),
     ],
 )
 def test_xpu_rejects_unsupported_modes(kwargs, error):
@@ -118,6 +119,98 @@ def test_xpu_compile_is_explicit_opt_in():
     MLIPPredictUnit._validate_xpu_settings(predictor)
     assert predictor.inference_settings.compile
     assert predictor.inference_settings.execution_mode == "general"
+
+
+def test_xpu_fp64_checks_selected_device_before_loading_model(mock_xpu, monkeypatch):
+    def failed_probe(device):
+        assert device == "xpu:1"
+        raise RuntimeError("FP64 execution probe failed")
+
+    monkeypatch.setattr(predict_module, "probe_fp64_support", failed_probe)
+    loader = Mock(side_effect=AssertionError("checkpoint must not be loaded"))
+    monkeypatch.setattr(MLIPPredictUnit, "_load_model", loader)
+    with pytest.raises(RuntimeError, match="FP64 execution probe"):
+        MLIPPredictUnit(
+            "unused.pt",
+            device="xpu:1",
+            inference_settings=InferenceSettings(base_precision_dtype=torch.float64),
+        )
+    loader.assert_not_called()
+
+
+def test_xpu_fp64_keeps_probe_evidence_and_fp64_policy(monkeypatch):
+    evidence = {"passed": True, "device": "xpu:1", "dtype": "float64"}
+    probe = Mock(return_value=evidence)
+    monkeypatch.setattr(predict_module, "probe_fp64_support", probe)
+    predictor = SimpleNamespace(
+        device="xpu:1",
+        inference_settings=InferenceSettings(base_precision_dtype=torch.float64),
+    )
+    MLIPPredictUnit._validate_xpu_settings(predictor)
+    probe.assert_called_once_with("xpu:1")
+    assert predictor.fp64_probe is evidence
+    assert predictor.inference_settings.base_precision_dtype == torch.float64
+    assert predictor.inference_settings.execution_mode == "general"
+
+
+@pytest.mark.parametrize(
+    "settings", ["fp64", "xpu-fp64", InferenceSettings(base_precision_dtype="float64")]
+)
+@pytest.mark.parametrize(
+    "factory",
+    [pretrained_mlip.get_predict_unit, FAIRChemCalculator.from_model_checkpoint],
+)
+def test_public_xpu_fp64_probe_fails_before_download(
+    settings, factory, mock_xpu, monkeypatch
+):
+    probe = Mock(side_effect=RuntimeError("FP64 execution probe failed"))
+    download = Mock(side_effect=AssertionError("checkpoint must not be downloaded"))
+    monkeypatch.setattr(pretrained_mlip, "probe_fp64_support", probe)
+    monkeypatch.setattr(pretrained_mlip, "resolve_checkpoint", download)
+    with pytest.raises(RuntimeError, match="FP64 execution probe"):
+        factory("uma-s-1p2p1", inference_settings=settings, device="xpu")
+    probe.assert_called_once_with("xpu:1")
+    download.assert_not_called()
+
+
+@pytest.mark.parametrize("settings", ["default", "xpu", "fp64", "xpu-fp64"])
+def test_public_xpu_fp64_preflight_order_and_fp32_unchanged(
+    settings, mock_xpu, monkeypatch
+):
+    operations = Mock()
+    operations.download.return_value = pretrained_mlip.ResolvedCheckpoint("local.pt")
+    monkeypatch.setattr(pretrained_mlip, "probe_fp64_support", operations.probe)
+    monkeypatch.setattr(pretrained_mlip, "resolve_checkpoint", operations.download)
+    monkeypatch.setattr(pretrained_mlip, "load_predict_unit", operations.load)
+    result = pretrained_mlip.get_predict_unit(
+        "uma-s-1p2p1", inference_settings=settings, device="xpu"
+    )
+    expected = (
+        ["probe", "download", "load"] if "fp64" in settings else ["download", "load"]
+    )
+    assert [call[0] for call in operations.mock_calls] == expected
+    assert operations.load.call_args.args[1] == settings
+    assert operations.load.call_args.args[3] == "xpu:1"
+    assert result is operations.load.return_value
+
+
+def test_public_xpu_preflight_validates_private_settings_copy(mock_xpu, monkeypatch):
+    settings = InferenceSettings()
+    settings.base_precision_dtype = "float64"
+    before = copy.deepcopy(settings)
+    probe = Mock(side_effect=RuntimeError("FP64 execution probe failed"))
+    monkeypatch.setattr(pretrained_mlip, "probe_fp64_support", probe)
+    with pytest.raises(RuntimeError, match="FP64 execution probe"):
+        pretrained_mlip.get_predict_unit(
+            "uma-s-1p2p1", inference_settings=settings, device="xpu"
+        )
+    assert settings == before
+
+    settings.base_precision_dtype = "not-a-dtype"
+    with pytest.raises(ValueError, match="base_precision_dtype"):
+        pretrained_mlip.get_predict_unit(
+            "uma-s-1p2p1", inference_settings=settings, device="xpu"
+        )
 
 
 def test_direct_constructor_has_safe_xpu_defaults(mock_xpu, monkeypatch):

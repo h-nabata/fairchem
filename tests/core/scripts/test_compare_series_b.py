@@ -56,8 +56,15 @@ def test_real_uma_comparison_reports_errors_without_claiming_qualification():
     json.dumps(report, allow_nan=False)
 
 
+@pytest.mark.parametrize(
+    "dtype,options_json",
+    [
+        ("float32", '{"weight_bits":8}'),
+        ("float64", '{"saved_feature_dtype":"fp32","saved_feature_min_elements":1}'),
+    ],
+)
 def test_cli_json_file_options_load_independent_models_sequentially(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, dtype, options_json
 ):
     previous, settings_seen = [], []
 
@@ -68,6 +75,13 @@ def test_cli_json_file_options_load_independent_models_sequentially(
             assert previous[-1]() is None
         predictor = _public_predictor()
         predictor.inference_settings = copy.deepcopy(inference_settings)
+        original_predict = predictor.predict
+
+        def checked_predict(data, **kwargs):
+            assert data.pos.dtype == getattr(torch, dtype)
+            return original_predict(data, **kwargs)
+
+        predictor.predict = checked_predict
         previous.append(weakref.ref(predictor))
         settings_seen.append(copy.deepcopy(inference_settings))
         return predictor
@@ -80,7 +94,7 @@ def test_cli_json_file_options_load_independent_models_sequentially(
         tmp_path / "report.json",
     )
     write(source, atoms)
-    options.write_text('{"weight_bits":8}')
+    options.write_text(options_json)
     assert (
         script.main(
             [
@@ -92,6 +106,8 @@ def test_cli_json_file_options_load_independent_models_sequentially(
                 "omol",
                 "--device",
                 "cpu",
+                "--dtype",
+                dtype,
                 "--series-b",
                 f"@{options}",
                 "--output",
@@ -108,7 +124,12 @@ def test_cli_json_file_options_load_independent_models_sequentially(
     assert report["success"]
     assert not report["accuracy_qualified"]
     assert not settings_seen[0].series_b.enabled
-    assert settings_seen[1].series_b.weight_bits == 8
+    assert settings_seen[1].base_precision_dtype == getattr(torch, dtype)
+    if dtype == "float64":
+        assert settings_seen[1].series_b.saved_feature_dtype == "fp32"
+        assert report["candidate"]["output_dtypes"]["forces"] == "torch.float64"
+    else:
+        assert settings_seen[1].series_b.weight_bits == 8
     assert all(reference() is None for reference in previous)
     assert "Sequential" in report["memory_scope"]
     assert report["natoms"] == 3
@@ -229,3 +250,70 @@ def test_outer_cpu_autocast_does_not_reduce_reference_precision(monkeypatch):
     assert calls == [False] * 4
     assert report["errors"]["energy"]["max_absolute_error"] < 1e-6
     assert report["errors"]["forces"]["max_absolute_error"] < 1e-6
+
+
+def test_fp64_comparison_reports_derivative_error_without_changing_forward_precision():
+    reference, candidate = _public_predictor(), _public_predictor()
+    reference.inference_settings = replace(
+        reference.inference_settings, base_precision_dtype=torch.float64
+    )
+    candidate.inference_settings = replace(
+        reference.inference_settings,
+        series_b=SeriesBSettings(
+            saved_feature_dtype="fp32", saved_feature_min_elements=1
+        ),
+    )
+    data = _data()
+    data.pos = data.pos.double()
+    data.cell = data.cell.double()
+    report = script.compare_predictors(
+        reference,
+        candidate,
+        data,
+        properties=("energy", "forces", "hessian"),
+        warmup=0,
+        repeats=1,
+    )
+    assert report["success"]
+    assert not report["accuracy_qualified"]
+    for side in ("reference", "candidate"):
+        assert report[side]["settings"]["base_precision_dtype"] == "float64"
+        assert set(report[side]["output_dtypes"].values()) == {"torch.float64"}
+    assert report["errors"]["energy"]["max_absolute_error"] == 0
+    assert report["errors"]["forces"]["max_absolute_error"] > 0
+    assert report["errors"]["hessian"]["max_absolute_error"] > 0
+
+
+def test_comparison_rejects_mixed_base_precision_before_predicting():
+    reference, candidate = _public_predictor(), _public_predictor()
+    candidate.inference_settings = replace(
+        candidate.inference_settings, base_precision_dtype=torch.float64
+    )
+    with pytest.raises(ValueError, match="same base precision"):
+        script.compare_predictors(reference, candidate, _data())
+
+
+def test_fp64_comparison_checks_device_support_before_checkpoint_load(monkeypatch):
+    from fairchem.core.units.mlip_unit import inference_runtime
+
+    monkeypatch.setattr(torch.xpu, "is_available", lambda: True)
+
+    def unsupported(device):
+        assert device == torch.device("xpu:0")
+        raise RuntimeError("FP64 unsupported")
+
+    monkeypatch.setattr(inference_runtime, "probe_fp64_support", unsupported)
+    monkeypatch.setattr(
+        script.pretrained_mlip,
+        "get_predict_unit",
+        lambda *a, **kw: pytest.fail("Probe must precede checkpoint loading"),
+    )
+    with pytest.raises(RuntimeError, match="FP64 unsupported"):
+        script.run_comparison(
+            "unused.pt",
+            molecule("H2O"),
+            task="omol",
+            device="xpu:0",
+            base_precision_dtype=torch.float64,
+            series_b=SeriesBSettings(saved_feature_dtype="fp32"),
+        )

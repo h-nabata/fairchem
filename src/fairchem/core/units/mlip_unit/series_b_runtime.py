@@ -49,11 +49,17 @@ def validate_series_b(settings, device, backbone=None):
 
 def prepare_series_b(model, settings, device):
     """
-    Transform the private, prepared backbone; keep geometry and heads at FP32.
+    Transform the private backbone; preserve geometry/head base precision.
     """
     validate_series_b(settings, device, model.backbone)
     options = settings.series_b
-    manifest = {"enabled": options.enabled, "backbone_only": True}
+    manifest = {
+        "enabled": options.enabled,
+        "backbone_only": True,
+        "base_precision_dtype": str(settings.base_precision_dtype).removeprefix(
+            "torch."
+        ),
+    }
     if not options.enabled:
         return manifest
     if options.linear_enabled:

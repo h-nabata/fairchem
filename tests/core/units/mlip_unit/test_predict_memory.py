@@ -8,6 +8,7 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 import copy
+import gc
 import traceback
 import weakref
 from collections import Counter
@@ -33,6 +34,108 @@ from fairchem.core.units.mlip_unit.predict import (
     collate_predictions,
 )
 from tests.core.units.mlip_unit.test_xpu_preparation import _data, _small_predictor
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_completed_conservative_outputs_do_not_retain_prior_forward_graphs(dtype):
+    from tests.core.units.mlip_unit.test_predict_interoperability import (
+        _public_predictor,
+    )
+
+    predictor = _public_predictor()
+    predictor.model.eval()
+    data = _data()
+    retained, references = [], []
+    for _ in range(4):
+        intermediate = torch.ones(4096, dtype=dtype, requires_grad=True)
+        references.append(weakref.ref(intermediate))
+        output = {"omol_energy": {"energy": intermediate.square().sum().reshape(1)}}
+        retained.append(predictor._process_outputs(data, output, False))
+        del output, intermediate
+    gc.collect()
+    assert all(reference() is None for reference in references)
+    for prediction in retained:
+        energy = prediction["omol_energy"]
+        assert not energy.requires_grad
+        assert energy.grad_fn is None
+        assert energy.dtype == dtype
+        torch.testing.assert_close(energy, torch.tensor([4096.0], dtype=dtype))
+
+
+@pytest.mark.parametrize("training,direct", [(True, False), (False, True)])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_output_postprocessing_preserves_training_and_direct_force_gradients(
+    training, direct, dtype
+):
+    from tests.core.units.mlip_unit.test_predict_interoperability import (
+        _public_predictor,
+    )
+
+    predictor = _public_predictor()
+    predictor.model.train(training)
+    predictor.model.module.backbone.regress_config.direct_forces = direct
+    leaf = torch.tensor([1.25], dtype=dtype, requires_grad=True)
+    output = {"omol_energy": {"energy": leaf.pow(3)}}
+    energy = predictor._process_outputs(_data(), output, False)["omol_energy"]
+    gradient = torch.autograd.grad(energy.sum(), leaf)[0]
+    torch.testing.assert_close(gradient, 3 * leaf.square())
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_raw_uma_training_retains_energy_gradients(dtype):
+    predictor = _small_predictor()
+    predictor.model.to(dtype=dtype).train()
+    data = _data()
+    for key, value in data:
+        if torch.is_tensor(value) and value.is_floating_point():
+            data[key] = value.to(dtype=dtype)
+    energy = predictor.model(data)["omol_energy"]["energy"]
+    assert energy.grad_fn is not None
+    assert energy.requires_grad
+    energy.sum().backward()
+    gradients = [
+        parameter.grad
+        for parameter in predictor.model.parameters()
+        if parameter.grad is not None
+    ]
+    assert gradients
+    assert all(torch.isfinite(value).all() for value in gradients)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "properties", [("energy", "forces"), ("hessian",), ("hessian_vector_product",)]
+)
+def test_real_uma_evaluation_returns_completed_derivatives_without_graphs(
+    dtype, properties
+):
+    from tests.core.units.mlip_unit.test_predict_interoperability import (
+        _public_predictor,
+    )
+
+    predictor = _public_predictor()
+    predictor.model.to(dtype=dtype).eval()
+    predictor.inference_settings.base_precision_dtype = dtype
+    data = _data()
+    for key, value in data:
+        if torch.is_tensor(value) and value.is_floating_point():
+            data[key] = value.to(dtype=dtype)
+    data["hessian_vector"] = torch.ones_like(data.pos)
+    result = predictor.predict(data, requested_properties=properties)
+    assert set(result) == set(properties)
+    for name, value in result.items():
+        # UMA retains FP64 energy reductions even with FP32 model parameters.
+        expected_dtype = torch.float64 if name == "energy" else dtype
+        assert value.dtype == expected_dtype
+        assert value.grad_fn is None
+        assert not value.requires_grad
+        assert torch.isfinite(value).all()
+    repeated = predictor.predict(data, requested_properties=properties)
+    for name in result:
+        tolerance = 1e-6 if dtype == torch.float32 else 1e-12
+        torch.testing.assert_close(
+            repeated[name], result[name], rtol=tolerance, atol=tolerance
+        )
 
 
 class _CopyRecorder(TorchDispatchMode):

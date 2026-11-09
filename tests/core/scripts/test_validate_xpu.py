@@ -125,6 +125,40 @@ def test_finite_difference_uses_energy_and_restores_structure():
     assert not finite_difference_check(atoms, -force, 0.005, 1e-9)["passed"]
 
 
+def test_raw_force_finite_difference_bypasses_fixed_atom_constraints():
+    from ase.constraints import FixAtoms
+
+    atoms = harmonic_atoms()
+    atoms.set_constraint(FixAtoms(indices=[0]))
+    original = atoms.positions.copy()
+    force = evaluate(atoms)["forces"]
+    result = finite_difference_check(atoms, force, step=1e-4, tolerance=1e-9)
+    assert result["passed"]
+    assert result["finite_difference_eV_per_A"] == pytest.approx(-1.0)
+    np.testing.assert_array_equal(atoms.positions, original)
+    assert len(atoms.constraints) == 1
+
+
+def test_raw_stress_finite_difference_bypasses_cell_constraints():
+    from ase.constraints import FixConstraint
+
+    class LockedCell(FixConstraint):
+        def adjust_cell(self, atoms, cell):
+            cell[:] = atoms.cell
+
+    atoms = periodic_harmonic_atoms()
+    atoms.set_constraint(LockedCell())
+    original_cell = atoms.cell.copy()
+    original_positions = atoms.positions.copy()
+    stress = evaluate(atoms, stress=True)["stress"]
+    result = finite_difference_stress_check(atoms, stress, 1e-4, 1e-9)
+    assert result["passed"]
+    assert np.count_nonzero(result["finite_difference_eV_per_A3"])
+    np.testing.assert_array_equal(atoms.cell, original_cell)
+    np.testing.assert_array_equal(atoms.positions, original_positions)
+    assert len(atoms.constraints) == 1
+
+
 def test_benchmark_does_not_measure_ase_cache_and_synchronizes(monkeypatch):
     atoms = harmonic_atoms()
     synchronize = Mock()
@@ -334,6 +368,15 @@ def test_fp64_probe_math_on_cpu():
     result = probe_fp64_reduction(torch.device("cpu"))
     assert result["passed"]
     assert result["gradient"] == [8.0, 4.0, 8.0]
+
+
+def test_fp64_probe_reference_ignores_foreign_default_device():
+    with torch.device("meta"):
+        result = probe_fp64_reduction(torch.device("cpu"))
+        assert torch.empty(0).device.type == "meta"
+    assert result["passed"]
+    assert result["device"] == "cpu"
+    assert result["multidimensional"]["passed"]
 
 
 def test_multidimensional_fp64_probe_math_on_cpu():
@@ -760,3 +803,122 @@ def test_invalid_options_fail_with_report(tmp_path, flag, value):
 def test_nonfinite_json_is_standards_compliant():
     result = json.dumps(_json_safe({"energy": float("nan")}), allow_nan=False)
     assert json.loads(result) == {"energy": "nan"}
+
+
+def test_fp64_settings_and_tensor_inventory_do_not_silently_use_fp32():
+    args = build_parser().parse_args(["--dtype", "float64", "--compare-merged"])
+    for device, merged in (("cpu", False), ("xpu:0", False), ("xpu:0", True)):
+        settings = case_settings(args, torch.device(device), merged, True)
+        assert settings.base_precision_dtype == torch.float64
+        assert not settings.tf32
+        assert not settings.nitro
+        assert settings.requested_properties == ("energy", "forces", "stress")
+    predictor = SimpleNamespace(model=torch.nn.Linear(2, 1).double())
+    inventory = model_tensor_inventory(predictor, torch.device("cpu"), torch.float64)
+    assert set(inventory) == {"cpu/torch.float64"}
+    predictor.model.float()
+    with pytest.raises(RuntimeError, match="not FP64"):
+        model_tensor_inventory(predictor, torch.device("cpu"), torch.float64)
+
+
+def test_fp64_compute_failure_is_reported_before_any_checkpoint_load(
+    tmp_path, monkeypatch
+):
+    from fairchem.core.scripts import validate_xpu
+    from fairchem.core.units.mlip_unit import inference_runtime
+
+    mock_xpu(monkeypatch)
+
+    def failed_probe(device):
+        assert device == torch.device("xpu:0")
+        raise RuntimeError("FP64 matrix multiplication is unavailable")
+
+    monkeypatch.setattr(inference_runtime, "probe_fp64_support", failed_probe)
+    monkeypatch.setattr(
+        validate_xpu, "run_case", lambda *a: pytest.fail("Must fail before loading")
+    )
+    output = tmp_path / "fp64-failure.json"
+    assert main(["--dtype", "float64", "--output", str(output)]) == 1
+    report = json.loads(output.read_text())
+    assert report["cases"] == {}
+    assert report["active_check"]["stage"] == "fp64_compute_probe"
+    assert "matrix multiplication" in report["error"]["message"]
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float64"])
+def test_probe_only_never_loads_a_model_and_identifies_its_scope(
+    tmp_path, monkeypatch, dtype
+):
+    from fairchem.core.scripts import validate_xpu
+    from fairchem.core.units.mlip_unit import inference_runtime
+
+    mock_xpu(monkeypatch)
+    probe_calls = []
+
+    def probe(device):
+        probe_calls.append(device)
+        return {"passed": True, "device": str(device), "dtype": "torch.float64"}
+
+    monkeypatch.setattr(inference_runtime, "probe_fp64_support", probe)
+    monkeypatch.setattr(
+        validate_xpu, "run_case", lambda *a: pytest.fail("Probe must not load a model")
+    )
+    output = tmp_path / "probe.json"
+    assert main(["--dtype", dtype, "--probe-only", "--output", str(output)]) == 0
+    report = json.loads(output.read_text())
+    assert report["probe_only"]
+    assert report["passed"]
+    assert report["cases"] == {}
+    assert "no checkpoint" in report["note"]
+    assert len(probe_calls) == (1 if dtype == "float64" else 0)
+
+
+@pytest.mark.parametrize("merge_mole", [False, True])
+@pytest.mark.parametrize("stress", [False, True])
+def test_actual_small_uma_fp64_validation_and_force_difference(
+    monkeypatch, merge_mole, stress
+):
+    from ase.build import molecule
+
+    import fairchem.core
+    from tests.core.units.mlip_unit.test_predict_interoperability import (
+        _public_predictor,
+    )
+
+    def load(model, device, inference_settings):
+        assert device == "cpu"
+        predictor = _public_predictor()
+        predictor.inference_settings = inference_settings
+        if stress:
+            # This lightweight fixture bypasses checkpoint construction, so
+            # explicitly perform its usual default derivative-task registration.
+            model = predictor.model.module
+            model.add_tasks(
+                model.backbone.get_default_untrained_tasks(
+                    model.tasks, inference_settings
+                )
+            )
+        return predictor
+
+    monkeypatch.setattr(fairchem.core.pretrained_mlip, "get_predict_unit", load)
+    args = build_parser().parse_args(
+        ["--dtype", "float64", "--warmup", "0", "--repeats", "1", "--fd-step", "1e-4"]
+    )
+    atoms = molecule("H2O")
+    atoms.info.update(charge=0, spin=1)
+    if stress:
+        atoms.set_cell([8, 8, 8])
+        atoms.pbc = True
+    values, report = run_case(
+        args, atoms, "omol", torch.device("cpu"), merge_mole, stress=stress
+    )
+    assert values["forces"].dtype == np.float64
+    assert report["settings"]["base_precision_dtype"] == "float64"
+    assert report["finite_difference"]["passed"]
+    assert report["finite_difference"]["absolute_error_eV_per_A"] < 1e-5
+    if stress:
+        assert values["stress"].dtype == np.float64
+        assert report["stress_finite_difference"]["passed"]
+        assert (
+            max(report["stress_finite_difference"]["absolute_errors_eV_per_A3"]) < 1e-6
+        )

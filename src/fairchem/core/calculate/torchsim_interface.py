@@ -465,7 +465,9 @@ class FairChemModel(_TSModelInterface):
                 None, prefers CUDA, then XPU, then CPU. Specify ``xpu:<index>``
                 explicitly on hosts with both NVIDIA and Intel GPUs.
             dtype (torch.dtype | None): Simulation input/output dtype (float32 or
-                float64). Network precision is selected by inference_settings.
+                float64). Defaults to the predictor's base precision. An explicit
+                dtype selects simulation conversion/output precision separately;
+                network precision is selected by inference_settings.
             compute_stress (bool): Whether to compute stress tensor
             task_name (UMATask | str | None): Task type for UMA models (optional,
                 only needed for UMA models)
@@ -490,7 +492,7 @@ class FairChemModel(_TSModelInterface):
         setup_logging()
         super().__init__()
 
-        self._dtype = dtype or torch.float32
+        self._dtype = torch.float32 if dtype is None else dtype
         if self._dtype not in (torch.float32, torch.float64):
             raise ValueError("FairChemModel dtype must be float32 or float64")
         self._compute_stress = compute_stress
@@ -535,6 +537,17 @@ class FairChemModel(_TSModelInterface):
             device=device_str,
             **loader_kwargs,
         )
+        if dtype is None:
+            # Do not round FP64 coordinates through a default FP32 simulation
+            # dtype before the FP64 predictor sees them. Explicit simulation
+            # precision remains independent of the network precision.
+            self._dtype = getattr(
+                getattr(self.predictor, "inference_settings", None),
+                "base_precision_dtype",
+                torch.float32,
+            )
+            if self._dtype not in (torch.float32, torch.float64):
+                raise ValueError("FairChemModel dtype must be float32 or float64")
 
         if self._device.type in {"xpu", "cuda"}:
             # The predictor resolves a bare accelerator to a concrete ordinal. Keep

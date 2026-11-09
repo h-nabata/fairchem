@@ -197,3 +197,118 @@ def test_runtime_diagnostics_are_owned_numeric_snapshots(monkeypatch):
     snapshot = benchmark_md._nitro_runtime()
     state["active_capacities"]["edge_capacity"] = 256
     assert snapshot["active_capacities"]["edge_capacity"] == 128
+
+
+def test_md_cli_runs_actual_fp64_small_uma_and_records_precision(tmp_path, monkeypatch):
+    from ase.io import write
+
+    from fairchem.core import pretrained_mlip
+    from tests.core.units.mlip_unit.test_predict_interoperability import (
+        _public_predictor,
+    )
+
+    settings_seen = []
+
+    def load(model, *, device, inference_settings, seed):
+        settings_seen.append(inference_settings)
+        predictor = _public_predictor()
+        predictor.inference_settings = inference_settings
+        return predictor
+
+    monkeypatch.setattr(pretrained_mlip, "get_predict_unit", load)
+    source, destination = tmp_path / "water.extxyz", tmp_path / "md64.json"
+    atoms = molecule("H2O")
+    atoms.info.update(charge=0, spin=1)
+    write(source, atoms)
+    assert (
+        benchmark_md.main(
+            [
+                "--device",
+                "cpu",
+                "--inference-settings",
+                "xpu",
+                "--dtype",
+                "float64",
+                "--input",
+                str(source),
+                "--task",
+                "omol",
+                "--steps",
+                "2",
+                "--warmup",
+                "0",
+                "--timestep-fs",
+                "0.001",
+                "--output",
+                str(destination),
+            ]
+        )
+        == 0
+    )
+    report = json.loads(destination.read_text())
+    assert report["base_precision_dtype"] == "torch.float64"
+    assert settings_seen[0].base_precision_dtype == torch.float64
+    assert not settings_seen[0].compile
+    assert np.isfinite(report["max_energy_drift_eV_per_atom"])
+
+
+def test_md_fp64_probe_precedes_checkpoint_download(tmp_path, monkeypatch):
+    from fairchem.core import pretrained_mlip
+    from fairchem.core.units.mlip_unit import inference_runtime
+
+    monkeypatch.setattr(torch.xpu, "is_available", lambda: True)
+    monkeypatch.setattr(
+        inference_runtime,
+        "probe_fp64_support",
+        lambda device: (_ for _ in ()).throw(RuntimeError("unsupported FP64")),
+    )
+    monkeypatch.setattr(
+        pretrained_mlip,
+        "get_predict_unit",
+        lambda *a, **kw: pytest.fail("FP64 support must be checked before loading"),
+    )
+    destination = tmp_path / "failed-fp64.json"
+    assert (
+        benchmark_md.main(
+            [
+                "--device",
+                "xpu:0",
+                "--inference-settings",
+                "xpu",
+                "--dtype",
+                "float64",
+                "--output",
+                str(destination),
+            ]
+        )
+        == 1
+    )
+    assert "unsupported FP64" in json.loads(destination.read_text())["error"]
+
+
+def test_md_rejects_fp64_nitro_before_loading_a_checkpoint(tmp_path, monkeypatch):
+    from fairchem.core import pretrained_mlip
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        pretrained_mlip,
+        "get_predict_unit",
+        lambda *a, **kw: pytest.fail("FP64 Nitro must fail before loading"),
+    )
+    destination = tmp_path / "nitro64.json"
+    assert (
+        benchmark_md.main(
+            [
+                "--device",
+                "cuda:0",
+                "--inference-settings",
+                "nitro",
+                "--dtype",
+                "float64",
+                "--output",
+                str(destination),
+            ]
+        )
+        == 1
+    )
+    assert "Nitro" in json.loads(destination.read_text())["error"]

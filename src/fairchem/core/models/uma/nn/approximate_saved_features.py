@@ -21,7 +21,7 @@ from fairchem.core.models.uma.nn.activation import (
 )
 from fairchem.core.models.uma.nn.execution_backends import ExecutionBackend
 
-_DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
+_DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
 _ACTIVATIONS = (
     GateActivation,
     ScaledSigmoid,
@@ -51,21 +51,25 @@ def _pack_feature(tensor, dtype, min_elements):
     # Returning detached tensors also avoids saved-output reference cycles.
     value = tensor.detach()
     version = None if tensor.is_inference() else tensor._version
+    source_dtype = torch.float64 if dtype == torch.float32 else torch.float32
     if (
         isinstance(tensor, torch.nn.Parameter)
         or not tensor.requires_grad
-        or tensor.dtype != torch.float32
+        or tensor.dtype != source_dtype
         or tensor.layout != torch.strided
         or tensor.numel() < min_elements
     ):
         return _UncompressedFeature(value, version)
 
-    # A block scale avoids introducing infinities for finite FP32 features that
-    # exceed FP16's range (or round above BF16's largest finite value). The scale
+    # A block scale avoids introducing infinities for finite source features
+    # outside the storage dtype's range. The scale
     # stays on the same device, without scalar reads or host synchronization.
     # Nonfinite entries must remain visible, but must not disable scaling for
     # the finite entries sharing this activation tensor.
-    maximum = torch.where(torch.isfinite(value), value.abs(), 0).amax()
+    # abs() owns this temporary, so replacing its nonfinite values in place
+    # avoids a full mask and second floating-point tensor without touching the
+    # saved source. The finite maximum (and hence the packed values) is unchanged.
+    maximum = value.abs().nan_to_num_(nan=0, posinf=0, neginf=0).amax()
     scale = (maximum / torch.finfo(dtype).max).clamp_min(1)
     packed = (value / scale).to(dtype=dtype, memory_format=torch.contiguous_format)
     return _PackedFeature(packed, scale, tensor.dtype, weakref.ref(tensor), version)
@@ -86,8 +90,8 @@ def _unpack_feature(packed):
         )
     if isinstance(packed, _PackedFeature):
         restored = packed.compressed.to(dtype=packed.original_dtype) * packed.scale
-        # Quantization can round the reconstructed largest finite FP32 value
-        # above FP32's range. Saturate only finite packed values; pre-existing
+        # Quantization can round the reconstructed largest finite source value
+        # above its dtype's range. Saturate only finite packed values; pre-existing
         # NaN/Inf must remain visible to the predictor's finite-value checks.
         limit = torch.finfo(packed.original_dtype).max
         return torch.where(
@@ -142,18 +146,21 @@ class _CompressedFeatureForward:
 
 def apply_saved_feature_compression(backbone, dtype="bf16", min_elements=1024):
     """
-    Compress FP32 learned activation features saved for inference derivatives.
+    Compress learned activation features saved for inference derivatives.
 
     This opt-in, lossy transformation wraps only parameter-free gate/SiLU/
-    sigmoid modules. Geometry, normalization, weights and FP64 tensors are not
-    compressed. It preserves module types and state_dict keys. Compilation,
+    sigmoid modules. BF16/FP16 storage applies only to FP32 activations; FP32
+    storage applies only to FP64 activations. Geometry, normalization and weights
+    are not compressed. Forward arithmetic and values stay at the original
+    precision; derivative values are approximate. Module types and state_dict
+    keys are preserved. Compilation,
     graph capture and activation checkpointing must be disabled by the caller.
 
     Returns a serializable manifest of wrapped modules. Reapplying the same
     configuration is idempotent; changing it requires a fresh backbone.
     """
     if not isinstance(dtype, str) or dtype not in _DTYPES:
-        raise ValueError("saved-feature dtype must be 'bf16' or 'fp16'")
+        raise ValueError("saved-feature dtype must be 'bf16', 'fp16' or 'fp32'")
     if (
         isinstance(min_elements, bool)
         or not isinstance(min_elements, Integral)
@@ -205,6 +212,9 @@ def apply_saved_feature_compression(backbone, dtype="bf16", min_elements=1024):
             module.forward = _CompressedFeatureForward(current, dtype, min_elements)
     return {
         "dtype": dtype,
+        "source_dtype": "float64" if dtype == "fp32" else "float32",
+        "forward_unchanged": True,
+        "derivatives_approximate": True,
         "min_elements": min_elements,
         "module_count": len(targets),
         "modules": [name for name, _, _ in targets],

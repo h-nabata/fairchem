@@ -353,7 +353,11 @@ def radius_graph_pbc_nvidia(
 @requires(nvalchemiops_installed(), message="Requires `nvalchemiops` to be installed")
 @torch.inference_mode()
 def get_neighbors_nvidia_atoms(
-    atoms, cutoff: float, max_neigh: int
+    atoms,
+    cutoff: float,
+    max_neigh: int,
+    *,
+    target_dtype: torch.dtype = torch.float32,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Performs nearest neighbor search using NVIDIA nvalchemiops and returns edge index, distances,
     and cell offsets.
@@ -362,6 +366,7 @@ def get_neighbors_nvidia_atoms(
         atoms: ASE Atoms object
         cutoff: Cutoff radius in Angstroms
         max_neigh: Maximum number of neighbors per atom
+        target_dtype: Coordinate precision used to select the neighbor topology.
 
     Returns:
         c_index: Center atom indices (numpy array)
@@ -369,8 +374,10 @@ def get_neighbors_nvidia_atoms(
         distances: Pairwise distances (numpy array) accounting for PBC
         offsets: Cell offsets (numpy array)
     """
-    positions = torch.from_numpy(atoms.get_positions()).float()
-    cell = torch.from_numpy(np.array(atoms.get_cell(complete=True))).float()
+    if target_dtype not in (torch.float32, torch.float64):
+        raise ValueError("NVIDIA ASE graph requires float32 or float64 coordinates")
+    positions = torch.from_numpy(atoms.get_positions()).to(target_dtype)
+    cell = torch.from_numpy(np.array(atoms.get_cell(complete=True))).to(target_dtype)
     pbc = torch.from_numpy(np.array(atoms.pbc)).bool()
 
     c_index, n_index, offsets, distances_sq = get_neighbors_nvidia(

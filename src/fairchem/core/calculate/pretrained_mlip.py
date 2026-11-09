@@ -7,6 +7,7 @@ LICENSE file in the root directory of this source tree.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 from dataclasses import dataclass
@@ -21,6 +22,8 @@ from fairchem.core import calculate
 from fairchem.core._config import CACHE_DIR
 from fairchem.core.common.distutils import resolve_xpu_device
 from fairchem.core.units.mlip_unit import MLIPPredictUnit, load_predict_unit
+from fairchem.core.units.mlip_unit.api.inference import guess_inference_settings
+from fairchem.core.units.mlip_unit.inference_runtime import probe_fp64_support
 
 if TYPE_CHECKING:
     from fairchem.core.units.mlip_unit import InferenceSettings
@@ -156,8 +159,10 @@ def get_predict_unit(
             compile with TF32 matrix multiplies on CUDA. "high-precision" uses
             merge_mole + compile in full FP32. "multigpu" and "high-precision" fall
             back automatically if their fixed-input contract is broken. "batch" keeps
-            MOLE unmerged for heterogeneous inputs. More advanced use cases can use a
-            custom InferenceSettings object.
+            MOLE unmerged for heterogeneous inputs. "fp64" (alias "xpu-fp64") uses
+            portable FP64 eager inference with MOLE merging; explicitly selected
+            XPU devices are probed before downloading weights. More advanced use
+            cases can use a custom InferenceSettings object.
         overrides: Optional dictionary of settings to override default inference settings.
         device: Optional device ("cpu", "cuda", "xpu", or "xpu:<index>").
             If None, prefers CUDA, then XPU, then CPU. On XPU, "default" selects
@@ -183,6 +188,13 @@ def get_predict_unit(
                 "XPU inference supports workers=1 without graph parallelism."
             )
         device = resolve_xpu_device(device)
+        # Validate a private settings copy before fetching weights. FP64 support
+        # depends on the installed driver/operator stack, not just discovery of
+        # the device. The constructor repeats this check for direct local loads.
+        settings = copy.deepcopy(guess_inference_settings(inference_settings))
+        settings.__post_init__()
+        if settings.base_precision_dtype == torch.float64:
+            probe_fp64_support(device)
     checkpoint = resolve_checkpoint(model_name, cache_dir)
     return load_predict_unit(
         checkpoint.path,

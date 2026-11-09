@@ -116,10 +116,14 @@ class EdgeDegreeEmbedding(torch.nn.Module):
         )
         x_edge_partitions = x_edge.split(self.activation_checkpoint_chunk_size, dim=0)
 
+        # Each checkpoint reuses one zero node tensor. Passing the accumulating
+        # x into every chunk would retain a full node-feature buffer per chunk
+        # until force backward (upstream fairchem PR #2219).
+        zeros = torch.zeros_like(x)
         for idx in range(len(scatter_target_partitions)):
-            x = torch.utils.checkpoint.checkpoint(
+            x = x + torch.utils.checkpoint.checkpoint(
                 self.forward_chunk,
-                x,
+                zeros,
                 x_edge_partitions[idx],
                 scatter_target_partitions[idx],
                 wigner_inv_partitions[idx],
@@ -183,18 +187,19 @@ class ChgSpinEmbedding(nn.Module):
         # charge is default 0
         if self.embedding_type == "pos_emb":
             x_proj = x[:, None] * self.W[None, :] * 2 * torch.pi
+            emb = torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
             if self.embedding_target == "charge":
-                return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
-            elif self.embedding_target == "spin":
-                zero_idxs = torch.where(x == 0)[0]
-                emb = torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
-                # this sets the null spin embedding to zero
-                emb[zero_idxs] = 0
                 return emb
+            elif self.embedding_target == "spin":
+                # Keep null-spin masking fixed-shape: extracting zero indices
+                # introduces a dynamic nonzero result and accelerator sync.
+                return torch.where((x == 0).unsqueeze(-1), 0, emb)
         elif self.embedding_type == "lin_emb":
             if self.embedding_target == "spin":
-                x[x == 0] = -100
-            return self.lin_emb(x.unsqueeze(-1).float())
+                # Charge/spin tensors may be shared by other embeddings or
+                # reused on the next prediction. Never replace caller values.
+                x = torch.where(x == 0, -100, x)
+            return self.lin_emb(x.unsqueeze(-1).to(self.lin_emb.weight.dtype))
         elif self.embedding_type == "rand_emb":
             # Use tensor arithmetic instead of dict lookup (compile-friendly)
             indices = x + self._index_offset

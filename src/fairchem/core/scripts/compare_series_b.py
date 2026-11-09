@@ -4,7 +4,7 @@ Copyright (c) Meta Platforms, Inc. and affiliates.
 This source code is licensed under the MIT license found in the
 LICENSE file in the root directory of this source tree.
 
-Compare explicitly enabled Series B with strict FP32 on the same structure.
+Compare explicitly enabled Series B with strict FP32 or FP64 on one structure.
 
 No error threshold or speedup claim is implied by successful execution. Native
 GPU modes must be tested on the target driver/hardware; CPU reduced-GEMM
@@ -164,11 +164,13 @@ def _measure_predictor(predictor, data, properties, warmup, repeats, measure_mem
         # CPU copies and validation are outside the timer. Release every GPU
         # output before the next evaluation so its buffers do not inflate peaks.
         snapshots = _snapshot(prediction, properties, natoms)
+        output_dtypes = {name: str(prediction[name].dtype) for name in properties}
         del prediction
     settings = predictor.inference_settings
     summary = {
         "device": str(device),
         "settings": _json_safe(settings.to_omegaconf()),
+        "output_dtypes": output_dtypes,
         "approximation_manifest": _json_safe(
             getattr(predictor, "approximation_manifest", {})
         ),
@@ -278,11 +280,14 @@ def compare_predictors(
     if reference.inference_settings.series_b.enabled:
         raise ValueError("The reference predictor must have Series B disabled")
     if reference.inference_settings.tf32 or reference.inference_settings.nitro:
-        raise ValueError("The reference predictor must use strict FP32")
-    if reference.inference_settings.base_precision_dtype != torch.float32:
+        raise ValueError("The reference predictor must use strict FP32 or FP64")
+    dtype = reference.inference_settings.base_precision_dtype
+    if dtype not in (torch.float32, torch.float64):
         raise ValueError(
-            "The reference predictor must use base_precision_dtype=float32"
+            "The reference predictor must use base_precision_dtype=float32 or float64"
         )
+    if candidate.inference_settings.base_precision_dtype != dtype:
+        raise ValueError("Reference and candidate must use the same base precision")
     if reference.inference_settings.compile or reference.inference_settings.xpu_graph:
         raise ValueError("The reference predictor must use eager execution")
     if torch.device(reference.device) != torch.device(candidate.device):
@@ -312,13 +317,14 @@ def run_comparison(
     task,
     device="xpu:0",
     series_b,
+    base_precision_dtype=torch.float32,
     properties=("energy", "forces"),
     warmup=2,
     repeats=5,
     measure_memory=False,
 ):
     """
-    Load the same checkpoint sequentially for strict FP32 and optional Series B.
+    Load one checkpoint sequentially at the requested base precision, with/without B.
 
     Models are released and the selected accelerator cache is emptied between
     cases; unrelated process allocations can still contribute to reported
@@ -333,12 +339,21 @@ def run_comparison(
         raise ValueError("Comparison device must be CPU, CUDA or XPU")
     if device.type != "cpu" and not getattr(torch, device.type).is_available():
         raise RuntimeError(f"Requested accelerator is unavailable: {device}")
-    baseline = inference_settings_xpu()
+    baseline = replace(
+        inference_settings_xpu(), base_precision_dtype=base_precision_dtype
+    )
     settings = [baseline, replace(baseline, series_b=series_b)]
+    fp64_probe = None
+    if device.type == "xpu" and baseline.base_precision_dtype == torch.float64:
+        from fairchem.core.units.mlip_unit.inference_runtime import probe_fp64_support
+
+        fp64_probe = probe_fp64_support(device)
     outputs, summaries = [], []
     structure = atoms.copy()
     validate_uma_atoms_data(structure, task)
-    data = AtomicData.from_ase(structure, task_name=task, target_dtype=torch.float32)
+    data = AtomicData.from_ase(
+        structure, task_name=task, target_dtype=baseline.base_precision_dtype
+    )
     for configuration in settings:
         predictor = None
         try:
@@ -366,6 +381,8 @@ def run_comparison(
     report["task"] = task
     report["natoms"] = len(atoms)
     report["series_b_requested"] = asdict(series_b)
+    if fp64_probe is not None:
+        report["fp64_compute_probe"] = fp64_probe
     return report
 
 
@@ -375,6 +392,7 @@ def build_parser():
     parser.add_argument("--structure", required=True, type=Path)
     parser.add_argument("--task", required=True)
     parser.add_argument("--device", default="xpu:0")
+    parser.add_argument("--dtype", choices=("float32", "float64"), default="float32")
     parser.add_argument(
         "--series-b", required=True, help="JSON object or @path/to/settings.json"
     )
@@ -402,6 +420,7 @@ def main(argv=None):
             task=args.task,
             device=args.device,
             series_b=options,
+            base_precision_dtype=args.dtype,
             properties=args.properties,
             warmup=args.warmup,
             repeats=args.repeats,

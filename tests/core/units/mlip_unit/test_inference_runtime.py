@@ -28,6 +28,7 @@ from fairchem.core.units.mlip_unit.inference_runtime import (
     configure_numeric_runtime,
     model_storage_bytes,
     mole_composition_key,
+    probe_fp64_support,
 )
 from fairchem.core.units.mlip_unit.mlip_unit import OutputSpec, Task
 from fairchem.core.units.mlip_unit.predict import MLIPPredictUnit, collate_predictions
@@ -42,6 +43,46 @@ def _key(data, device="xpu:0"):
         model_id="UMA-S-1.2",
         settings_key="strict",
     )
+
+
+def test_fp64_probe_exercises_math_and_derivatives_and_restores_ambient_state():
+    rng = torch.get_rng_state()
+    dtype = torch.get_default_dtype()
+    with torch.inference_mode(), torch.autocast("cpu", dtype=torch.bfloat16):
+        result = probe_fp64_support("cpu")
+        assert torch.is_inference_mode_enabled()
+        assert torch.is_autocast_enabled("cpu")
+    assert result["passed"]
+    assert result["preserves_sub_fp32_bits"]
+    assert result["dtype"] == "float64"
+    assert result["device"] == "cpu"
+    assert set(result["checks"]) == {
+        "matmul",
+        "index_add",
+        "geometry",
+        "first_derivative",
+        "second_derivative",
+    }
+    assert torch.get_default_dtype() == dtype
+    torch.testing.assert_close(torch.get_rng_state(), rng, rtol=0, atol=0)
+
+
+def test_fp64_probe_does_not_accept_silent_low_precision_matmul(monkeypatch):
+    original = torch.Tensor.__matmul__
+
+    def rounded(left, right):
+        return original(left.float(), right.float()).to(left.dtype)
+
+    monkeypatch.setattr(torch.Tensor, "__matmul__", rounded)
+    with pytest.raises(RuntimeError, match="below FP32 resolution"):
+        probe_fp64_support("cpu")
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="Requires a real Intel XPU")
+def test_real_xpu_fp64_probe():
+    result = probe_fp64_support("xpu")
+    assert result["device"].startswith("xpu:")
+    assert result["passed"]
 
 
 def test_mole_key_uses_exact_counts_all_systems_metadata_and_device():
@@ -168,6 +209,36 @@ def test_real_predictor_switches_cached_mole_models_and_matches_unmerged():
         assert len(candidate._prepared_models) <= 2
     assert candidate._prepared_models.hits == 1
     assert candidate._mole_template.module.backbone.num_experts == 2
+
+
+def test_fp64_merged_cache_and_neighbor_reuse_match_unmerged_reference():
+    candidate = _raw_predictor(2)
+    reference = _raw_predictor()
+    for predictor in (candidate, reference):
+        predictor.model.double()
+        predictor.inference_settings.base_precision_dtype = torch.float64
+    candidate.inference_settings.neighbor_skin = 0.5
+    reference.inference_settings.merge_mole = False
+    first, second = _data(), _data()
+    second.charge += 1
+    original = None
+    for index, data in enumerate((first, second, first)):
+        for key, value in data:
+            if torch.is_tensor(value) and value.is_floating_point():
+                data[key] = value.double()
+        actual = _raw_predict(candidate, data)
+        expected = _raw_predict(reference, data)
+        for prop in ("energy", "forces", "stress"):
+            value = actual[f"omol_{prop}"][prop]
+            assert value.dtype == torch.float64
+            torch.testing.assert_close(
+                value, expected[f"omol_{prop}"][prop], rtol=1e-10, atol=1e-10
+            )
+        if index == 0:
+            original = candidate.model
+        elif index == 2:
+            assert candidate.model is original
+    assert candidate._prepared_models.hits == 1
 
 
 def test_real_cache_detects_weight_edit_and_can_clear_without_disabling_merging():
@@ -326,7 +397,9 @@ def test_hvp_postprocessing_scales_without_energy_mean_and_collates():
         normalizer=SimpleNamespace(rmsd=torch.tensor(2.0), mean=torch.tensor(17.0)),
     )
     predictor = SimpleNamespace(
-        model=SimpleNamespace(module=SimpleNamespace(tasks={task.name: task})),
+        model=SimpleNamespace(
+            training=True, module=SimpleNamespace(tasks={task.name: task})
+        ),
         assert_on_nans=False,
         dataset_to_tasks={"omol": [task]},
     )

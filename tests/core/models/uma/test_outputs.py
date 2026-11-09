@@ -11,6 +11,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from fairchem.core.models.uma.escn_md import compose_tensor
 from fairchem.core.models.uma.outputs import (
     compute_energy,
     compute_forces,
@@ -18,6 +19,45 @@ from fairchem.core.models.uma.outputs import (
     get_l_component_range,
     reduce_node_to_system,
 )
+from fairchem.core.models.utils.irreps import cg_change_mat
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_stress_recomposition_preserves_dtype_and_analytic_coefficients(dtype):
+    trace = torch.tensor([[1.0 + 2**-30], [0.75]], dtype=dtype, requires_grad=True)
+    l2 = torch.linspace(-0.5, 0.5, 10, dtype=dtype).reshape(2, 5).requires_grad_()
+    actual = compose_tensor(trace, l2)
+    matrix = cg_change_mat(2, dtype=dtype)
+    assert actual.dtype == dtype
+    assert matrix.dtype == dtype
+    torch.testing.assert_close(matrix @ matrix.T, torch.eye(9, dtype=dtype))
+    reference = torch.cat((trace, torch.zeros(2, 3, dtype=dtype), l2), dim=1) @ matrix
+    # einsum and a differently shaped GEMM may associate the final sum
+    # differently; permit a few rounding units, not FP32-level FP64 error.
+    rounding = 4 * torch.finfo(dtype).eps
+    torch.testing.assert_close(actual, reference, rtol=rounding, atol=rounding)
+    tolerance = 2e-7 if dtype == torch.float32 else 1e-15
+    torch.testing.assert_close(
+        matrix[0, 0], torch.tensor(1 / 3**0.5, dtype=dtype), rtol=0, atol=tolerance
+    )
+    if dtype == torch.float64:
+        assert torch.autograd.gradcheck(compose_tensor, (trace, l2))
+        assert torch.autograd.gradgradcheck(compose_tensor, (trace, l2))
+
+
+def test_stress_recomposition_ignores_foreign_default_dtype_and_promotes_inputs():
+    trace = torch.tensor([[1.0]], dtype=torch.float32)
+    l2 = torch.tensor([[0.25, 0.0, 0.5, 0.0, 0.75]], dtype=torch.float64)
+    original = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.float32)
+        actual = compose_tensor(trace, l2)
+        torch.set_default_dtype(torch.float64)
+        expected = compose_tensor(trace, l2)
+    finally:
+        torch.set_default_dtype(original)
+    assert actual.dtype == expected.dtype == torch.float64
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 class TestGetLComponentRange:

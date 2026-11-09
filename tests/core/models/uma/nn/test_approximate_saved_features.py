@@ -86,6 +86,40 @@ def test_pack_excludes_weights_buffers_fp64_and_small_values():
         assert packed.tensor.dtype == source.dtype
 
 
+def test_fp64_features_use_half_width_storage_and_restore_owned_fp64_values():
+    source = torch.linspace(-2e200, 2e200, 4096, dtype=torch.float64).requires_grad_()
+    packed = _pack_feature(source, torch.float32, 1024)
+    assert isinstance(packed, _PackedFeature)
+    assert packed.compressed.dtype == torch.float32
+    assert packed.scale.dtype == torch.float64
+    assert packed.compressed.numel() * packed.compressed.element_size() == (
+        source.numel() * source.element_size() // 2
+    )
+    restored = _unpack_feature(packed)
+    assert restored.dtype == torch.float64
+    assert torch.isfinite(restored).all()
+    torch.testing.assert_close(restored, source, rtol=6e-8, atol=0)
+    restored.zero_()
+    assert torch.count_nonzero(_unpack_feature(packed)) > 0
+    # FP32 storage must not change the old BF16/FP16 policy or silently process
+    # an ordinary FP32 tensor without reducing its storage.
+    passthrough = _pack_feature(source.float(), torch.float32, 1)
+    assert isinstance(passthrough, _UncompressedFeature)
+    assert isinstance(_pack_feature(source, torch.bfloat16, 1), _UncompressedFeature)
+
+
+def test_fp64_feature_storage_keeps_extremes_and_nonfinite_diagnostics():
+    limit = torch.finfo(torch.float64).max
+    source = torch.tensor(
+        [limit, -limit, float("inf"), -float("inf"), float("nan")],
+        dtype=torch.float64,
+        requires_grad=True,
+    )
+    restored = _unpack_feature(_pack_feature(source, torch.float32, 1))
+    assert torch.isfinite(restored[:2]).all()
+    torch.testing.assert_close(restored, source, rtol=6e-8, atol=0, equal_nan=True)
+
+
 @pytest.mark.parametrize("size", [16, 2048])
 def test_saved_feature_mutation_does_not_silently_change_backward(size):
     activation = torch.nn.SiLU().eval()
@@ -133,6 +167,24 @@ def test_compressed_silu_keeps_forward_and_defined_double_backward(dtype):
         torch.testing.assert_close(approximate, exact, atol=0.004, rtol=0.02)
 
 
+def test_fp64_compressed_silu_preserves_forward_and_reports_derivative_precision():
+    reference = torch.nn.SiLU().eval()
+    candidate = copy.deepcopy(reference)
+    manifest = apply_saved_feature_compression(candidate, dtype="fp32", min_elements=1)
+    assert manifest["source_dtype"] == "float64"
+    assert manifest["forward_unchanged"]
+    assert manifest["derivatives_approximate"]
+    values = torch.linspace(-4, 4, 2048, dtype=torch.float64)
+    expected = _derivatives(reference, values)
+    actual = _derivatives(candidate, values)
+    torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
+    assert any(not torch.equal(a, e) for a, e in zip(actual[1:], expected[1:]))
+    for approximate, exact in zip(actual[1:], expected[1:]):
+        assert approximate.dtype == torch.float64
+        assert torch.isfinite(approximate).all()
+        torch.testing.assert_close(approximate, exact, atol=1e-7, rtol=1e-5)
+
+
 def test_gate_is_wrapped_once_without_changing_norm_or_state_dict():
     model = (
         torch.nn.Sequential(
@@ -159,13 +211,15 @@ def test_gate_is_wrapped_once_without_changing_norm_or_state_dict():
 @pytest.mark.parametrize(
     "restore", [copy.deepcopy, lambda value: pickle.loads(pickle.dumps(value))]
 )
-def test_copied_and_pickled_activation_owns_its_forward(restore):
+@pytest.mark.parametrize("storage", ["bf16", "fp32"])
+def test_copied_and_pickled_activation_owns_its_forward(restore, storage):
     original = torch.nn.SiLU().eval()
-    apply_saved_feature_compression(original, min_elements=1)
+    apply_saved_feature_compression(original, dtype=storage, min_elements=1)
     restored = restore(original)
     assert restored.forward.function.__self__ is restored
     assert restored.forward is not original.forward
-    values = torch.linspace(-2, 2, 32)
+    dtype = torch.float64 if storage == "fp32" else torch.float32
+    values = torch.linspace(-2, 2, 32, dtype=dtype)
     for actual, expected in zip(
         _derivatives(restored, values), _derivatives(original, values)
     ):
@@ -221,7 +275,7 @@ def test_independent_predictor_threads_keep_separate_hook_precision():
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"dtype": "fp32"},
+        {"dtype": "float32"},
         {"min_elements": True},
         {"min_elements": 0},
         {"min_elements": 1.5},
@@ -265,8 +319,12 @@ def test_forward_vmap_has_explicit_limitation():
 
 
 @pytest.mark.parametrize("vectorized", [False, True])
+@pytest.mark.parametrize(
+    "base_dtype, storage, rtol, atol",
+    [(torch.float32, "bf16", 0.08, 0.003), (torch.float64, "fp32", 2e-5, 2e-7)],
+)
 def test_real_uma_energy_force_stress_and_hessian_with_compressed_features(
-    vectorized, monkeypatch
+    vectorized, base_dtype, storage, rtol, atol, monkeypatch
 ):
     recorded = []
     original_pack = _pack_feature
@@ -284,15 +342,17 @@ def test_real_uma_energy_force_stress_and_hessian_with_compressed_features(
         return packed
 
     monkeypatch.setattr(approximate_saved_features, "_pack_feature", record_pack)
-    reference = tuple(module.float() for module in _model())
+    reference = tuple(module.to(dtype=base_dtype) for module in _model())
     reference[0].regress_config.hessian_vmap = vectorized
     candidate = copy.deepcopy(reference)
-    manifest = apply_saved_feature_compression(candidate[0], min_elements=1)
+    manifest = apply_saved_feature_compression(
+        candidate[0], dtype=storage, min_elements=1
+    )
     assert manifest["module_count"] > 0
     data = _data()
     for name, value in data.to_dict().items():
         if torch.is_tensor(value) and value.is_floating_point():
-            data[name] = value.float()
+            data[name] = value.to(dtype=base_dtype)
     properties = ("energy", "forces", "stress", "hessian")
     torch.manual_seed(19)
     expected = _evaluate(reference, data, properties)
@@ -304,6 +364,10 @@ def test_real_uma_energy_force_stress_and_hessian_with_compressed_features(
     )
     torch.testing.assert_close(actual["energy"], expected["energy"], rtol=0, atol=0)
     for name in properties[1:]:
+        # Stress reduction intentionally returns FP64 even for an FP32 model.
+        assert actual[name].dtype == expected[name].dtype
+        if base_dtype == torch.float64:
+            assert actual[name].dtype == torch.float64
         assert torch.isfinite(actual[name]).all()
         assert torch.count_nonzero(actual[name]) > 0
-        torch.testing.assert_close(actual[name], expected[name], rtol=0.08, atol=0.003)
+        torch.testing.assert_close(actual[name], expected[name], rtol=rtol, atol=atol)

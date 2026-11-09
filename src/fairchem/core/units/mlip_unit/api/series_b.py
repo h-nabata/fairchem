@@ -26,6 +26,9 @@ class SeriesBSettings:
     low_precision_emulation: bool = False
     weight_bits: int | None = None
     low_rank_fraction: float | None = None
+    # "fp32" compresses FP64 activation tape only; forward arithmetic stays
+    # FP64 while derivatives use rounded saved values. Other B policies remain
+    # FP32-base only, enforced by InferenceSettings.
     saved_feature_dtype: str | None = None
     saved_feature_min_elements: int = 1024
     compensated_reduction: bool = False
@@ -67,8 +70,10 @@ class SeriesBSettings:
                 raise ValueError("series_b.low_rank_fraction must be in (0, 1]")
             if self.weight_bits is not None:
                 raise ValueError("Select weight quantization or low rank separately")
-        if self.saved_feature_dtype not in (None, "bf16", "fp16"):
-            raise ValueError("series_b.saved_feature_dtype must be bf16, fp16 or None")
+        if self.saved_feature_dtype not in (None, "bf16", "fp16", "fp32"):
+            raise ValueError(
+                "series_b.saved_feature_dtype must be bf16, fp16, fp32 or None"
+            )
         for name, minimum in (
             ("saved_feature_min_elements", 1),
             ("radial_table_points", 2),
@@ -104,6 +109,19 @@ class SeriesBSettings:
             self.gemm_precision != "fp32"
             or self.weight_bits is not None
             or self.low_rank_fraction is not None
+        )
+
+    @property
+    def fp64_saved_features_only(self) -> bool:
+        """
+        Whether this is the supported FP64-base, approximate-derivative policy.
+        """
+        return self.saved_feature_dtype == "fp32" and not (
+            self.linear_enabled
+            or self.compensated_reduction
+            or self.radial_table_points is not None
+            or self.radial_fast_exp
+            or self.onednn_tf32
         )
 
     @property

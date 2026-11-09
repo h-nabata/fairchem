@@ -4,7 +4,7 @@ Copyright (c) Meta Platforms, Inc. and affiliates.
 This source code is licensed under the MIT license found in the
 LICENSE file in the root directory of this source tree.
 
-Run FP32 correctness, synchronized ASE timing and allocator-memory checks on XPU.
+Run FP32/FP64 correctness, synchronized ASE timing and allocator checks on XPU.
 
 Example:
     python -m fairchem.core.scripts.validate_xpu --device xpu:0 \
@@ -117,10 +117,10 @@ def finite_difference_check(atoms, force, step, tolerance):
         for sign in (1, -1):
             positions = original.copy()
             positions[atom, axis] += sign * step
-            atoms.set_positions(positions)
+            atoms.set_positions(positions, apply_constraint=False)
             energies.append(evaluate(atoms)["energy"])
     finally:
-        atoms.set_positions(original)
+        atoms.set_positions(original, apply_constraint=False)
         atoms.calc.reset()
     numeric = -(energies[0] - energies[1]) / (2 * step)
     analytic = float(force[atom, axis])
@@ -160,14 +160,16 @@ def finite_difference_stress_check(atoms, stress, step, tolerance):
                     strain[row, col] += sign * step / 2
                     strain[col, row] += sign * step / 2
                 # Restore first: each strain must be relative to the same cell.
-                atoms.set_cell(original_cell, scale_atoms=False)
-                atoms.set_positions(original_positions)
-                atoms.set_cell(original_cell @ strain, scale_atoms=True)
+                atoms.set_cell(original_cell, scale_atoms=False, apply_constraint=False)
+                atoms.set_positions(original_positions, apply_constraint=False)
+                atoms.set_cell(
+                    original_cell @ strain, scale_atoms=True, apply_constraint=False
+                )
                 energies.append(evaluate(atoms)["energy"])
             numeric.append((energies[0] - energies[1]) / (2 * step * volume))
     finally:
-        atoms.set_cell(original_cell, scale_atoms=False)
-        atoms.set_positions(original_positions)
+        atoms.set_cell(original_cell, scale_atoms=False, apply_constraint=False)
+        atoms.set_positions(original_positions, apply_constraint=False)
         atoms.calc.reset()
     numeric = np.asarray(numeric)
     analytic = np.asarray(stress)
@@ -244,7 +246,7 @@ def synchronized_timings(
     return result
 
 
-def model_tensor_inventory(predictor, device):
+def model_tensor_inventory(predictor, device, dtype=torch.float32):
     """
     Reject unexpected model placement or floating-point precision.
     """
@@ -260,8 +262,10 @@ def model_tensor_inventory(predictor, device):
             raise RuntimeError(
                 f"Model tensor {name} is on {tensor.device}, not {device}"
             )
-        if tensor.is_floating_point() and tensor.dtype != torch.float32:
-            raise RuntimeError(f"Model tensor {name} uses {tensor.dtype}, not FP32")
+        if tensor.is_floating_point() and tensor.dtype != dtype:
+            raise RuntimeError(
+                f"Model tensor {name} uses {tensor.dtype}, not FP{torch.finfo(dtype).bits}"
+            )
     if not count:
         raise RuntimeError("No model tensors found; cannot verify device placement")
     return inventory
@@ -280,10 +284,10 @@ def probe_fp64_reduction(device):
     )
     gradient = torch.autograd.grad(reduced.square().sum(), source)[0]
     torch.testing.assert_close(
-        reduced.cpu(), torch.tensor([4.0, 2.0], dtype=torch.float64)
+        reduced.cpu(), torch.tensor([4.0, 2.0], dtype=torch.float64, device="cpu")
     )
     torch.testing.assert_close(
-        gradient.cpu(), torch.tensor([8.0, 4.0, 8.0], dtype=torch.float32)
+        gradient.cpu(), torch.tensor([8.0, 4.0, 8.0], dtype=torch.float32, device="cpu")
     )
     # Stress/virial accumulation uses native multi-dimensional index_add_.
     # Keep the source strided so the probe also covers the non-contiguous path.
@@ -304,6 +308,7 @@ def probe_fp64_reduction(device):
         torch.tensor(
             [[[14, 20], [16, 22], [18, 24]], [[7, 10], [8, 11], [9, 12]]],
             dtype=torch.float64,
+            device="cpu",
         ),
     )
     torch.testing.assert_close(
@@ -315,6 +320,7 @@ def probe_fp64_reduction(device):
                 [[28, 40], [32, 44], [36, 48]],
             ],
             dtype=torch.float32,
+            device="cpu",
         ),
     )
     return {
@@ -338,7 +344,7 @@ def probe_fp64_reduction(device):
 
 def case_settings(args, device, merge_mole, stress=False):
     """
-    Keep a general CPU reference and select explicit FP32 XPU optimizations.
+    Keep a same-precision general CPU reference and explicit XPU optimizations.
 
     The unmerged XPU case exercises graph/compile options. Backend transforms
     and graph capture require merged experts and apply only to the merged case.
@@ -359,7 +365,7 @@ def case_settings(args, device, merge_mole, stress=False):
         }
         options = {name: getattr(args, name, value) for name, value in defaults.items()}
     return InferenceSettings(
-        base_precision_dtype=torch.float32,
+        base_precision_dtype=getattr(args, "dtype", "float32"),
         activation_checkpointing=False,
         tf32=False,
         nitro=False,
@@ -419,7 +425,9 @@ def run_case(args, atoms, task, device, merge_mole, stress=False, progress=None)
         stage("model_tensor_inventory")
         result = {
             "device": str(device),
-            "model_tensor_elements": model_tensor_inventory(predictor, device),
+            "model_tensor_elements": model_tensor_inventory(
+                predictor, device, settings.base_precision_dtype
+            ),
             "settings": predictor.inference_settings.to_omegaconf(),
             "first_evaluation_seconds": first_evaluation_seconds,
             "energy_eV": values["energy"],
@@ -510,6 +518,12 @@ def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="uma-s-1p2p1")
     parser.add_argument("--device", default="xpu:0")
+    parser.add_argument("--dtype", choices=("float32", "float64"), default="float32")
+    parser.add_argument(
+        "--probe-only",
+        action="store_true",
+        help="Run primitive device checks without loading or downloading a model",
+    )
     parser.add_argument("--output", type=Path, default=Path("xpu-validation.json"))
     parser.add_argument(
         "--case", choices=("all", "molecule", "periodic"), default="all"
@@ -573,6 +587,7 @@ def main(argv=None):
         "passed": False,
         "model": args.model,
         "requested_device": args.device,
+        "probe_only": args.probe_only,
         "versions": {
             name: _version(name) for name in ("torch", "fairchem-core", "ase", "e3nn")
         },
@@ -580,7 +595,11 @@ def main(argv=None):
         "python": platform.python_version(),
         "cases": {},
         "options": vars(args),
-        "note": "Small-system smoke checks; no claim about all operators or workloads.",
+        "note": (
+            "Primitive operator checks only; no checkpoint or model was evaluated."
+            if args.probe_only
+            else "Small-system smoke checks; no claim about all operators or workloads."
+        ),
     }
     try:
         if args.warmup < 0 or args.repeats < 1:
@@ -628,6 +647,13 @@ def main(argv=None):
             "stage": "fp64_reduction_probe",
         }
         report["fp64_reduction_probe"] = probe_fp64_reduction(device)
+        if args.dtype == "float64":
+            from fairchem.core.units.mlip_unit.inference_runtime import (
+                probe_fp64_support,
+            )
+
+            report["active_check"]["stage"] = "fp64_compute_probe"
+            report["fp64_compute_probe"] = probe_fp64_support(device)
         tolerances = {
             "energy_eV_per_atom": args.energy_tolerance,
             "forces_eV_per_A": args.force_tolerance,
@@ -640,10 +666,15 @@ def main(argv=None):
         copper = bulk("Cu", "fcc", a=3.6, cubic=True)
         copper.positions[0, 0] += 0.04
         passed = True
-        for name, atoms, task in (
-            ("molecule", water, "omol"),
-            ("periodic", copper, "omat"),
-        ):
+        cases = (
+            (
+                ("molecule", water, "omol"),
+                ("periodic", copper, "omat"),
+            )
+            if not args.probe_only
+            else ()
+        )
+        for name, atoms, task in cases:
             if args.case not in ("all", name):
                 continue
             case = {"natoms": len(atoms), "task": task}

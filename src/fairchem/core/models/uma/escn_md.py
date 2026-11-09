@@ -1416,15 +1416,18 @@ def compose_tensor(
         )
 
     batch_size = trace.shape[0]
+    # Direct stress heads reduce in FP64. Preserve that precision through the
+    # Cartesian reconstruction instead of copying into the default FP32 dtype.
+    dtype = torch.promote_types(trace.dtype, l2_symmetric.dtype)
     decomposed_preds = torch.zeros(
-        batch_size, irreps_sum(2), device=trace.device
+        batch_size, irreps_sum(2), device=trace.device, dtype=dtype
     )  # rank 2
     decomposed_preds[:, : irreps_sum(0)] = trace
     decomposed_preds[:, irreps_sum(1) : irreps_sum(2)] = l2_symmetric
 
     r2_tensor = torch.einsum(
         "ba, cb->ca",
-        cg_change_mat(2, device=trace.device),
+        cg_change_mat(2, device=trace.device, dtype=dtype),
         decomposed_preds,
     )
     return r2_tensor

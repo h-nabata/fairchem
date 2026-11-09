@@ -476,7 +476,9 @@ class AtomicData:
                     get_neighbors_nvidia_atoms,
                 )
 
-                split_idx_dist = get_neighbors_nvidia_atoms(atoms, radius, max_neigh)
+                split_idx_dist = get_neighbors_nvidia_atoms(
+                    atoms, radius, max_neigh, target_dtype=target_dtype
+                )
             else:
                 raise ValueError(
                     f"external_graph_method must be 'pymatgen' or 'nvidia', got {external_graph_method}"

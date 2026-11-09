@@ -287,8 +287,18 @@ class InferenceSettings:
                 raise ValueError(
                     "Series B currently requires activation_checkpointing=False"
                 )
-            if self.base_precision_dtype not in (torch.float32, "float32"):
-                raise ValueError("Series B requires base_precision_dtype=float32")
+            if self.base_precision_dtype in (torch.float64, "float64"):
+                if not self.series_b.fp64_saved_features_only:
+                    raise ValueError(
+                        "FP64 Series B only supports saved_feature_dtype='fp32' "
+                        "with all other approximations disabled"
+                    )
+            elif self.base_precision_dtype not in (torch.float32, "float32"):
+                raise ValueError("Series B requires float32 or supported FP64 settings")
+            elif self.series_b.saved_feature_dtype == "fp32":
+                raise ValueError(
+                    "saved_feature_dtype='fp32' requires FP64 base precision"
+                )
             if self.tf32:
                 raise ValueError("Use the separate series_b.onednn_tf32 option for XPU")
             if self.series_b.low_rank_fraction is not None and not self.merge_mole:
@@ -464,6 +474,26 @@ def inference_settings_xpu():
     )
 
 
+def inference_settings_fp64():
+    """
+    FP64 eager inference with exact MoLE merging and portable model operations.
+
+    Suitable for CPU, CUDA and XPU devices with working FP64 operators. XPU
+    construction probes the selected device before loading model weights. This
+    does not enable reduced-precision saved features or other Series B settings.
+    Compilation and graph replay remain explicit, separately validated options.
+    """
+    return InferenceSettings(
+        tf32=False,
+        activation_checkpointing=False,
+        merge_mole=True,
+        compile=False,
+        internal_graph_gen_version=2,
+        execution_mode="general",
+        base_precision_dtype=torch.float64,
+    )
+
+
 # The multigpu preset is a reduced-precision fast path: merged MOLE and
 # torch.compile with TF32 matrix multiplies on CUDA (tensors stay FP32), trading
 # precision for speed. Multi-worker inference runs it, since Nitro is single-GPU.
@@ -513,6 +543,8 @@ NAME_TO_INFERENCE_SETTING = {
     "traineval": inference_settings_traineval(),
     "nitro": inference_settings_nitro(),
     "xpu": inference_settings_xpu(),
+    "fp64": inference_settings_fp64(),
+    "xpu-fp64": inference_settings_fp64(),
 }
 
 
@@ -520,7 +552,8 @@ def describe_inference_settings(settings: InferenceSettings) -> str:
     """
     A preset's name, or the full settings on one line.
 
-    "default" is an alias of "nitro", so it reports the mode that runs. Presets
+    "default" aliases "nitro" and "xpu-fp64" aliases the portable "fp64" preset,
+    so aliases report their canonical mode. Presets
     leave execution_mode to automatic backend selection, which fills it in when
     the model loads, so the comparison ignores it.
     """
