@@ -486,3 +486,64 @@ def test_load_model_releases_partial_nitro_model_before_hydra(monkeypatch):
     predictor._load_hydra_model = load_hydra
     predictor._load_model()
     assert not predictor.inference_settings.nitro
+
+
+@pytest.mark.parametrize("use_template", [False, True])
+def test_failed_preparation_releases_partial_model_before_replacement(
+    monkeypatch, use_template
+):
+    released = []
+    predictor = MLIPPredictUnit.__new__(MLIPPredictUnit)
+    super(MLIPPredictUnit, predictor).__init__()
+    predictor.model = _ModelWrapper(_FallbackModule(released))
+    predictor._preparation_failed = True
+    predictor.lazy_model_intialized = False
+    predictor._numeric_runtimes = [NumericCoreRuntime(predictor.model.module.forward)]
+    # The module and its bound runtime form a cycle even after the predictor's
+    # extra runtime reference is dropped. Reclaim it before allocating a model.
+    predictor.model.module._numeric_runtimes = predictor._numeric_runtimes
+    partial = weakref.ref(predictor.model.module)
+    template = _ModelWrapper(torch.nn.Identity()) if use_template else None
+    predictor._mole_template = template
+    deepcopy = copy.deepcopy
+
+    def load():
+        assert partial() is None
+        predictor.model = _ModelWrapper(torch.nn.Identity())
+
+    def copy_template(value, *args, **kwargs):
+        if value is template:
+            assert partial() is None
+        return deepcopy(value, *args, **kwargs)
+
+    monkeypatch.setattr(predictor, "_load_model", load)
+    monkeypatch.setattr(predict_module.copy, "deepcopy", copy_template)
+    predictor._restore_failed_preparation()
+    assert released == [True]
+    assert partial() is None
+    assert not predictor._preparation_failed
+    assert not predictor.lazy_model_intialized
+    assert predictor._numeric_runtimes == []
+
+
+def test_preparation_releases_private_cpu_data_before_device_allocation(monkeypatch):
+    predictor = _small_predictor()
+    original_prepare = predictor.model.module.prepare_for_inference
+    original_move = predictor.move_to_device
+    owned = []
+
+    def prepare(data, settings):
+        owned.append(weakref.ref(data))
+        original_prepare(data, settings)
+
+    def move():
+        assert owned
+        assert owned[0]() is None
+        original_move()
+
+    monkeypatch.setattr(predictor.model.module, "prepare_for_inference", prepare)
+    monkeypatch.setattr(predictor, "move_to_device", move)
+    caller = _data()
+    predictor._lazy_init(caller)
+    assert predictor.lazy_model_intialized
+    assert caller.pos.shape == (3, 3)

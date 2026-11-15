@@ -8,6 +8,7 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 import copy
+import gc
 import math
 import os
 import tempfile
@@ -21,6 +22,7 @@ from typing import TYPE_CHECKING
 import hydra
 import torch
 
+from fairchem.core.calculate.series_b_workflows import _release_failed_workflow
 from fairchem.core.common._model_state import MODEL_STATE_LOCK
 from fairchem.core.datasets.atomic_data import AtomicData, _clone_tensor_tree
 from fairchem.core.models.uma.nn.mole import MOLEGlobals
@@ -135,23 +137,25 @@ class DistillationDataset:
     provenance: dict = field(default_factory=dict)
 
     def __post_init__(self):
-        samples = tuple(self.samples)
-        if not samples or any(
-            not isinstance(sample, DistillationSample) for sample in samples
-        ):
-            raise ValueError("A nonempty sequence of DistillationSample is required")
         if not isinstance(self.provenance, Mapping):
             raise TypeError("provenance must be a mapping")
-        object.__setattr__(
-            self,
-            "samples",
-            tuple(
-                DistillationSample(sample.data, sample.targets) for sample in samples
-            ),
-        )
+        # Consume generators one sample at a time. Materializing their original
+        # samples before making ownership copies would keep two whole datasets.
+        owned = []
+        for sample in self.samples:
+            if not isinstance(sample, DistillationSample):
+                raise ValueError(
+                    "A nonempty sequence of DistillationSample is required"
+                )
+            owned.append(DistillationSample(sample.data, sample.targets))
+            del sample
+        if not owned:
+            raise ValueError("A nonempty sequence of DistillationSample is required")
+        object.__setattr__(self, "samples", tuple(owned))
         object.__setattr__(self, "provenance", copy.deepcopy(self.provenance))
 
 
+@_release_failed_workflow
 def collect_teacher_labels(
     teacher,
     structures: Iterable[AtomicData],
@@ -177,22 +181,30 @@ def collect_teacher_labels(
         or len(set(properties)) != len(properties)
     ):
         raise ValueError("properties must be unique energy/forces/stress names")
-    samples = []
-    for structure in structures:
-        data = _owned_data(structure)
-        output = teacher.predict(data.clone(), requested_properties=tuple(properties))
-        if not isinstance(output, Mapping) or any(
-            name not in output for name in properties
-        ):
-            raise ValueError("Teacher did not return all requested physical properties")
-        samples.append(
-            DistillationSample(data, {name: output[name] for name in properties})
-        )
-        # Labels own detached CPU copies. Keeping the previous prediction here
-        # would overlap its accelerator storage/graph with the next evaluation.
-        del output
+
+    def samples():
+        for structure in structures:
+            data = _owned_data(structure)
+            output = teacher.predict(
+                data.clone(), requested_properties=tuple(properties)
+            )
+            if not isinstance(output, Mapping) or any(
+                name not in output for name in properties
+            ):
+                raise ValueError(
+                    "Teacher did not return all requested physical properties"
+                )
+            sample = DistillationSample(
+                data, {name: output[name] for name in properties}
+            )
+            # Release the predictor's output/graph before yielding the CPU
+            # sample, and consume that sample before evaluating the next one.
+            del output, data
+            yield sample
+            del sample
+
     return DistillationDataset(
-        tuple(samples),
+        samples(),
         {
             "teacher_id": teacher_id,
             "properties": list(properties),
@@ -294,6 +306,7 @@ class DistillationResult:
     provenance: dict
 
 
+@_release_failed_workflow
 @torch.inference_mode(False)
 def distill_student(
     student: torch.nn.Module,
@@ -387,6 +400,7 @@ def distill_student(
                 int(seed)
             )
         optimizer = torch.optim.Adam(parameters, lr=learning_rate)
+        optimizer.zero_grad(set_to_none=True)
         for _ in range(int(steps)):
             sample = dataset.samples[
                 int(
@@ -403,7 +417,6 @@ def distill_student(
             )
             data["_requested_properties"] = weights.active
             data.pos.requires_grad_(True)
-            optimizer.zero_grad(set_to_none=True)
             output = model(data)
             if output_adapter is not None:
                 output = output_adapter(output, data)
@@ -439,7 +452,11 @@ def distill_student(
             if any(not torch.isfinite(parameter).all() for parameter in parameters):
                 raise ValueError("Nonfinite student parameters after optimizer step")
             history.append(float(loss.detach().cpu()))
-        optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad(set_to_none=True)
+            # These tensors can retain a conservative derivative graph and
+            # coordinate storage even after backward has freed saved values.
+            # Do not overlap them with the next forward's allocations.
+            del output, prediction, target, loss, gradients, data
     model.eval()
     provenance = copy.deepcopy(dataset.provenance)
     provenance.update(
@@ -456,6 +473,7 @@ def distill_student(
     return DistillationResult(model, tuple(history), provenance)
 
 
+@_release_failed_workflow
 def export_distilled_checkpoint(
     result: DistillationResult,
     path: str | Path,
@@ -503,6 +521,10 @@ def export_distilled_checkpoint(
         reconstructed.load_state_dict(state, strict=True)
         if hasattr(reconstructed, "setup_tasks"):
             reconstructed.setup_tasks(tasks)
+    # The validation-only model is no longer needed. Release it before copying
+    # EMA state and serializing; some models contain bound-method cycles.
+    del reconstructed
+    gc.collect()
     ema_state = OrderedDict(
         [("n_averaged", torch.tensor(0, device="cpu"))]
         + [

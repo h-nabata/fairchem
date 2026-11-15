@@ -7,6 +7,8 @@ LICENSE file in the root directory of this source tree.
 
 from __future__ import annotations
 
+import gc
+import weakref
 from collections import namedtuple
 from types import SimpleNamespace
 
@@ -19,6 +21,7 @@ from ase.constraints import FixAtoms, FixConstraint
 
 from fairchem.core.datasets.atomic_data import (
     AtomicData,
+    _clone_tensor_tree,
     atomicdata_list_to_batch,
     tensor_or_int_to_tensor,
 )
@@ -91,6 +94,95 @@ def test_clone_supports_nonleaf_tensors_in_custom_metadata_objects():
         torch.autograd.grad(cloned.metadata.coordinates.sum(), leaf)[0],
         torch.full_like(leaf, 2),
     )
+
+
+@pytest.mark.parametrize("operation", ["clone", "metadata_conversion"])
+def test_released_clones_do_not_wait_for_cyclic_gc(operation):
+    data = _data()
+    data.metadata = SimpleNamespace(coordinates=data.pos, names=["first"])
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        for _ in range(4):
+            cloned = data.clone()
+            if operation == "metadata_conversion":
+                cloned.to(dtype=torch.float64, copy=True)
+            assert cloned.pos is cloned.metadata.coordinates
+            ref = weakref.ref(cloned.pos)
+            owner_ref = weakref.ref(cloned)
+            del cloned
+            assert ref() is None
+            assert owner_ref() is None
+    finally:
+        if enabled:
+            gc.enable()
+
+
+def test_clone_cleanup_preserves_external_memo_aliases_and_cycles():
+    tensor = torch.ones(3, requires_grad=True) * 2
+    source = [tensor, tensor]
+    source.append(source)
+    memo = {}
+    cloned = _clone_tensor_tree(source, memo=memo)
+    assert cloned[0] is cloned[1] is memo[id(tensor)]
+    assert cloned[2] is cloned is memo[id(source)]
+    assert cloned[0].grad_fn is not None
+    assert cloned[0].data_ptr() != tensor.data_ptr()
+
+
+def test_clone_transform_failure_does_not_retain_earlier_copies_until_gc():
+    references = []
+
+    def transform(tensor):
+        if references:
+            raise RuntimeError("conversion failed")
+        result = tensor.clone()
+        references.append(weakref.ref(result))
+        return result
+
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        try:
+            _clone_tensor_tree([torch.ones(2), torch.ones(3)], transform)
+        except RuntimeError:
+            # Do not retain an ExceptionInfo/traceback: that itself would own
+            # conversion frames and their memo during this lifetime check.
+            pass
+        else:
+            pytest.fail("the conversion should fail")
+        assert len(references) == 1
+        assert references[0]() is None
+    finally:
+        if enabled:
+            gc.enable()
+
+
+def test_conversion_keeps_original_field_ids_alive_until_memo_is_released():
+    class WeakList(list):
+        pass
+
+    class SidFirst(set):
+        def __iter__(self):
+            return iter(sorted(super().__iter__(), key=lambda key: key != "sid"))
+
+    data = _data()
+    data.sid = WeakList(data.sid)
+    original = weakref.ref(data.sid)
+    data.__keys__ = SidFirst(data.__keys__)
+    converted = []
+
+    def convert(tensor):
+        # sid has already been replaced. Its original id must remain reserved
+        # while the same conversion memo can still be used by deepcopy below.
+        assert original() is not None
+        converted.append(True)
+        return tensor.clone()
+
+    data.apply(convert)
+    assert converted
+    assert original() is None  # The temporary roots must not survive apply.
+    data.validate()
 
 
 def test_conversion_preserves_tuple_list_cycles_and_tensor_aliases():

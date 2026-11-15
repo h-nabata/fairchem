@@ -71,6 +71,28 @@ def _tensor_cache_key(tensor: torch.Tensor) -> tuple | None:
     return (id(tensor), version, tensor.device, tensor.dtype, tuple(tensor.shape))
 
 
+def _precision_cache_key(tensor):
+    # Frozen tables must not outlive the external precision policy under which
+    # their GEMMs ran. Read backend flags without initializing an accelerator.
+    device_type = tensor.device.type
+    autocast_dtype = (
+        torch.get_autocast_dtype(device_type)
+        if torch.amp.autocast_mode.is_autocast_available(device_type)
+        and torch.is_autocast_enabled(device_type)
+        else None
+    )
+    matmul_precision = (
+        torch.get_float32_matmul_precision() if tensor.dtype == torch.float32 else None
+    )
+    # XPU's oneDNN policy is independent of the CUDA matmul setting.
+    onednn_tf32 = (
+        getattr(torch.backends.mkldnn, "allow_tf32", None)
+        if tensor.dtype == torch.float32 and device_type == "xpu"
+        else None
+    )
+    return autocast_dtype, matmul_precision, onednn_tf32
+
+
 def _record_cache_event(tensor: torch.Tensor):
     if tensor.device.type not in {"cuda", "xpu"}:
         return None
@@ -223,6 +245,29 @@ class UnifiedRadialMLP(nn.Module):
         self._clear_element_cache()
         return super()._apply(fn, recurse=recurse)
 
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        # Also handles loading through a parent module. Discard derived tables
+        # and old weight owners before assign=True can replace their storage.
+        self._clear_element_cache()
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
     def __getstate__(self):
         # Accelerator events cannot be pickled/deep-copied. Derived tables
         # belong to the live instance and are rebuilt in the copied model.
@@ -322,7 +367,8 @@ class UnifiedRadialMLP(nn.Module):
         )
         key = tuple(_tensor_cache_key(t) for t in owners) if cacheable else None
         cacheable = cacheable and all(k is not None for k in key)
-        key = (key, D, S, T)
+        precision_key = _precision_cache_key(self.W1_cat) if cacheable else None
+        key = (key, D, S, T, precision_key)
         if not cacheable or key != self._element_cache_key:
             source_table = torch.nn.functional.linear(
                 source_embedding,

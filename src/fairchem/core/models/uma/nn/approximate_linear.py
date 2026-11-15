@@ -183,7 +183,13 @@ class _ReducedGEMM(torch.autograd.Function):
         result = None
         for i, j in pairs:
             term = _mm_fp32_output(xs[i], ws[j].T, emulation)
-            result = term if result is None else result + term
+            if result is None:
+                result = term
+            else:
+                # Custom-autograd forward does not record this accumulation.
+                # The first GEMM owns the buffer; preserve summation order while
+                # avoiding a full output allocation for each of the 4/9 terms.
+                result.add_(term)
         return result
 
     @staticmethod

@@ -314,12 +314,17 @@ class MicrobatchPredictor:
                 if current is None:
                     predictions = self._predict(assemble(indices), requested)
                     split = self._split(predictions, selected)
+                    # Split outputs own their storage. Do not retain the large
+                    # combined outputs while allocating the next input/forward.
+                    del predictions
                 else:
                     with current as batch:
                         if position + 1 < len(plan) and self.stager.slots > 1:
                             next_lease = self.stager.stage(assemble(plan[position + 1]))
                         predictions = self._predict(batch, requested)
                         split = self._split(predictions, selected)
+                        del predictions
+                    del batch
                     if position + 1 < len(plan) and self.stager.slots == 1:
                         next_lease = self.stager.stage(assemble(plan[position + 1]))
                     current = next_lease

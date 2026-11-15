@@ -198,6 +198,42 @@ def _public_predictor(cache_size=0):
     return unit
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize(
+    "properties", [("energy", "forces"), ("hessian_vector_product",)]
+)
+def test_strict_predictor_isolates_external_cpu_autocast(dtype, properties):
+    unit = _public_predictor()
+    unit.model.eval()
+    unit.inference_settings.base_precision_dtype = dtype
+    data = _data().to(dtype=dtype)
+    data["hessian_vector"] = torch.ones_like(data.pos)
+    expected = unit.predict(data, requested_properties=properties)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        actual = unit.predict(data, requested_properties=properties)
+        assert torch.is_autocast_enabled("cpu")
+    for key in expected:
+        assert actual[key].dtype == expected[key].dtype
+        tolerance = 2e-6 if dtype == torch.float32 else 1e-12
+        torch.testing.assert_close(
+            actual[key], expected[key], rtol=tolerance, atol=tolerance
+        )
+
+
+def test_predictor_restores_external_autocast_after_model_failure(monkeypatch):
+    unit = _public_predictor()
+
+    def fail(data):
+        assert not torch.is_autocast_enabled("cpu")
+        raise RuntimeError("model failure")
+
+    monkeypatch.setattr(unit.model, "forward", fail)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        with pytest.raises(RuntimeError, match="model failure"):
+            unit._run_inference(_data(), False)
+        assert torch.is_autocast_enabled("cpu")
+
+
 def test_shared_predictor_serializes_real_jobs_and_preserves_cached_results():
     unit = _public_predictor(2)
     reference = _public_predictor()

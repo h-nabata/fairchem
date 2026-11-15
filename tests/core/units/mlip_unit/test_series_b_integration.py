@@ -137,10 +137,17 @@ def test_public_fp64_predictor_compresses_only_backward_features():
         ),
     )
     data = _data().to(dtype=torch.float64)
-    expected = reference.predict(
-        data.clone(), requested_properties=("energy", "forces")
-    )
-    actual = candidate.predict(data.clone(), requested_properties=("energy", "forces"))
+    # General UMA samples edge-frame rolls even in eval mode. Match the RNG
+    # draws to isolate saved-feature compression from rotation roundoff, while
+    # retaining exact equality for its unchanged forward computation.
+    with torch.random.fork_rng(devices=[]):
+        expected = reference.predict(
+            data.clone(), requested_properties=("energy", "forces")
+        )
+    with torch.random.fork_rng(devices=[]):
+        actual = candidate.predict(
+            data.clone(), requested_properties=("energy", "forces")
+        )
     manifest = candidate.approximation_manifest
     assert manifest["base_precision_dtype"] == "float64"
     assert "linear" not in manifest

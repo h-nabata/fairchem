@@ -206,25 +206,30 @@ def _edge_degree_layer(chunk_size, dtype):
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 @pytest.mark.parametrize("trainable", [False, True])
+@pytest.mark.parametrize("seed", [2, 13, 15])
 def test_checkpointed_edge_degree_preserves_values_and_two_derivatives(
-    dtype, trainable
+    dtype, trainable, seed
 ):
-    layer = _edge_degree_layer(3, dtype).requires_grad_(trainable)
-    reference = copy.deepcopy(layer)
-    x = torch.randn(5, 9, 4, dtype=dtype, requires_grad=True)
-    edge = torch.randn(11, 6, dtype=dtype, requires_grad=True)
-    wigner = torch.randn(11, 9, 3, dtype=dtype, requires_grad=True)
+    # These seeds reproduce FP32 cancellation in the old pointwise second-
+    # derivative comparison. Keep them rather than relying on prior tests' RNG.
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(seed)
+        layer = _edge_degree_layer(3, dtype).requires_grad_(trainable)
+        x = torch.randn(5, 9, 4, dtype=dtype, requires_grad=True)
+        edge = torch.randn(11, 6, dtype=dtype, requires_grad=True)
+        wigner = torch.randn(11, 9, 3, dtype=dtype, requires_grad=True)
     target = torch.tensor([0, 1, 1, 4, 3, 1, 2, 0, 4, 4, 1])
     original = x.detach().clone()
-    results = []
-    for model in (layer, reference):
-        variables = (x, edge, wigner, *(model.parameters() if trainable else ()))
-        if model is reference:
+
+    def evaluate(model, inputs, *, legacy=False):
+        nodes, edges, rotations = inputs
+        variables = (*inputs, *(model.parameters() if trainable else ()))
+        if legacy:
             # Preserve the former chunking and GEMM shapes, changing only the
             # checkpoint accumulation algorithm under test.
-            output = x
+            output = nodes
             for radial, destinations, rotation in zip(
-                edge.split(3), target.split(3), wigner.split(3), strict=True
+                edges.split(3), target.split(3), rotations.split(3), strict=True
             ):
                 output = torch.utils.checkpoint.checkpoint(
                     model.forward_chunk,
@@ -235,15 +240,44 @@ def test_checkpointed_edge_degree_preserves_values_and_two_derivatives(
                     use_reentrant=False,
                 )
         else:
-            output = model(x, edge, target, wigner)
+            output = model(nodes, edges, target, rotations)
         first = torch.autograd.grad(output.square().sum(), variables, create_graph=True)
         second = torch.autograd.grad(
             sum(value.square().sum() for value in first), variables
         )
-        results.append((output, first, second))
+        return output, first, second
+
+    inputs = (x, edge, wigner)
+    actual = evaluate(layer, inputs)
+    expected = evaluate(copy.deepcopy(layer), inputs, legacy=True)
     tolerance = 2e-5 if dtype == torch.float32 else 1e-11
-    for actual, expected in zip(*results, strict=True):
-        torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+    for current, former in zip(actual[:2], expected[:2], strict=True):
+        torch.testing.assert_close(current, former, rtol=tolerance, atol=tolerance)
+    if dtype == torch.float64:
+        torch.testing.assert_close(
+            actual[2], expected[2], rtol=tolerance, atol=tolerance
+        )
+    else:
+        # Lift exactly the same FP32 weights and inputs to FP64. Both chunk
+        # algorithms agree there to ~5e-13, while their FP32 roundoff can be
+        # amplified near cancelled components. Compare each to that common
+        # oracle using a tensor-scaled, 16-epsilon numerical regression budget;
+        # the reproduced trainable cases measured at most 5.1 eps, leaving
+        # approximately threefold margin for rounding-order variation. This
+        # is not a universal bound on arbitrary network conditioning.
+        oracle_inputs = tuple(
+            value.detach().double().requires_grad_() for value in inputs
+        )
+        oracle = evaluate(copy.deepcopy(layer).double(), oracle_inputs)[2]
+        for result in (actual[2], expected[2]):
+            for value, reference in zip(result, oracle, strict=True):
+                scale = reference.abs().amax().clamp_min(1)
+                torch.testing.assert_close(
+                    value.double() / scale,
+                    reference / scale,
+                    rtol=0,
+                    atol=16 * torch.finfo(torch.float32).eps,
+                )
     torch.testing.assert_close(x, original, rtol=0, atol=0)
 
 

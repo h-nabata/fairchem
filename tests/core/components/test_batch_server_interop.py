@@ -7,7 +7,9 @@ LICENSE file in the root directory of this source tree.
 
 from __future__ import annotations
 
+import asyncio
 import weakref
+from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import ClassVar
@@ -19,7 +21,13 @@ import torch
 from ase import Atoms
 
 from fairchem.core.calculate import _batch
-from fairchem.core.components.batch_server import BatchConfig, BatchPredictServerMixin
+from fairchem.core.components import batch_server
+from fairchem.core.components.batch_server import (
+    BatchConfig,
+    BatchPredictServerMixin,
+    ModelSpec,
+    MultiplexedBatchPredictServer,
+)
 from fairchem.core.datasets.atomic_data import AtomicData, atomicdata_list_to_batch
 from fairchem.core.units.mlip_unit.api.inference import InferenceSettings
 
@@ -278,6 +286,121 @@ def test_oom_retry_releases_failed_frames_and_uses_predictor_device(
     results = _server()._run_batched_inference([_data(1), _data(2)], predictor, False)
     assert [r["energy"].item() for r in results] == [1, 4]
     assert events == ([] if device == "cpu" else ["enter", "cache", "exit"])
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda:3", "xpu:2"])
+def test_server_releases_collated_storage_before_cleanup_and_next_allocation(
+    monkeypatch, device
+):
+    # Accelerator cleanup is virtual; ownership is checked with real CPU data.
+    batch_refs = []
+    original_collate = batch_server.atomicdata_list_to_batch
+
+    def collate(*args, **kwargs):
+        assert all(ref() is None for ref in batch_refs)
+        batch = original_collate(*args, **kwargs)
+        batch_refs.extend((weakref.ref(batch), weakref.ref(batch.pos)))
+        return batch
+
+    monkeypatch.setattr(batch_server, "atomicdata_list_to_batch", collate)
+
+    @contextmanager
+    def device_scope(selected):
+        assert str(selected) == device
+        yield
+
+    def empty_cache():
+        assert all(ref() is None for ref in batch_refs)
+
+    if device != "cpu":
+        backend = getattr(torch, torch.device(device).type)
+        monkeypatch.setattr(backend, "device", device_scope)
+        monkeypatch.setattr(backend, "empty_cache", empty_cache)
+
+    class OOMPredictor(MixedTaskPredictor):
+        def predict(self, batch, undo_element_references):
+            if batch.num_graphs > 1:
+                raise torch.OutOfMemoryError("synthetic OOM")
+            return super().predict(batch, undo_element_references)
+
+    predictor = OOMPredictor()
+    predictor.device = torch.device(device)
+    items = [_data(1), _data(2)]
+    results = _server()._run_batched_inference(items, predictor, False)
+    assert [r["energy"].item() for r in results] == [1, 4]
+    assert len(batch_refs) == 6  # Failed full batch, then two successful singletons.
+    assert all(ref() is None for ref in batch_refs)
+    assert [data.pos[1, 0].item() for data in items] == [1, 2]
+
+
+def _multiplexed_server():
+    server_class = MultiplexedBatchPredictServer.func_or_class
+    server = object.__new__(server_class)
+    server._specs = OrderedDict()
+    server._active_spec_counts = defaultdict(int)
+    server._spec_capacity = 12
+    server.split_oom_batch = True
+    return server, server_class.predict.__wrapped__
+
+
+def test_multiplexed_switch_does_not_pin_an_evicted_previous_predictor():
+    server, predict = _multiplexed_server()
+    owners = []
+    refs = []
+
+    async def get_model(model_id):
+        # Emulate eviction during the next asynchronous load. Other Serve
+        # requests may have changed the LRU order since the preceding group.
+        owners.clear()
+        assert all(ref() is None for ref in refs)
+        model = MixedTaskPredictor()
+        owners.append(model)
+        refs.append(weakref.ref(model))
+        return model
+
+    server.get_model = get_model
+    specs = [ModelSpec(f"model-{index}", device="cpu") for index in range(2)]
+    results = asyncio.run(
+        predict(
+            server,
+            [_data(1), _data(2)],
+            [spec.model_id for spec in specs],
+            specs,
+            [False, False],
+        )
+    )
+    owners.clear()
+    assert all(ref() is None for ref in refs)
+    assert [r["energy"].item() for r in results] == [1, 4]
+
+
+@pytest.mark.parametrize("invalid_spec", ["different_model", "not_a_spec"])
+def test_multiplexed_validates_every_spec_before_running_any_group(invalid_spec):
+    server, predict = _multiplexed_server()
+    original = ModelSpec("same-model", device="cpu")
+    replacement = (
+        ModelSpec("different-model", device="cpu")
+        if invalid_spec == "different_model"
+        else object()
+    )
+    loaded = []
+
+    async def get_model(model_id):
+        loaded.append(model_id)
+        return MixedTaskPredictor()
+
+    server.get_model = get_model
+    with pytest.raises((ValueError, TypeError), match="ModelSpec"):
+        asyncio.run(
+            predict(
+                server,
+                [_data(1), _data(2)],
+                [original.model_id, original.model_id],
+                [original, replacement],
+                False,
+            )
+        )
+    assert not loaded
 
 
 def test_server_rejects_multi_system_requests_and_accepts_empty_queue():

@@ -8,6 +8,8 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 import copy
+import weakref
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -125,6 +127,139 @@ def test_element_cache_never_retains_a_differentiable_tape():
     assert unified._source_table is None
 
 
+@pytest.mark.parametrize(
+    ("warm_dtype", "next_dtype"),
+    [
+        (torch.bfloat16, None),
+        (None, torch.bfloat16),
+        (torch.bfloat16, torch.float16),
+        (torch.float16, torch.bfloat16),
+    ],
+)
+def test_element_cache_does_not_mix_autocast_policies(warm_dtype, next_dtype):
+    _, unified = _radial(torch.float32)
+    fresh = copy.deepcopy(unified)
+    source, target = torch.randn(4, 3), torch.randn(4, 3)
+    src, dst = torch.tensor([0, 3, 1]), torch.tensor([1, 2, 0])
+    distance = torch.randn(3, 4, requires_grad=True)
+    with torch.autocast("cpu", dtype=warm_dtype, enabled=warm_dtype is not None):
+        unified.forward_decomposed(distance, src, dst, source, target)
+    with torch.autocast("cpu", dtype=next_dtype, enabled=next_dtype is not None):
+        actual = unified.forward_decomposed(distance, src, dst, source, target)
+        expected = fresh.forward_decomposed(distance, src, dst, source, target)
+        # A second call in the same policy must still reuse the ready table.
+        table = unified._source_table
+        unified.forward_decomposed(distance, src, dst, source, target)
+        assert unified._source_table is table
+    assert table.dtype == (next_dtype or torch.float32)
+    for a, b in zip(actual, expected):
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+    derivatives = []
+    for output in (actual, expected):
+        first = torch.autograd.grad(
+            sum(value.square().sum() for value in output), distance, create_graph=True
+        )[0]
+        second = torch.autograd.grad(first.square().sum(), distance)[0]
+        derivatives.append((first, second))
+    for a, b in zip(*derivatives):
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("assign", [False, True])
+def test_parent_state_reload_releases_derived_radial_tables(assign):
+    _, unified = _radial()
+    parent = torch.nn.Module()
+    parent.radial = unified
+    distance = torch.randn(3, 4, dtype=torch.float64)
+    source, target = (torch.randn(4, 3, dtype=torch.float64) for _ in range(2))
+    checkpoint = {name: value.clone() for name, value in parent.state_dict().items()}
+    _decomposed(unified, distance, source, target)
+    table_ref = weakref.ref(unified._source_table)
+    weight_ref = weakref.ref(unified.W1_cat)
+    parent.load_state_dict(checkpoint, assign=assign)
+    assert unified._source_table is unified._target_table is None
+    assert unified._element_cache_owners == ()
+    assert table_ref() is None
+    if assign:
+        assert weight_ref() is None
+    _decomposed(unified, distance, source, target)
+
+
+def test_element_cache_distinguishes_fp32_matmul_policy(monkeypatch):
+    _, unified = _radial(torch.float32)
+    distance, source, target = torch.randn(3, 4), torch.randn(4, 3), torch.randn(4, 3)
+    src, dst = torch.tensor([0, 3, 1]), torch.tensor([1, 2, 0])
+    previous = None
+    for policy in ("high", "highest", "medium", "highest"):
+        # Exercise policy invalidation on CPU without changing process-global
+        # TF32 state or pretending that this host implements CUDA arithmetic.
+        monkeypatch.setattr(
+            torch, "get_float32_matmul_precision", lambda policy=policy: policy
+        )
+        actual = unified.forward_decomposed(distance, src, dst, source, target)
+        table = unified._source_table
+        assert table is not previous
+        expected = copy.deepcopy(unified).forward_decomposed(
+            distance, src, dst, source, target
+        )
+        for a, b in zip(actual, expected):
+            torch.testing.assert_close(a, b, rtol=0, atol=0)
+        unified.forward_decomposed(distance, src, dst, source, target)
+        assert unified._source_table is table
+        previous = table
+
+
+def test_decomposed_radial_supports_meta_shape_evaluation():
+    _, unified = _radial(torch.float32)
+    unified.to("meta")
+    outputs = unified.forward_decomposed(
+        torch.empty(3, 4, device="meta"),
+        torch.empty(3, dtype=torch.long, device="meta"),
+        torch.empty(3, dtype=torch.long, device="meta"),
+        torch.empty(4, 3, device="meta"),
+        torch.empty(4, 3, device="meta"),
+    )
+    assert len(outputs) == 2
+    assert all(output.shape == (3, 12) and output.is_meta for output in outputs)
+
+
+def test_element_cache_distinguishes_virtual_xpu_onednn_policy(monkeypatch):
+    from fairchem.core.models.uma.nn import unified_radial
+
+    # Substitute only policy metadata; numerical operations stay on the CPU.
+    # This verifies cache isolation, not Intel kernel execution.
+    backend = SimpleNamespace(allow_tf32=False)
+    weight_metadata = SimpleNamespace(device=torch.device("xpu:0"), dtype=torch.float32)
+    precision_key = unified_radial._precision_cache_key
+    monkeypatch.setattr(torch.backends, "mkldnn", backend)
+    monkeypatch.setattr(
+        unified_radial,
+        "_precision_cache_key",
+        lambda tensor: precision_key(weight_metadata),
+    )
+    initialized = torch.xpu.is_initialized()
+    _, unified = _radial(torch.float32)
+    distance, source, target = torch.randn(3, 4), torch.randn(4, 3), torch.randn(4, 3)
+    src, dst = torch.tensor([0, 3, 1]), torch.tensor([1, 2, 0])
+    previous = None
+    for policy in (False, True, False, None):
+        backend.allow_tf32 = policy
+        actual = unified.forward_decomposed(distance, src, dst, source, target)
+        table = unified._source_table
+        assert table is not previous
+        expected = copy.deepcopy(unified).forward_decomposed(
+            distance, src, dst, source, target
+        )
+        for a, b in zip(actual, expected):
+            torch.testing.assert_close(a, b, rtol=0, atol=0)
+        unified.forward_decomposed(distance, src, dst, source, target)
+        assert unified._source_table is table
+        previous = table
+    del backend.allow_tf32
+    assert precision_key(weight_metadata)[-1] is None
+    assert torch.xpu.is_initialized() == initialized
+
+
 @pytest.mark.skipif(not torch.xpu.is_available(), reason="Requires an Intel XPU")
 def test_cached_radial_tables_and_so2_weights_cross_xpu_streams():
     mlps, _ = _radial(torch.float32)
@@ -218,6 +353,29 @@ def test_norm_silu_gradients_jvp_and_saved_activation_storage():
         return sum(saved)
 
     assert saved_bytes(lambda a: fn(a, weight, bias)) < saved_bytes(native)
+
+
+@pytest.mark.parametrize("shape", [(7,), (2, 3, 7)])
+@pytest.mark.parametrize("requires", range(1, 8))
+def test_norm_silu_preserves_derivatives_for_partially_frozen_inputs(shape, requires):
+    inputs = tuple(
+        torch.randn(size, dtype=torch.float64, requires_grad=bool(requires & (1 << i)))
+        for i, size in enumerate((shape, (shape[-1],), (shape[-1],)))
+    )
+    variables = tuple(value for value in inputs if value.requires_grad)
+    actual = layer_norm_silu(*inputs, 0.003)
+    expected = F.silu(F.layer_norm(inputs[0], (shape[-1],), *inputs[1:], 0.003))
+    torch.testing.assert_close(actual, expected)
+    derivatives = []
+    for output in (actual, expected):
+        first = torch.autograd.grad(output.square().sum(), variables, create_graph=True)
+        second = torch.autograd.grad(
+            sum(value.square().sum() for value in first), variables
+        )
+        derivatives.append((first, second))
+    for actual_order, expected_order in zip(*derivatives):
+        for a, b in zip(actual_order, expected_order):
+            torch.testing.assert_close(a, b, rtol=1e-9, atol=1e-10)
 
 
 def test_block_gemm_preserves_parameter_gradients_and_refreshes_frozen_cache():

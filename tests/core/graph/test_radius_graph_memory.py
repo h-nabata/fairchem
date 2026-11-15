@@ -7,6 +7,8 @@ LICENSE file in the root directory of this source tree.
 
 from __future__ import annotations
 
+import weakref
+
 import numpy as np
 import pytest
 import torch
@@ -14,6 +16,7 @@ from ase import Atoms
 from ase.neighborlist import neighbor_list
 from torch.utils._python_dispatch import TorchDispatchMode
 
+import fairchem.core.graph.radius_graph_pbc as graph_module
 from fairchem.core.datasets.atomic_data import AtomicData, atomicdata_list_to_batch
 from fairchem.core.graph.radius_graph_pbc import (
     get_max_neighbors_mask,
@@ -122,6 +125,48 @@ class _LargestTensor(TorchDispatchMode):
             + [x.numel() for x in leaves if isinstance(x, torch.Tensor)]
         )
         return result
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("strict", [False, True])
+def test_cell_search_releases_full_grid_scratch_before_neighbor_capping(
+    monkeypatch, dtype, strict
+):
+    atoms = Atoms(
+        "H27",
+        positions=np.random.default_rng(12).random((27, 3)) * 3,
+        cell=[4, 4, 4],
+    )
+    data = _data([atoms]).to(dtype=dtype)
+    references = []
+
+    class TrackGridScratch(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            result = func(*args, **(kwargs or {}))
+            values, _ = torch.utils._pytree.tree_flatten(result)
+            references.extend(
+                weakref.ref(value)
+                for value in values
+                if torch.is_tensor(value)
+                and value.ndim == 3
+                and value.shape[0] == len(data.pos)
+                and value.shape[1] >= 27
+                and value.shape[2] == 3
+            )
+            return result
+
+    original = get_max_neighbors_mask
+
+    def cap(*args, **kwargs):
+        assert references
+        assert all(reference() is None for reference in references)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(graph_module, "get_max_neighbors_mask", cap)
+    with TrackGridScratch():
+        edges, cells, counts = radius_graph_pbc_v2(data, 1.3, 300, strict)
+    assert _edges_as_tuples(edges, cells) == _ase_edges([atoms], 1.3)
+    assert counts.tolist() == [edges.shape[1]]
 
 
 def test_sparse_grid_does_not_pad_vacuum_to_densest_bucket():

@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from fairchem.core.calculate.series_b_workflows import _release_failed_workflow
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -205,6 +207,7 @@ def _random_direction(size, template, generator, basis):
     raise RuntimeError("Unable to construct an independent Krylov direction")
 
 
+@_release_failed_workflow
 def lanczos_modes(
     hvp: Callable[[torch.Tensor], torch.Tensor],
     template: torch.Tensor | None = None,
@@ -285,6 +288,9 @@ def lanczos_modes(
         eigenvalues, rotations = torch.linalg.eigh((projected + projected.T) * 0.5)
         values = (eigenvalues[: options.num_modes] * projection_scale).to(reference)
         vectors = q_matrix @ rotations[:, : options.num_modes].to(reference)
+        # Ritz vectors own their matrix-product storage. The full Krylov basis
+        # need not overlap the fresh model graphs used to check each residual.
+        del q_matrix
         vectors = vectors / _scaled_norm(vectors, dim=0, keepdim=True)
         if not torch.isfinite(values).all():
             raise ValueError(
@@ -312,6 +318,7 @@ def lanczos_modes(
     )
 
 
+@_release_failed_workflow
 def hutchinson_estimates(
     hvp: Callable[[torch.Tensor], torch.Tensor],
     template: torch.Tensor | None = None,

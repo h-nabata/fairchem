@@ -134,6 +134,9 @@ def source_cloud(
                 )
                 selected = delta.square().sum(-1) <= (prune + margin) ** 2
                 atom, tile = torch.where(selected)
+                # Do not retain the last full image tile while concatenating
+                # and sorting the selected cloud below.
+                del positions, delta, selected
                 sources.append(atom + atom_start)
                 images.append(image[tile])
                 keys.append((atom + atom_start) * len(unit_cell) + image[tile])
@@ -170,6 +173,7 @@ def alternative_candidates(
                 target_images[start : start + tile, None] == source_images
             )
             targets, sources = torch.where(keep)
+            del distance2, keep
             source_parts.append(sources)
             target_parts.append(targets + start)
         return torch.cat(source_parts), torch.cat(target_parts)
@@ -189,6 +193,7 @@ def alternative_candidates(
     lower[leaves:] = padded.view(leaves, leaf_size, 3).amin(1)
     padded[len(order) :] = -torch.inf
     upper[leaves:] = padded.view(leaves, leaf_size, 3).amax(1)
+    del padded
     width = leaves
     while width > 1:
         lower[width // 2 : width] = lower[width : 2 * width].view(-1, 2, 3).amin(1)
@@ -208,6 +213,7 @@ def alternative_candidates(
         ).clamp(min=0)
         keep = delta.square().sum(-1) <= (radius + margin) ** 2
         targets, nodes = targets[keep], nodes[keep]
+        del positions, delta, keep
         if width == leaves:
             break
         width *= 2

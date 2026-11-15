@@ -220,6 +220,52 @@ def test_bounded_cache_reuses_multiple_structures_and_deepcopy_is_empty():
     assert cache.stats["entries"] == 0
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("method", ["cell", "all_pairs", "bvh", "auto"])
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize("cap", [0, 1, 4])
+def test_cache_option_combinations_across_interleaved_mixed_system_jobs(
+    dtype, method, strict, cap
+):
+    random = np.random.default_rng(41)
+    cell = np.array([[3.0, 0.13, 0], [0, 3.0, -0.21], [0, 0, 3.0]])
+    cases = []
+    for case in range(3):
+        data = _data(
+            [
+                Atoms(
+                    "H5",
+                    positions=random.random((5, 3)) * 2.6,
+                    cell=cell,
+                    pbc=[True, False, True],
+                ),
+                Atoms("H4", positions=random.random((4, 3)) * 2.6, cell=cell),
+            ]
+        ).to(dtype=dtype)
+        if case == 1:
+            data.node_partition = torch.tensor([8, 1, 3])
+        cases.append(data)
+
+    cache = VerletNeighborCache(0.45, max_entries=3)
+    for step in range(18):
+        data = cases[step % 3]
+        data.pos += torch.as_tensor(
+            (random.random(data.pos.shape) - 0.5) * 0.002, dtype=dtype
+        )
+        if step == 8:
+            data.cell[0, 0, 0] += 0.002
+        if step == 12:
+            data.pbc[0, 1] = True
+        positions = data.pos.clone()
+        actual = cache.get_graph(data, 1.4, cap, strict, method=method)
+        expected = radius_graph_pbc_v2(data, 1.4, cap, strict, method=method)
+        assert _tuples(actual) == _tuples(expected)
+        torch.testing.assert_close(actual[2], expected[2], atol=0, rtol=0)
+        torch.testing.assert_close(data.pos, positions, atol=0, rtol=0)
+        assert cache.stats["entries"] <= 3
+    assert cache.stats["hits"] > 0
+
+
 @pytest.mark.parametrize("operation", ["copy", "deepcopy", "pickle"])
 def test_cache_serialization_drops_device_events_and_owned_snapshots(operation):
     class UnpickleableEvent:

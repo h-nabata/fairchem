@@ -25,7 +25,13 @@ from fairchem.core.calculate.series_b_workflows import (
     run_dyneb,
     run_respa,
 )
-from tests.core.calculate.test_series_b_workflows import Harmonic, _atom, _band
+from tests.core.calculate.test_series_b_workflows import (
+    BFGS,
+    DoubleWell,
+    Harmonic,
+    _atom,
+    _band,
+)
 
 
 @pytest.mark.parametrize("array_name", ["positions", "momenta"])
@@ -172,6 +178,41 @@ def test_successful_respa_releases_cyclic_models_before_the_next_job():
     finally:
         if enabled:
             gc.enable()
+
+
+@pytest.mark.parametrize("workflow", ["coarse", "dyneb"])
+def test_stage_optimizer_is_released_before_loading_reference_models(workflow):
+    references = []
+
+    class TrackingBFGS(BFGS):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.bound = self.run
+            references.append(weakref.ref(self))
+
+    def reference_factory():
+        assert references
+        assert all(reference() is None for reference in references)
+        return Harmonic() if workflow == "coarse" else DoubleWell()
+
+    if workflow == "coarse":
+        result = run_coarse_refine(
+            _atom(),
+            coarse_factory=Harmonic,
+            reference_factory=reference_factory,
+            options=CoarseRefineOptions(coarse_steps=1, reference_steps=0),
+            optimizer_cls=TrackingBFGS,
+        )
+        assert np.isfinite(result.reference_energy)
+    else:
+        result = run_dyneb(
+            _band(),
+            calculator_factory=DoubleWell,
+            reference_calculator_factory=reference_factory,
+            options=DyNEBOptions(max_steps=1, final_refine=False),
+            optimizer_cls=TrackingBFGS,
+        )
+        assert np.isfinite(result.reference_energies).all()
 
 
 def test_concurrent_mixed_calculator_jobs_preserve_results_and_source_metadata():

@@ -51,9 +51,15 @@ upstreamのロゴ・タイトルは冒頭に、機能説明・導入例などの
 **Intelで最初に使用する設定は`device="xpu:0", inference_settings="xpu"`です。**
 下部のupstream手順にある`pip install fairchem-core`だけでは、このフォークの修正は入りません。
 
+2026年11月15日のA/B併用・メモリ再監査は
+[併用監査記録](docs/core/common_tasks/intel_xpu_combination_audit_20261115.md)を参照してください。
+23通りの二因子組合せ試験と、非対応な65通りの設定の拒否を追加しています。
+最終の直列試験は2,091件成功・47件skip・失敗なしでした。
+初回の並列試験でのworker異常終了と数値比較の修正についても、同記録に記載しています。
+
 2026年11月10日のFP64対応・最適化とupstream調査は
 [FP64監査記録](docs/core/common_tasks/intel_xpu_fp64_audit.md)に記録しています。
-今回の統合試験は1,864件成功・47件skip・失敗なしでした。
+11月10日の統合試験は1,864件成功・47件skip・失敗なしでした。
 前回11月9日の21項目の修正と1,663件成功・44件skipの結果は
 [前回の監査記録](docs/core/common_tasks/intel_xpu_final_audit.md)を参照してください。
 CPUでの実計算とGPU制御経路の模擬試験を実施していますが、Arc Pro B70実機の速度、

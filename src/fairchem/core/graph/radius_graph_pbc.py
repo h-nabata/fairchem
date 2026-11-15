@@ -673,6 +673,7 @@ def radius_graph_pbc_v2(
     cell_matrix = torch.transpose(data.cell, 1, 2)
     cell_matrix = torch.repeat_interleave(cell_matrix, cells_per_image, dim=0)
     pbc_cell_offsets = torch.bmm(cell_matrix, unit_cell.view(-1, 3, 1)).squeeze(-1)
+    del cell_matrix
 
     # If node_partition exists, this means we want to generate only a partial graph
     # from a subset of target atoms to the entire set of source atoms
@@ -849,6 +850,10 @@ def radius_graph_pbc_v2(
             out_of_bounds |= (
                 delta.square().sum(-1) > (radius / grid_resolution + margin) ** 2
             )
+            del delta, relative_target
+        # These [targets, stencil, 3] arrays are used only to reject cells.
+        # Release them before expanding candidate edges and sorting neighbors.
+        del grid_index, max_index, target_grid_float
         # Never mutate a cached integer table.
         strides = torch.stack(
             (
@@ -867,6 +872,7 @@ def radius_graph_pbc_v2(
             target_atom_grid_id[:, None] + padding_offsets[target_atom_image]
         )
         neighboring_grid_cells.masked_fill_(out_of_bounds, num_grid_cells)
+        del out_of_bounds
         neighboring_grid_cells = neighboring_grid_cells.reshape(-1)
         # A direct lookup is faster for compact grids, but cap its size by the
         # number of tiled atoms so vacuum cannot turn it into a volume allocation.
@@ -878,6 +884,7 @@ def radius_graph_pbc_v2(
                 len(occupied_grid_ids), device=device
             )
             occupied_index = cell_to_occupied[neighboring_grid_cells].clamp(min=0)
+            del cell_to_occupied
         else:
             occupied_index = torch.searchsorted(
                 occupied_grid_ids, neighboring_grid_cells
@@ -900,6 +907,13 @@ def radius_graph_pbc_v2(
             candidate_counts.view(-1, num_padding_grid_cells).sum(dim=1),
             output_size=len(source_atom_edge_index),
         )
+        del (
+            candidate_counts,
+            candidate_starts,
+            source_offsets,
+            occupied_index,
+            neighboring_grid_cells,
+        )
 
     else:
         source_atom_edge_index, target_atom_edge_index = alternative_candidates(
@@ -921,6 +935,7 @@ def radius_graph_pbc_v2(
         ** 2,
         dim=1,
     )
+    del source_atom_pos, target_atom_pos
     # Is the distance within the radius and not 0 (the same atom)
     within_radius_mask = torch.logical_and(
         atom_distance_sqr.le(radius * radius),
@@ -935,6 +950,7 @@ def radius_graph_pbc_v2(
         target_atom_edge_index, within_radius_mask
     )
     atom_distance_sqr = torch.masked_select(atom_distance_sqr, within_radius_mask)
+    del within_radius_mask
 
     # Get the return values
     # The indices of the atoms for each edge

@@ -179,16 +179,20 @@ def _owned_atoms(atoms):
         raise ValueError("Empty structures are not supported")
     result = atoms.copy()
     result.info = copy.deepcopy(atoms.info)
-    _finite(result.positions, "positions")
-    _finite(result.cell.array, "cell")
+    _checked_real_array(result.positions, "positions")
+    _checked_real_array(result.cell.array, "cell")
+    return result
+
+
+def _checked_real_array(value, name):
+    result = np.asarray(value)
+    if result.dtype.kind not in "iuf" or not np.isfinite(result).all():
+        raise ValueError(f"{name} must contain finite real numbers")
     return result
 
 
 def _finite(value, name):
-    result = np.asarray(value)
-    if result.dtype.kind not in "iuf" or not np.isfinite(result).all():
-        raise ValueError(f"{name} must contain finite real numbers")
-    return np.array(result, dtype=float, copy=True)
+    return np.array(_checked_real_array(value, name), dtype=float, copy=True)
 
 
 def _forces(atoms, *, constrained=False):
@@ -335,7 +339,7 @@ def run_respa(
     reference_energy = _energy(teacher)
     student_force = _forces(student)
     energies = [reference_energy + float((momentum**2 / (2 * masses)).sum())]
-    _finite(energies, "total energy")
+    _checked_real_array(energies, "total energy")
     inner_dt = options.inner_timestep
     outer_dt = inner_dt * options.inner_steps
     for _ in range(outer_steps):
@@ -349,14 +353,16 @@ def run_respa(
             student.set_positions(positions)
             student_force = _forces(student)
             momentum += 0.5 * inner_dt * student_force
-            _finite(momentum, "momenta")
+            # Validation alone must not allocate another full momentum array
+            # for every inner MD step. Returned property arrays still own copies.
+            _checked_real_array(momentum, "momenta")
         teacher.set_positions(working.positions)
         teacher_force = _forces(teacher)
         reference_energy = _energy(teacher)
         momentum += 0.5 * outer_dt * (teacher_force - student_force)
         momentum = _finite(momentum, "momenta")
         total = reference_energy + float((momentum**2 / (2 * masses)).sum())
-        _finite(total, "total energy")
+        _checked_real_array(total, "total energy")
         energies.append(total)
     working.set_momenta(momentum)
     # The result owns only copied numerical values, never the private models.
@@ -405,6 +411,9 @@ def run_coarse_refine(
         coarse_converged = bool(
             optimizer.run(fmax=options.coarse_fmax, steps=options.coarse_steps)
         )
+    # A completed BFGS optimizer can still own a quadratic Hessian/history.
+    # Its context closes files, but does not release that state.
+    del optimizer
     _forces(working)
     coarse_energy = _energy(working)
     # Release the private coarse model before loading the reference model.
@@ -484,10 +493,14 @@ def run_dyneb(
         dynamic_converged = bool(
             optimizer.run(fmax=options.fmax, steps=options.max_steps)
         )
+    del optimizer, dynamic
     if reference_calculator_factory is not None:
         for image in working:
             image.calc = None
-        gc.collect()
+    # Do not overlap the finished optimizer or its bound-method cycles with a
+    # reference model/optimizer, even when the same calculators are reused.
+    gc.collect()
+    if reference_calculator_factory is not None:
         for image in working:
             image.calc = _new_calculator(
                 reference_calculator_factory, [reference() for reference in calculators]

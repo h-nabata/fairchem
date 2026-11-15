@@ -394,9 +394,7 @@ class BatchPredictServerMixin:
                     **predict_kwargs,
                 )
                 results.extend(self._split_predictions(preds, batch, predict_unit))
-                preds = None
             except torch.OutOfMemoryError as err:
-                preds = None
                 if not self.split_oom_batch:
                     raise torch.OutOfMemoryError(
                         "Out of memory during batched inference. "
@@ -420,8 +418,14 @@ class BatchPredictServerMixin:
                 )
 
                 _clear_exception_tracebacks(err)
-            if oom:
                 device = torch.device(getattr(predict_unit, "device", batch.pos.device))
+            finally:
+                # Split results own CPU storage. Do not keep the failed or
+                # completed collated tensors alive during allocator cleanup or
+                # while allocating the next (possibly smaller) batch.
+                preds = None
+                batch = None
+            if oom:
                 if device.type in {"cuda", "xpu"}:
                     accelerator = getattr(torch, device.type)
                     with accelerator.device(device):
@@ -813,6 +817,16 @@ class MultiplexedBatchPredictServer(BatchPredictServerMixin):
         for i, (data, model_id, spec, undo_flag) in enumerate(
             zip(data_list, model_id_list, spec_list, undo_flags)
         ):
+            # Validate every request before running any group. Checking only
+            # the first spec would let a later mismatched request use another
+            # model's weights/precision settings when the route IDs agree.
+            if not isinstance(spec, ModelSpec):
+                raise TypeError(f"spec must be a ModelSpec, got {type(spec).__name__}")
+            if spec.model_id != model_id:
+                raise ValueError(
+                    f"Batched ModelSpec identity mismatch: received {model_id!r}, "
+                    f"derived {spec.model_id!r}."
+                )
             groups[model_id].append((i, data, spec, undo_flag))
 
         results: list[dict | None] = [None] * num_requests
@@ -828,10 +842,16 @@ class MultiplexedBatchPredictServer(BatchPredictServerMixin):
             predict_unit = await self.get_model(model_id)  # LRU cache hit
 
             indices, group_data, _, group_flags = zip(*indexed_items)
-            group_results = self._run_grouped_inference(
-                list(group_data), list(group_flags), predict_unit
-            )
-            for orig_idx, pred in zip(indices, group_results):
+            try:
+                group_results = self._run_grouped_inference(
+                    list(group_data), list(group_flags), predict_unit
+                )
+            finally:
+                # The next get_model() may evict this model before allocating
+                # its replacement. A loop-local owner would prevent that
+                # eviction from releasing model RAM/VRAM until loading ended.
+                predict_unit = None
+            for orig_idx, pred in zip(indices, group_results, strict=True):
                 results[orig_idx] = pred
 
         return results

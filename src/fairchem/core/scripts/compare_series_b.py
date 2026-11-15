@@ -30,6 +30,7 @@ from ase.io import read
 from ase.stress import voigt_6_to_full_3x3_stress
 
 from fairchem.core.calculate import pretrained_mlip
+from fairchem.core.calculate.series_b_workflows import _release_failed_workflow
 from fairchem.core.datasets.atomic_data import AtomicData
 from fairchem.core.units.mlip_unit.api.inference import (
     inference_settings_xpu,
@@ -310,6 +311,7 @@ def compare_predictors(
     )
 
 
+@_release_failed_workflow
 def run_comparison(
     checkpoint,
     atoms,

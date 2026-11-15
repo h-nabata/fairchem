@@ -103,8 +103,15 @@ def _clone_tensor_tree(value, tensor_transform=None, memo=None):
         ):
             remember(vars(item))
 
-    remember(value.__dict__ if isinstance(value, AtomicData) else value)
-    return copy.deepcopy(value, memo)
+    try:
+        remember(value.__dict__ if isinstance(value, AtomicData) else value)
+        return copy.deepcopy(value, memo)
+    finally:
+        # A recursive closure captures its own function cell. Without breaking
+        # that cycle, its memo retains every cloned tensor until cyclic GC runs,
+        # even after a completed prediction or streamed example is released.
+        # Do not clear memo: a caller may still need its aliases and backrefs.
+        remember = None
 
 
 # TODO: potential future keys
@@ -829,8 +836,12 @@ class AtomicData:
         # Conversion mutates this owner in place. Metadata back-references must
         # keep pointing here instead of creating a second AtomicData instance.
         memo = {id(self): self}
-        for key in self.__keys__:
-            self[key] = self.__apply__(self[key], func, memo)
+        # The memo is indexed by Python ids. Keep original field roots alive
+        # until all conversions finish, so replacing e.g. sid cannot recycle
+        # its id for a later dataclass's temporary deepcopy state list.
+        items = [(key, self[key]) for key in self.__keys__]
+        for key, item in items:
+            self[key] = self.__apply__(item, func, memo)
 
         return self
 

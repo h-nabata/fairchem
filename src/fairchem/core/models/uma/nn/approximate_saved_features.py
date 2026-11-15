@@ -89,13 +89,18 @@ def _unpack_feature(packed):
             "A tensor saved by feature compression was modified in place"
         )
     if isinstance(packed, _PackedFeature):
-        restored = packed.compressed.to(dtype=packed.original_dtype) * packed.scale
+        # This upcast owns its storage. Reuse it for scaling and saturation
+        # instead of retaining several full-precision temporary activations.
+        restored = packed.compressed.to(dtype=packed.original_dtype, copy=True)
+        restored.mul_(packed.scale)
         # Quantization can round the reconstructed largest finite source value
         # above its dtype's range. Saturate only finite packed values; pre-existing
         # NaN/Inf must remain visible to the predictor's finite-value checks.
         limit = torch.finfo(packed.original_dtype).max
         return torch.where(
-            torch.isfinite(packed.compressed), restored.clamp(-limit, limit), restored
+            torch.isfinite(packed.compressed),
+            restored.clamp_(-limit, limit),
+            packed.compressed,
         )
     return packed.tensor
 

@@ -8,7 +8,7 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 import copy
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from types import SimpleNamespace
 
 import pytest
@@ -141,3 +141,111 @@ def test_torchsim_accepts_series_b_startup_configuration(monkeypatch, use_overri
         assert output[name].dtype == torch.float32
         assert torch.isfinite(output[name]).all()
     torch.testing.assert_close(state.positions, before.positions, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "dtype,series_b",
+    [
+        (
+            torch.float32,
+            SeriesBSettings(
+                weight_bits=8,
+                saved_feature_dtype="bf16",
+                saved_feature_min_elements=1,
+                compensated_reduction=True,
+                radial_table_points=64,
+            ),
+        ),
+        (
+            torch.float32,
+            SeriesBSettings(
+                gemm_precision="bf16_split2",
+                low_precision_emulation=True,
+                saved_feature_dtype="fp16",
+                saved_feature_min_elements=1,
+                radial_fast_exp=True,
+            ),
+        ),
+        (
+            torch.float32,
+            SeriesBSettings(
+                low_rank_fraction=0.75,
+                saved_feature_dtype="bf16",
+                saved_feature_min_elements=1,
+            ),
+        ),
+        (
+            torch.float64,
+            SeriesBSettings(saved_feature_dtype="fp32", saved_feature_min_elements=1),
+        ),
+    ],
+    ids=[
+        "int8-storage-reduction-radial",
+        "split2-storage-exp",
+        "lowrank-storage",
+        "fp64-storage",
+    ],
+)
+def test_combined_ab_ase_and_torchsim_match_direct_predictions(
+    monkeypatch, dtype, series_b
+):
+    ts = pytest.importorskip("torch_sim")
+    from ase.build import molecule
+
+    from fairchem.core.calculate import torchsim_interface as interface
+    from fairchem.core.calculate.ase_calculator import FAIRChemCalculator
+    from fairchem.core.datasets.atomic_data import AtomicData
+
+    predictor = _public_predictor()
+    predictor.inference_settings = replace(
+        predictor.inference_settings,
+        base_precision_dtype=dtype,
+        neighbor_skin=0.4,
+        mole_cache_size=2,
+        series_b=series_b,
+    )
+    predictor.model.to(dtype=dtype)
+    ase_predictor, sim_predictor = copy.deepcopy(predictor), copy.deepcopy(predictor)
+    calc = FAIRChemCalculator(ase_predictor, task_name="omol")
+    monkeypatch.setattr(
+        interface.pretrained_mlip, "get_predict_unit", lambda *a, **kw: sim_predictor
+    )
+    model = interface.FairChemModel(
+        "small-uma.pt",
+        device="cpu",
+        task_name="omol",
+        inference_settings=sim_predictor.inference_settings,
+    )
+    atoms = molecule("H2O")
+    atoms.set_cell([8, 9, 10])
+    atoms.info.update(charge=0, spin=1)
+    state = ts.io.atoms_to_state([atoms], device="cpu", dtype=dtype)
+    assert model.dtype == dtype
+    for _ in range(3):
+        before = state.positions.clone()
+        atoms.positions[:] = before.double().numpy()
+        data = AtomicData.from_ase(
+            atoms, task_name="omol", target_dtype=dtype, r_data_keys=["charge", "spin"]
+        )
+        expected = predictor.predict(data, requested_properties=("energy", "forces"))
+        calc.calculate(atoms, properties=["energy", "forces"])
+        actual = model(state)
+        tolerance = (
+            dict(atol=2e-5, rtol=2e-4)
+            if dtype == torch.float32
+            else dict(atol=1e-11, rtol=1e-9)
+        )
+        for name in ("energy", "forces"):
+            torch.testing.assert_close(
+                actual[name], expected[name].to(dtype), **tolerance
+            )
+            torch.testing.assert_close(
+                torch.as_tensor(calc.results[name], dtype=dtype).reshape_as(
+                    actual[name]
+                ),
+                expected[name].to(dtype),
+                **tolerance,
+            )
+            actual[name].fill_(123)
+        torch.testing.assert_close(state.positions, before, atol=0, rtol=0)
+        state.positions[0, 0] += 0.001

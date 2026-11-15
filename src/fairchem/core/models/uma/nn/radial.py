@@ -54,18 +54,26 @@ class _LayerNormSiLU(torch.autograd.Function):
             x, weight, bias, ctx.eps
         )
         grad_affine = grad_output * derivative
-        grad_normalized = grad_affine * weight
-        grad_x = inv_std * (
-            grad_normalized
-            - grad_normalized.mean(dim=-1, keepdim=True)
-            - normalized * (grad_normalized * normalized).mean(dim=-1, keepdim=True)
-        )
+        grad_x = grad_weight = grad_bias = None
+        if ctx.needs_input_grad[0]:
+            grad_normalized = grad_affine * weight
+            grad_x = inv_std * (
+                grad_normalized
+                - grad_normalized.mean(dim=-1, keepdim=True)
+                - normalized * (grad_normalized * normalized).mean(dim=-1, keepdim=True)
+            )
+        # Frozen inference weights need coordinate derivatives only. Avoid
+        # materializing a full activation-sized parameter-gradient product and
+        # reducing it, while retaining the full training/higher-gradient paths.
         batch_dims = tuple(range(x.ndim - 1))
-        grad_weight = grad_affine * normalized
-        grad_bias = grad_affine
-        if batch_dims:
-            grad_weight = grad_weight.sum(dim=batch_dims)
-            grad_bias = grad_bias.sum(dim=batch_dims)
+        if ctx.needs_input_grad[1]:
+            grad_weight = grad_affine * normalized
+            if batch_dims:
+                grad_weight = grad_weight.sum(dim=batch_dims)
+        if ctx.needs_input_grad[2]:
+            grad_bias = grad_affine
+            if batch_dims:
+                grad_bias = grad_bias.sum(dim=batch_dims)
         return grad_x, grad_weight, grad_bias, None
 
     @staticmethod

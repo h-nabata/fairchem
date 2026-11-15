@@ -132,7 +132,11 @@ def _validate_radial_replacement(module, expected_type):
     # These replacements implement the standard Gaussian formula directly.
     # Moving hooks to a new module, or bypassing a customized forward, would
     # silently change application semantics beyond the selected approximation.
-    if type(module) is not expected_type or "forward" in module.__dict__:
+    if (
+        type(module) is not expected_type
+        or "forward" in module.__dict__
+        or module._compiled_call_impl is not None
+    ):
         raise ValueError(
             "Radial approximation cannot replace a customized Gaussian module"
         )
@@ -141,6 +145,10 @@ def _validate_radial_replacement(module, expected_type):
         or module._forward_pre_hooks
         or module._backward_hooks
         or module._backward_pre_hooks
+        or module._state_dict_hooks
+        or module._state_dict_pre_hooks
+        or module._load_state_dict_pre_hooks
+        or module._load_state_dict_post_hooks
     ):
         raise ValueError("Radial approximation cannot replace a module with hooks")
 

@@ -7,6 +7,7 @@ LICENSE file in the root directory of this source tree.
 
 from __future__ import annotations
 
+import gc
 import weakref
 
 import pytest
@@ -45,6 +46,62 @@ def test_lanczos_releases_product_copies_before_the_projected_eigensolve(monkeyp
         options=LanczosOptions(num_modes=4, max_iterations=4),
     )
     torch.testing.assert_close(result.eigenvalues, diagonal)
+    assert result.converged.all()
+
+
+@pytest.mark.parametrize("workflow", ["lanczos", "hutchinson"])
+@pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt])
+def test_retained_curvature_failure_releases_private_vectors(workflow, error_type):
+    references = []
+    template = torch.zeros(8, dtype=torch.float64)
+    diagonal = torch.arange(1.0, 9.0, dtype=template.dtype)
+    rng = torch.get_rng_state().clone()
+
+    def operator(vector):
+        references.append(weakref.ref(vector))
+        if len(references) == 3:
+            raise error_type("HVP interrupted")
+        return diagonal * vector
+
+    function = lanczos_modes if workflow == "lanczos" else hutchinson_estimates
+    with pytest.raises(error_type, match="HVP interrupted") as recorded:
+        function(operator, template)
+    gc.collect()
+    assert recorded.value is not None
+    assert all(reference() is None for reference in references)
+    torch.testing.assert_close(template, torch.zeros_like(template))
+    torch.testing.assert_close(torch.get_rng_state(), rng, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_lanczos_releases_basis_matrix_before_residual_products(monkeypatch, dtype):
+    matrices = []
+    stack = torch.stack
+    calls = 0
+
+    def track_stack(values, *args, **kwargs):
+        result = stack(values, *args, **kwargs)
+        if kwargs.get("dim") == 1:
+            matrices.append(weakref.ref(result))
+        return result
+
+    diagonal = torch.tensor([-2.0, 1.0, 3.0, 5.0], dtype=dtype)
+
+    def product(vector):
+        nonlocal calls
+        calls += 1
+        if calls > 4:
+            assert len(matrices) == 2
+            assert all(reference() is None for reference in matrices)
+        return diagonal * vector
+
+    monkeypatch.setattr(torch, "stack", track_stack)
+    result = lanczos_modes(
+        product,
+        torch.zeros_like(diagonal),
+        options=LanczosOptions(num_modes=2, max_iterations=4),
+    )
+    torch.testing.assert_close(result.eigenvalues, diagonal[:2])
     assert result.converged.all()
 
 

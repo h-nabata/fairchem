@@ -72,7 +72,20 @@ def _custom_forward(self, values):
 
 
 @pytest.mark.parametrize(
-    "customization", ["subclass", "forward", "pre", "post", "backward", "backward_pre"]
+    "customization",
+    [
+        "subclass",
+        "forward",
+        "pre",
+        "post",
+        "backward",
+        "backward_pre",
+        "state_pre",
+        "state_post",
+        "load_pre",
+        "load_post",
+        "compiled",
+    ],
 )
 @pytest.mark.parametrize(
     "options", [{"radial_table_points": 257}, {"radial_fast_exp": True}]
@@ -93,6 +106,16 @@ def test_radial_replacement_rejects_custom_semantics_without_mutation(
         radial.register_full_backward_hook(lambda module, inputs, outputs: None)
     elif customization == "backward_pre":
         radial.register_full_backward_pre_hook(lambda module, outputs: None)
+    elif customization == "compiled":
+        radial.compile(backend="eager")
+    elif customization.startswith(("state_", "load_")):
+        register = {
+            "state_pre": "register_state_dict_pre_hook",
+            "state_post": "register_state_dict_post_hook",
+            "load_pre": "register_load_state_dict_pre_hook",
+            "load_post": "register_load_state_dict_post_hook",
+        }[customization]
+        getattr(radial, register)(lambda *args: None)
     model = torch.nn.Module()
     model.distance_expansion = radial
     values = torch.tensor([0.3], requires_grad=True)
@@ -129,6 +152,35 @@ def test_reapplying_radial_policy_preserves_identity_and_hooks():
     handle.remove()
     apply_feature_approximations(model, SimpleNamespace())
     assert model.distance_expansion is radial.original
+
+
+@pytest.mark.parametrize(
+    "options", [{"radial_table_points": 257}, {"radial_fast_exp": True}]
+)
+def test_radial_replacement_cannot_change_external_checkpoint_hook_paths(options):
+    model = torch.nn.Module()
+    original = GaussianSmearing(0, 5, 8).eval()
+    model.distance_expansion = original
+
+    def export(module, state, prefix, metadata):
+        state[prefix + "external_offset"] = module.offset.clone()
+
+    def restore(module, state, prefix, *args):
+        module.offset.copy_(state.pop(prefix + "external_offset"))
+
+    original.register_state_dict_post_hook(export)
+    original.register_load_state_dict_pre_hook(restore)
+    checkpoint = model.state_dict()
+    assert set(checkpoint) == {"distance_expansion.external_offset"}
+    expected = original(torch.tensor([0.3]))
+    with pytest.raises(ValueError, match="hooks"):
+        apply_feature_approximations(model, SimpleNamespace(**options))
+    # A failed conversion must leave the application-specific checkpoint
+    # contract usable, rather than nesting its keys under ".original".
+    assert model.distance_expansion is original
+    original.offset.add_(0.4)
+    model.load_state_dict(checkpoint)
+    torch.testing.assert_close(original(torch.tensor([0.3])), expected)
 
 
 @pytest.mark.parametrize(

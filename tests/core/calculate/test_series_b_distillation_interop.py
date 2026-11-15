@@ -8,6 +8,7 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 import copy
+import gc
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
@@ -18,6 +19,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from fairchem.core.calculate import series_b_distillation
 from fairchem.core.calculate.series_b_distillation import (
     DistillationDataset,
     DistillationResult,
@@ -70,6 +72,100 @@ class VersionedStudent(torch.nn.Linear):
 
     def forward(self, inputs):
         return super().forward(inputs) * self.extra["scale"]
+
+
+def test_dataset_consumes_generated_samples_without_retaining_source_copies():
+    references = []
+
+    def samples():
+        for index in range(3):
+            sample = DistillationSample(_data(index + 1), {"energy": torch.ones(1)})
+            references.append(weakref.ref(sample.data.pos))
+            yield sample
+            del sample
+            assert references[-1]() is None
+
+    dataset = DistillationDataset(samples())
+    assert len(dataset.samples) == 3
+    assert all(reference() is None for reference in references)
+    for index, sample in enumerate(dataset.samples):
+        torch.testing.assert_close(sample.data.pos, _data(index + 1).pos)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_training_releases_previous_outputs_before_next_forward(dtype):
+    previous = []
+
+    class CheckedStudent(HarmonicStudent):
+        def forward(self, data):
+            assert all(reference() is None for reference in previous)
+            assert all(parameter.grad is None for parameter in self.parameters())
+            result = super().forward(data)
+            previous.extend(weakref.ref(value) for value in result.values())
+            return result
+
+    dataset = collect_teacher_labels(
+        Teacher(HarmonicStudent(2)), [_data()], teacher_id="analytic"
+    )
+    result = distill_student(CheckedStudent().to(dtype), dataset, steps=3)
+    assert all(reference() is None for reference in previous)
+    assert len(result.loss_history) == 3
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt])
+def test_retained_training_error_releases_private_model(error_type):
+    references = []
+
+    class FailingStudent(HarmonicStudent):
+        def forward(self, data):
+            references.append(weakref.ref(self))
+            self.bound = self.forward
+            raise error_type("training interrupted")
+
+    source = FailingStudent()
+    dataset = collect_teacher_labels(
+        Teacher(HarmonicStudent(2)), [_data()], teacher_id="analytic"
+    )
+    with pytest.raises(error_type, match="training interrupted") as recorded:
+        distill_student(source, dataset, steps=1)
+    gc.collect()
+    assert recorded.value is not None
+    assert all(reference() is None for reference in references)
+    assert source.coefficient.item() == 0.5
+    assert not hasattr(source, "bound")
+
+
+def test_export_releases_validation_model_before_serialization(tmp_path, monkeypatch):
+    references = []
+    instantiate = series_b_distillation.hydra.utils.instantiate
+    save = torch.save
+
+    def checked_instantiate(*args, **kwargs):
+        model = instantiate(*args, **kwargs)
+        references.append(weakref.ref(model))
+        return model
+
+    def checked_save(*args, **kwargs):
+        assert references
+        assert all(reference() is None for reference in references)
+        return save(*args, **kwargs)
+
+    monkeypatch.setattr(
+        series_b_distillation.hydra.utils, "instantiate", checked_instantiate
+    )
+    monkeypatch.setattr(torch, "save", checked_save)
+    path = export_distilled_checkpoint(
+        DistillationResult(torch.nn.Linear(3, 1), (), {}),
+        tmp_path / "student.pt",
+        model_config={
+            "_target_": "torch.nn.Linear",
+            "in_features": 3,
+            "out_features": 1,
+        },
+        tasks_config=[],
+        architecture_note="validation model lifetime",
+    )
+    assert path.is_file()
 
 
 def test_teacher_outputs_are_released_before_collecting_the_next_structure():

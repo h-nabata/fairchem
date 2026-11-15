@@ -66,6 +66,14 @@ def _unpack_coefficients(g0, g1, g2, channels):
     return [m_coeffs[index] for index in L_TO_M]
 
 
+def _scale_pair(packed, radial):
+    # The real/imaginary SO2 blocks share the same radial coefficients. Use a
+    # broadcast view instead of allocating their repeated edge-sized tensor.
+    return (
+        packed.reshape(packed.shape[0], 2, radial.shape[-1]) * radial[:, None, :]
+    ).flatten(1)
+
+
 def producer_reference(x, edge_index, wigner, radial, channels):
     """
     Gather, rotate and form SO2 GEMM inputs without a dense Wigner matrix.
@@ -76,7 +84,7 @@ def producer_reference(x, edge_index, wigner, radial, channels):
     )
     m0, m1, m2 = _pack_coefficients(_rotate_blocks(edge_features, wigner))
     r0, r1, r2 = radial.split((6 * channels, 4 * channels, 2 * channels), dim=-1)
-    return m0 * r0, m1 * r1.repeat(1, 2), m2 * r2.repeat(1, 2)
+    return m0 * r0, _scale_pair(m1, r1), _scale_pair(m2, r2)
 
 
 def producer_projected_reference(x, edge_index, wigner, radial, channels):
@@ -90,8 +98,8 @@ def producer_projected_reference(x, edge_index, wigner, radial, channels):
     m0, m1, m2 = _pack_coefficients(_rotate_blocks(edge_features, wigner))
     return (
         m0 * radial.block(0, 6 * channels),
-        m1 * radial.block(6 * channels, 4 * channels).repeat(1, 2),
-        m2 * radial.block(10 * channels, 2 * channels).repeat(1, 2),
+        _scale_pair(m1, radial.block(6 * channels, 4 * channels)),
+        _scale_pair(m2, radial.block(10 * channels, 2 * channels)),
     )
 
 
@@ -474,7 +482,7 @@ def producer_adjoint(g0, g1, g2, x, edge_index, wigner, radial, channels):
     rotated = _rotate_blocks(x_edge, wigner)
     packed = _pack_coefficients(rotated)
     r0, r1, r2 = radial.split((6 * channels, 4 * channels, 2 * channels), -1)
-    d_packed = (g0 * r0, g1 * r1.repeat(1, 2), g2 * r2.repeat(1, 2))
+    d_packed = (g0 * r0, _scale_pair(g1, r1), _scale_pair(g2, r2))
     d_coeffs = _unpack_coefficients(*d_packed, double_channels)
     dx_blocks, dw_blocks = [], []
     for start, width, offset in _BLOCKS:

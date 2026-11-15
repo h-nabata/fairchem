@@ -240,6 +240,7 @@ class VerletNeighborCache:
             )
             del source_pos, target_pos, shifts
             distance_error = rounding * (2 * distance2.sqrt() + rounding)
+            del rounding
             if bool(((distance2 - cutoff * cutoff).abs() <= distance_error).any()):
                 self.boundary_fallbacks += 1
                 return radius_graph_pbc_v2(
@@ -248,6 +249,7 @@ class VerletNeighborCache:
             keep = (distance2 <= cutoff * cutoff) & (distance2 != 0)
             edges, cells, distance2 = edges[:, keep], cells[keep], distance2[keep]
             distance_error = distance_error[keep]
+            del keep
             if len(data.pos) == 0:
                 return edges, cells, torch.zeros_like(data.natoms, dtype=torch.long)
             needs_capping = False

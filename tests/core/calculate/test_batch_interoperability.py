@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import pickle
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from threading import Event
@@ -32,6 +33,54 @@ from fairchem.core.modules.normalization.normalizer import Normalizer
 from fairchem.core.units.mlip_unit.mlip_unit import OutputSpec, Task
 from tests.core.calculate.test_batched_inference import HarmonicPredictor, _structure
 from tests.core.units.mlip_unit.test_xpu_preparation import _small_predictor
+
+
+@pytest.mark.parametrize("slots", [None, 1, 2])
+def test_microbatch_releases_combined_outputs_before_next_forward(slots):
+    references = []
+
+    class Predictor:
+        device = "cpu"
+
+        def predict(self, data):
+            assert all(reference() is None for reference in references)
+            output = torch.ones((data.num_graphs, 4096))
+            references.append(weakref.ref(output))
+            return {"energy": output}
+
+    stager = None if slots is None else DeviceBatchStager("cpu", slots=slots)
+    try:
+        wrapper = MicrobatchPredictor(
+            Predictor(), InferenceBatchLimits(max_systems=1), stager=stager
+        )
+        results = wrapper.predict_many([_structure() for _ in range(3)])
+        assert all(reference() is None for reference in references)
+        assert len(results) == 3
+        for result in results:
+            torch.testing.assert_close(result["energy"], torch.ones(1, 4096))
+        results[0]["energy"].zero_()
+        assert results[1]["energy"].count_nonzero() == 4096
+    finally:
+        if stager is not None:
+            stager.close()
+
+
+def test_staging_warmed_inside_inference_mode_is_reusable_outside():
+    stager = DeviceBatchStager("cpu", slots=1)
+    data = _structure()
+    try:
+        with torch.inference_mode():
+            with stager.stage(data) as staged:
+                assert not staged.pos.is_inference()
+                torch.testing.assert_close(staged.pos, data.pos)
+            assert torch.is_inference_mode_enabled()
+        data.pos.add_(0.25)
+        with stager.stage(data) as staged:
+            torch.testing.assert_close(staged.pos, data.pos)
+            assert not staged.pos.is_inference()
+        assert not torch.is_inference_mode_enabled()
+    finally:
+        stager.close()
 
 
 @pytest.mark.parametrize("count", [1, 2])

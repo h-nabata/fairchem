@@ -1445,6 +1445,20 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         logging.warning("Reloading model after interrupted inference preparation")
         self.clear_prepared_model_cache()
         self._numeric_runtimes = []
+        # A failed device move or compiler setup may leave a large partial
+        # model, including module/runtime cycles. Drop it before constructing
+        # its replacement, just as the normal fast-path fallback does. A retry
+        # after a failed checkpoint read may already have no model attribute.
+        model = getattr(self, "model", None)
+        release = getattr(
+            getattr(model, "module", None), "release_inference_resources", None
+        )
+        if release is not None:
+            release()
+        del release, model
+        if hasattr(self, "model"):
+            del self.model
+        gc.collect()
         template = getattr(self, "_mole_template", None)
         if template is not None:
             self.model = copy.deepcopy(template)
@@ -1484,6 +1498,9 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
             self.model.module.prepare_for_inference(
                 preparation_data, self.inference_settings
             )
+        # Preparation owns any metadata it retains. The extra complete CPU
+        # input copy is no longer needed during approximation or device upload.
+        del preparation_data
         # Inference differentiates outputs with respect to inputs, not weights.
         self.model.requires_grad_(False)
 
@@ -1589,12 +1606,13 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
             precision_context = tf32_context_manager(
                 self.inference_settings.series_b.onednn_tf32, device_type="xpu"
             )
-        # Nitro kernels require their configured precision, independent of the
-        # caller's autocast scope. Approximate modules choose their own operand
-        # precision, leaving geometry, normalization and heads in FP32.
+        # InferenceSettings owns precision on every device. An enclosing
+        # library's autocast must not silently turn strict A inference into
+        # BF16/FP16. Explicit approximate modules still choose their operands,
+        # while model-owned AMP scopes and raw training APIs remain unchanged.
         autocast_context = (
             torch.autocast(device_type, enabled=False)
-            if device_type == "xpu"
+            if device_type in {"cpu", "cuda", "xpu"}
             or self.inference_settings.nitro
             or self.inference_settings.series_b.enabled
             else nullcontext()

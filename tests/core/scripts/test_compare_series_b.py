@@ -8,6 +8,7 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 import copy
+import gc
 import json
 import weakref
 from dataclasses import replace
@@ -23,6 +24,42 @@ from fairchem.core.units.mlip_unit.api.inference import inference_settings_xpu
 from fairchem.core.units.mlip_unit.api.series_b import SeriesBSettings
 from tests.core.units.mlip_unit.test_predict_interoperability import _public_predictor
 from tests.core.units.mlip_unit.test_xpu_preparation import _data
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt])
+def test_retained_comparison_error_releases_private_predictor(monkeypatch, error_type):
+    references = []
+
+    class FailingPredictor:
+        device = "cpu"
+
+        def __init__(self, settings):
+            self.inference_settings = settings
+            self.bound = self.predict
+
+        def predict(self, data, requested_properties):
+            raise error_type("comparison interrupted")
+
+    def load(name, *, device, inference_settings):
+        predictor = FailingPredictor(inference_settings)
+        references.append(weakref.ref(predictor))
+        return predictor
+
+    monkeypatch.setattr(script.pretrained_mlip, "get_predict_unit", load)
+    with pytest.raises(error_type, match="comparison interrupted") as recorded:
+        script.run_comparison(
+            "unused.pt",
+            molecule("H2O"),
+            task="omol",
+            device="cpu",
+            series_b={"weight_bits": 8},
+            warmup=0,
+            repeats=1,
+        )
+    gc.collect()
+    assert recorded.value is not None
+    assert references
+    assert all(reference() is None for reference in references)
 
 
 def test_real_uma_comparison_reports_errors_without_claiming_qualification():
@@ -252,7 +289,20 @@ def test_outer_cpu_autocast_does_not_reduce_reference_precision(monkeypatch):
     assert report["errors"]["forces"]["max_absolute_error"] < 1e-6
 
 
-def test_fp64_comparison_reports_derivative_error_without_changing_forward_precision():
+def test_fp64_comparison_reports_derivative_error_without_changing_forward_precision(
+    monkeypatch,
+):
+    measure = script._measure_predictor
+
+    def matched_rolls(*args, **kwargs):
+        # General UMA samples a random edge-frame roll on each forward, even
+        # in eval mode. Independent rolls can differ at roundoff even for A/A;
+        # pair them to test saved-feature compression's exact forward contract.
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(42)
+            return measure(*args, **kwargs)
+
+    monkeypatch.setattr(script, "_measure_predictor", matched_rolls)
     reference, candidate = _public_predictor(), _public_predictor()
     reference.inference_settings = replace(
         reference.inference_settings, base_precision_dtype=torch.float64

@@ -291,7 +291,15 @@ class DeviceBatchStager:
             else self._backend.stream(self._copy_stream)
         )
         try:
-            with device_scope(self.device), copy_context, torch.no_grad():
+            # Reusable buffers must remain writable by later calls outside an
+            # ambient inference_mode context. no_grad alone still creates
+            # inference tensors when the caller has inference_mode enabled.
+            with (
+                device_scope(self.device),
+                copy_context,
+                torch.inference_mode(False),
+                torch.no_grad(),
+            ):
                 for path, tensor in tensors:
                     target = slot.target.get(path)
                     if (
