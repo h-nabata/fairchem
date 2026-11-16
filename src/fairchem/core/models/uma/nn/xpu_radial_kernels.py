@@ -188,23 +188,26 @@ def _supported_layout(x, weight, bias, norm_weight, norm_bias, eps):
 def _launch_linear_norm_silu(x, weight, bias, norm_weight, norm_bias, eps):
     triton, kernel = _load_kernel()
     output = torch.empty((x.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
-    kernel[(triton.cdiv(x.shape[0], 16),)](
-        x,
-        weight,
-        bias,
-        norm_weight,
-        norm_bias,
-        output,
-        M=x.shape[0],
-        K=x.shape[1],
-        N=weight.shape[0],
-        EPS=float(eps),
-        BLOCK_M=16,
-        BLOCK_K=32,
-        BLOCK_N=triton.next_power_of_2(weight.shape[0]),
-        num_warps=4,
-        enable_fp_fusion=False,
-    )
+    # Triton selects its launch stream from the current device, not
+    # from tensor pointers. Preserve explicit xpu:1 on multi-GPU hosts.
+    with torch.xpu.device(x.device):
+        kernel[(triton.cdiv(x.shape[0], 16),)](
+            x,
+            weight,
+            bias,
+            norm_weight,
+            norm_bias,
+            output,
+            M=x.shape[0],
+            K=x.shape[1],
+            N=weight.shape[0],
+            EPS=float(eps),
+            BLOCK_M=16,
+            BLOCK_K=32,
+            BLOCK_N=triton.next_power_of_2(weight.shape[0]),
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
     return output
 
 

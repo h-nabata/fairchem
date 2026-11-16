@@ -612,6 +612,9 @@ def run_resident_steps(
         if observer is not None and step % observe_every == 0:
             observer(step, state, predictions)
         state = update(state, predictions)
+        # The integrator/observer owns anything it retains. Avoid overlapping
+        # otherwise completed force/stress outputs with the next model graph.
+        del predictions
         if torch.device(state.device) != device:
             raise ValueError("The update moved simulation state off the model device")
     return state

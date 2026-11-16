@@ -372,6 +372,10 @@ def compute_hessian_vmap(
             blocks.append(block)
         else:
             hessian[start:stop].copy_(block)
+        # Evaluation already copied the rows into their final allocation.
+        # Training keeps any required tensors through blocks/autograd itself.
+        # Do not keep a previous basis/block live during the next backward.
+        del block, basis, rows
     return torch.cat(blocks, dim=0) if create_graph else hessian
 
 

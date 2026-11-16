@@ -295,23 +295,26 @@ class FusedProducer(torch.autograd.Function):
         def grid(meta):
             return (edges, 9, triton.cdiv(2 * channels, meta["BLOCK_C"]))
 
-        _producer_kernel[grid](
-            x,
-            index,
-            wigner,
-            radial,
-            radial,
-            radial,
-            *outputs,
-            edges,
-            channels,
-            1,
-            1,
-            False,
-            _wide_offsets(x, wigner, radial, *outputs),
-            _device_key(x.device),
-            enable_fp_fusion=False,
-        )
+        # Triton selects its launch stream from the current device, not
+        # from tensor pointers. Preserve explicit xpu:1 on multi-GPU hosts.
+        with torch.xpu.device(x.device):
+            _producer_kernel[grid](
+                x,
+                index,
+                wigner,
+                radial,
+                radial,
+                radial,
+                *outputs,
+                edges,
+                channels,
+                1,
+                1,
+                False,
+                _wide_offsets(x, wigner, radial, *outputs),
+                _device_key(x.device),
+                enable_fp_fusion=False,
+            )
         return tuple(outputs)
 
     @staticmethod
@@ -380,23 +383,26 @@ class FusedProjectedProducer(torch.autograd.Function):
         def grid(meta):
             return (edges, 9, triton.cdiv(2 * channels, meta["BLOCK_C"]))
 
-        _producer_kernel[grid](
-            x,
-            index,
-            wigner,
-            hidden,
-            weight,
-            bias,
-            *outputs,
-            edges,
-            channels,
-            hidden.shape[1],
-            triton.next_power_of_2(hidden.shape[1]),
-            True,
-            _wide_offsets(x, wigner, hidden, weight, *outputs),
-            _device_key(x.device),
-            enable_fp_fusion=False,
-        )
+        # Triton selects its launch stream from the current device, not
+        # from tensor pointers. Preserve explicit xpu:1 on multi-GPU hosts.
+        with torch.xpu.device(x.device):
+            _producer_kernel[grid](
+                x,
+                index,
+                wigner,
+                hidden,
+                weight,
+                bias,
+                *outputs,
+                edges,
+                channels,
+                hidden.shape[1],
+                triton.next_power_of_2(hidden.shape[1]),
+                True,
+                _wide_offsets(x, wigner, hidden, weight, *outputs),
+                _device_key(x.device),
+                enable_fp_fusion=False,
+            )
         return tuple(outputs)
 
     @staticmethod
@@ -473,23 +479,26 @@ class FusedConsumer(torch.autograd.Function):
         def grid(meta):
             return (num_nodes, 9, triton.cdiv(channels, meta["BLOCK_C"]))
 
-        _consumer_kernel[grid](
-            g0,
-            g1,
-            g2,
-            wigner,
-            order,
-            offsets,
-            output if residual is None else residual,
-            output,
-            num_nodes,
-            target.numel(),
-            channels,
-            _wide_offsets(g0, g1, g2, wigner, output),
-            residual is not None,
-            _device_key(g0.device),
-            enable_fp_fusion=False,
-        )
+        # Triton selects its launch stream from the current device, not
+        # from tensor pointers. Preserve explicit xpu:1 on multi-GPU hosts.
+        with torch.xpu.device(g0.device):
+            _consumer_kernel[grid](
+                g0,
+                g1,
+                g2,
+                wigner,
+                order,
+                offsets,
+                output if residual is None else residual,
+                output,
+                num_nodes,
+                target.numel(),
+                channels,
+                _wide_offsets(g0, g1, g2, wigner, output),
+                residual is not None,
+                _device_key(g0.device),
+                enable_fp_fusion=False,
+            )
         return output
 
     @staticmethod

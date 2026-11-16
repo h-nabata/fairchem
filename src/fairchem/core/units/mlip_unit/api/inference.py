@@ -204,7 +204,8 @@ class InferenceSettings:
     graph_search_method: str = "cell"
     graph_edge_order: str = "original"
 
-    # Number of internal torch threads to use for inference
+    # CPU intra-op threads (process-wide). Does not configure PyTorch's one-shot
+    # inter-op pool. Leave None when the application manages thread policy.
     torch_num_threads: int | None = None
 
     # Used for padding edges during inference, this is useful to reduce recompiling time during dynamic inference runs
