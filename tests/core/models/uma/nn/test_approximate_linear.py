@@ -499,3 +499,75 @@ def test_synthetic_general_uma_energy_force_stress_and_hessian_all_variants():
                 atol=absolute_limit,
                 msg=f"{kwargs}: {name}",
             )
+
+
+@pytest.mark.parametrize("bits", [4, 8])
+def test_packed_policy_skips_expansion_and_preserves_reduced_gemm(bits):
+    for precision in ("fp32", "bf16"):
+        model = _model(1, 128)
+        manifest = apply_linear_approximations(
+            model,
+            weight_bits=bits,
+            quantize_only_if_smaller=True,
+            gemm_precision=precision,
+            low_precision_emulation=True,
+        )
+        if precision == "fp32":
+            assert isinstance(model[0], nn.Linear)
+            assert manifest["skipped"]
+        else:
+            assert manifest["converted"][0]["weight_bits"] is None
+            assert model[0].factors[0].bits is None
+
+
+@pytest.mark.parametrize("bits", [4, 8])
+@pytest.mark.parametrize("precision", ["fp32", "bf16_split2"])
+def test_tiled_decode_matches_full_gradients(bits, precision):
+    models = [_model(7, 13), _model(7, 13)]
+    for m, rows in zip(models, [None, 3]):
+        apply_linear_approximations(
+            m,
+            weight_bits=bits,
+            packed_tile_rows=rows,
+            gemm_precision=precision,
+            low_precision_emulation=True,
+        )
+    x = torch.randn(4, 7, requires_grad=True)
+    outputs = [m(x) for m in models]
+    gradient = [
+        torch.autograd.grad(y.square().sum(), x, create_graph=True)[0] for y in outputs
+    ]
+    curvature = [torch.autograd.grad(g.sum(), x)[0] for g in gradient]
+    for ref, tiled in [outputs, gradient, curvature]:
+        torch.testing.assert_close(tiled, ref, atol=2e-5, rtol=2e-5)
+
+
+def test_randomized_svd_uses_private_rng_and_reports_factor_error():
+    m = _model(32, 48)
+    weight = m[0].weight.clone()
+    initial = torch.random.get_rng_state()
+    manifest = apply_linear_approximations(
+        m, low_rank_fraction=0.125, low_rank_solver="randomized"
+    )
+    torch.testing.assert_close(initial, torch.random.get_rng_state())
+    error = (weight - m[0].materialized_weight()).norm() / weight.norm()
+    assert manifest["converted"][0]["relative_frobenius_residual"] == pytest.approx(
+        float(error), abs=1e-6
+    )
+
+
+def test_split_gemm_reads_finite_results_once():
+    m = _model()
+    apply_linear_approximations(
+        m, gemm_precision="bf16_split3", low_precision_emulation=True
+    )
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CPU]
+    ) as profile:
+        m(torch.ones(2, 7))
+    scalar_reads = sum(
+        event.count
+        for event in profile.key_averages()
+        if event.key == "aten::_local_scalar_dense"
+    )
+    assert scalar_reads == 1

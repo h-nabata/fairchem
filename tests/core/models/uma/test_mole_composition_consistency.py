@@ -103,7 +103,7 @@ def test_scaled_composition_after_merge(
 ):
     model = _model(model_id, use_composition_embedding)
     merged = model.prepare_for_inference(_data(), inference_settings_xpu())
-    # The bound guard runs on the replacement plain backbone, not the MoE.
+    # The prepared backbone must retain the initial router contract.
     merged.on_predict_check(_data())
     if must_reject:
         with pytest.raises(MergeMoleConsistencyError, match="absolute composition"):

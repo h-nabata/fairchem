@@ -17,10 +17,13 @@ We run one batched first layer, then each tail:
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 import torch.nn as nn
+
+from fairchem.core.common.precision import matmul_precision_key
 
 from .radial import layer_norm_silu
 
@@ -81,16 +84,8 @@ def _precision_cache_key(tensor):
         and torch.is_autocast_enabled(device_type)
         else None
     )
-    matmul_precision = (
-        torch.get_float32_matmul_precision() if tensor.dtype == torch.float32 else None
-    )
-    # XPU's oneDNN policy is independent of the CUDA matmul setting.
-    onednn_tf32 = (
-        getattr(torch.backends.mkldnn, "allow_tf32", None)
-        if tensor.dtype == torch.float32 and device_type == "xpu"
-        else None
-    )
-    return autocast_dtype, matmul_precision, onednn_tf32
+    policy = matmul_precision_key(device_type) if tensor.dtype == torch.float32 else ()
+    return (autocast_dtype, *policy)
 
 
 def _record_cache_event(tensor: torch.Tensor):
@@ -166,8 +161,11 @@ class UnifiedRadialMLP(nn.Module):
 
     The first layer uses concatenated weights for a single GEMM (all N layers
     share the same input). Layers 2+ use stacked weight buffers for fast
-    indexed functional calls.
+    indexed functional calls. This module owns a snapshot of the source
+    parameters. To update a prepared model, load its packed state dictionary.
     """
+
+    _derived_inference_buffers = frozenset({"_source_table", "_target_table"})
 
     def __init__(self, radial_mlps: list[RadialMLP]) -> None:
         """
@@ -324,9 +322,12 @@ class UnifiedRadialMLP(nn.Module):
         projection = RadialProjection(h, self.fc3_weight[i], self.fc3_bias[i])
         return projection if lazy else projection.materialize()
 
-    def _tails(self, h_all, lazy):
+    def _tails(self, h_all, lazy, first_layer=0):
         h_per_layer = h_all.split(self.hidden_features, dim=1)
-        return [self.umas_radial_mlp(h, i, lazy) for i, h in enumerate(h_per_layer)]
+        return [
+            self.umas_radial_mlp(h, first_layer + i, lazy)
+            for i, h in enumerate(h_per_layer)
+        ]
 
     def forward(self, x: torch.Tensor, lazy: bool = False) -> list:
         """
@@ -343,6 +344,8 @@ class UnifiedRadialMLP(nn.Module):
         source_embedding: torch.Tensor,
         target_embedding: torch.Tensor,
         lazy: bool = False,
+        first_layer: int = 0,
+        end_layer: int | None = None,
     ) -> list:
         """
         Precompute the fixed elemental parts of the first radial linear.
@@ -370,14 +373,16 @@ class UnifiedRadialMLP(nn.Module):
         precision_key = _precision_cache_key(self.W1_cat) if cacheable else None
         key = (key, D, S, T, precision_key)
         if not cacheable or key != self._element_cache_key:
-            source_table = torch.nn.functional.linear(
-                source_embedding,
-                self.W1_cat[:, D : D + S],
-            )
-            target_table = torch.nn.functional.linear(
-                target_embedding,
-                self.W1_cat[:, D + S :],
-            )
+            # Cached weights must also be valid in a later force/HVP graph.
+            with torch.inference_mode(False) if cacheable else nullcontext():
+                source_table = torch.nn.functional.linear(
+                    source_embedding,
+                    self.W1_cat[:, D : D + S],
+                )
+                target_table = torch.nn.functional.linear(
+                    target_embedding,
+                    self.W1_cat[:, D + S :],
+                )
             if cacheable:
                 self._source_table = source_table
                 self._target_table = target_table
@@ -387,14 +392,18 @@ class UnifiedRadialMLP(nn.Module):
         else:
             source_table, target_table = self._source_table, self._target_table
             _wait_cache_event(self._element_cache_event, source_table, target_table)
+        end_layer = self.num_layers if end_layer is None else end_layer
+        channels = slice(
+            first_layer * self.hidden_features, end_layer * self.hidden_features
+        )
         h_all = torch.nn.functional.linear(
             distance_features,
-            self.W1_cat[:, :D],
-            self.b1_cat,
+            self.W1_cat[channels, :D],
+            self.b1_cat[channels],
         )
-        h_all = h_all + source_table.index_select(0, source_indices)
-        h_all = h_all + target_table.index_select(0, target_indices)
-        return self._tails(h_all, lazy)
+        h_all.add_(source_table[:, channels].index_select(0, source_indices))
+        h_all.add_(target_table[:, channels].index_select(0, target_indices))
+        return self._tails(h_all, lazy, first_layer)
 
 
 def create_unified_radial_mlp(radial_mlps: list) -> UnifiedRadialMLP:

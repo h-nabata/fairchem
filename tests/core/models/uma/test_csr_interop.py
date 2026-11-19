@@ -78,3 +78,29 @@ def test_csr_snapshot_counts_towards_the_memory_budget():
 def test_segment_length_mismatch_never_silently_drops_values(length):
     with pytest.raises(ValueError, match="same leading length"):
         segmented_sum(torch.ones(length, 2), torch.tensor([0, 1, 0]), 2)
+
+
+def test_clear_during_topology_build_does_not_repopulate_cache(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    cache = CSRTopologyCache()
+    target = torch.tensor([0, 1, 0])
+    reached, resume = Event(), Event()
+    argsort = torch.argsort
+
+    def paused_sort(*args, **kwargs):
+        reached.set()
+        assert resume.wait(5)
+        return argsort(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "argsort", paused_sort)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        build = executor.submit(cache.get, target, 2)
+        try:
+            assert reached.wait(5)
+            executor.submit(cache.clear).result(timeout=5)
+        finally:
+            resume.set()
+        assert build.result().lengths.tolist() == [2, 1]
+    assert not cache._entries

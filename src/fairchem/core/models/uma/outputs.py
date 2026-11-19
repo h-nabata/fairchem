@@ -144,6 +144,8 @@ def reduce_node_to_system(
     """
     if compensated_reduction_enabled():
         system_values = compensated_node_sum(node_values, batch, num_systems).double()
+    elif num_systems == 1:
+        system_values = node_values.sum(dim=0, keepdim=True, dtype=torch.float64)
     else:
         output_shape = (num_systems,) + node_values.shape[1:]
         system_values = torch.zeros(
@@ -285,8 +287,17 @@ def compute_forces_and_stress(
     # reduce_node_to_system performs the single correct GP all-reduce.
     # Using already-reduced gradients here would cause double-reduction
     # since reduce_node_to_system also calls reduce_from_model_parallel_region.
-    pos_virial_per_atom = grads[0].unsqueeze(2) * pos.unsqueeze(1)  # [N, 3, 3]
-    pos_virial, _ = reduce_node_to_system(pos_virial_per_atom, batch, num_systems)
+    if num_systems == 1 and not compensated_reduction_enabled():
+        # Round each product at the input precision, as in the batched path.
+        # Reduce one [N,3] row at a time and communicate only the final [1,3,3].
+        pos_virial = torch.stack(
+            [(g[:, None] * pos).sum(0, dtype=torch.float64) for g in grads[0].unbind(1)]
+        ).unsqueeze(0)
+        if gp_utils.initialized():
+            pos_virial = gp_utils.reduce_from_model_parallel_region(pos_virial)
+    else:
+        pos_virial_per_atom = grads[0].unsqueeze(2) * pos.unsqueeze(1)
+        pos_virial, _ = reduce_node_to_system(pos_virial_per_atom, batch, num_systems)
 
     # Now all-reduce gradients for forces and cell_virial
     if gp_utils.initialized():

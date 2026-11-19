@@ -8,6 +8,7 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -23,8 +24,14 @@ from fairchem.core.models.uma.escn_moe import (
     DatasetSpecificSingleHeadWrapper,
     eSCNMDMoeBackbone,
 )
-from fairchem.core.models.uma.nn.mole import MOLEGlobals
-from fairchem.core.units.mlip_unit.api.inference import inference_settings_xpu
+from fairchem.core.models.uma.nn.mole import MOLE, MOLEGlobals, _pnorm
+from fairchem.core.units.mlip_unit.api.inference import (
+    MergeMoleConsistencyError,
+    inference_settings_xpu,
+)
+from fairchem.core.units.mlip_unit.inference_runtime import model_storage_bytes
+from fairchem.core.units.mlip_unit.predict import MLIPPredictUnit
+from tests.core.models.uma.uma_nitro.nitro_test_utils import random_checkpoint
 
 
 class _OutputsHead(torch.nn.Module):
@@ -205,16 +212,23 @@ def test_backbone_merge_preserves_mixed_and_nonpersistent_buffer_precision(
     atoms = molecule("H2O")
     atoms.info.update(charge=0, spin=1)
     data = AtomicData.from_ase(atoms, task_name="omol")
+    original = {
+        name: value.detach().clone()
+        for name, value in (
+            dict(model.named_parameters()) | dict(model.named_buffers())
+        ).items()
+    }
+    gaussian_coeff = model.distance_expansion.coeff
     merged = model.merge_MOLE_model(data)
-    # The source has already replaced experts by linear layers. Compare its
-    # exact tensors with the plain replacement, including derived buffers.
-    source = dict(model.named_parameters()) | dict(model.named_buffers())
     target = dict(merged.named_parameters()) | dict(merged.named_buffers())
-    assert source.keys() == target.keys()
+    assert not any(isinstance(module, MOLE) for module in merged.modules())
     assert any(tensor.dtype == torch.float64 for tensor in target.values())
-    for name, value in source.items():
-        torch.testing.assert_close(target[name], value, rtol=0, atol=0)
-        assert target[name].device == value.device
+    assert merged.distance_expansion.coeff == gaussian_coeff
+    # The unmixed parameters and all derived buffers retain their exact
+    # pre-merge state. Expert mixing creates new linear weight names.
+    for name in original.keys() & target.keys():
+        torch.testing.assert_close(target[name], original[name], rtol=0, atol=0)
+        assert target[name].device == original[name].device
     assert torch.get_default_dtype() == original_dtype
 
 
@@ -285,3 +299,138 @@ def test_full_uma_merge_preserves_loaded_fp64_weights_and_predictions():
             rtol=1e-10,
             atol=1e-12,
         )
+
+
+@pytest.mark.parametrize("cache_size", [0, 2])
+def test_portable_checkpoint_energy_then_forces_with_lazy_weights(tmp_path, cache_size):
+    path = tmp_path / "small.pt"
+    torch.save(
+        random_checkpoint(
+            num_experts=2,
+            num_layers=2,
+            sphere_channels=8,
+            hidden_channels=16,
+            edge_channels=8,
+            num_distance_basis=8,
+            otf_graph=True,
+        ),
+        path,
+    )
+    settings = replace(
+        inference_settings_xpu(),
+        execution_mode="umas_fast_portable",
+        mole_cache_size=cache_size,
+    )
+    unit = MLIPPredictUnit(
+        str(path),
+        device="cpu",
+        inference_settings=settings,
+        atom_refs={},
+        form_elem_refs={},
+    )
+    atoms = molecule("H2O")
+    atoms.info.update(charge=0, spin=1)
+    data = AtomicData.from_ase(atoms, task_name="omol")
+    rng_before = torch.get_rng_state()
+    unit._initialize(data)
+    torch.testing.assert_close(torch.get_rng_state(), rng_before)
+    with torch.inference_mode():
+        energy = unit.predict(data, requested_properties=["energy"])
+    assert torch.isfinite(energy["energy"]).all()
+    forces = unit.predict(data, requested_properties=["forces"])
+    assert forces["forces"].isfinite().all()
+    if not cache_size:
+        compact = MLIPPredictUnit(
+            str(path),
+            device="cpu",
+            inference_settings=replace(
+                settings, compact_angular_weights=True, radial_layer_group_size=1
+            ),
+            atom_refs={},
+            form_elem_refs={},
+        )
+        torch.manual_seed(45)
+        packed = unit.predict(data, requested_properties=["energy", "forces"])
+        torch.manual_seed(45)
+        streamed = compact.predict(data, requested_properties=["energy", "forces"])
+        for prop in packed:
+            torch.testing.assert_close(
+                streamed[prop], packed[prop], atol=1e-6, rtol=1e-5
+            )
+        assert model_storage_bytes(compact.model) < model_storage_bytes(unit.model)
+    if cache_size:
+        assert unit._prepared_models.bytes == model_storage_bytes(unit.model)
+        # Physical nonpersistent buffers must continue to trigger mutation checks.
+        unit.model.module.backbone.coefficient_index.add_(0)
+        with pytest.raises(RuntimeError, match="weights/buffers changed"):
+            unit.predict(data, requested_properties=["energy"])
+
+
+def test_merge_requires_exact_element_ratio_and_pnorm_system_count():
+    def batch(counts):
+        numbers = torch.cat(
+            [
+                torch.repeat_interleave(torch.tensor([1, 6]), torch.tensor(pair))
+                for pair in counts
+            ]
+        )
+        sizes = torch.tensor([sum(pair) for pair in counts])
+        return SimpleNamespace(
+            natoms=sizes,
+            batch=torch.repeat_interleave(torch.arange(len(sizes)), sizes),
+            atomic_numbers=numbers,
+            charge=sizes * 0,
+            spin=sizes * 0 + 1,
+            dataset=["omol"] * len(sizes),
+        )
+
+    model = eSCNMDMoeBackbone(
+        use_dataset_embedding=False,
+        num_layers=1,
+        sphere_channels=4,
+        hidden_channels=8,
+        num_experts=2,
+        lmax=2,
+        mmax=2,
+    )
+    first = (377, 233)
+    second = (610, 377)
+    model.model_id = "UMA-S-1.2.1"
+    model._merged_composition = model._get_merged_mole_consistency_info(batch([first]))
+    with pytest.raises(MergeMoleConsistencyError, match="Compositions differ"):
+        model._assert_merged_mole_consistency(
+            model._get_merged_mole_consistency_info(batch([second]))
+        )
+    with pytest.raises(MergeMoleConsistencyError, match="same reduced composition"):
+        model._assert_all_mole_info_consistent(batch([first, second]))
+    model.mole_expert_coefficient_norm = _pnorm
+    with pytest.raises(MergeMoleConsistencyError, match="Batch size"):
+        model._assert_merged_mole_consistency(
+            model._get_merged_mole_consistency_info(batch([first, first]))
+        )
+
+
+def test_grouped_mole_chunk_preserves_routing_gradients():
+    sizes = torch.tensor([4, 2, 0, 5, 3])
+    coefficients = torch.randn(5, 3, dtype=torch.float64, requires_grad=True)
+    state = MOLEGlobals(coefficients, sizes, ac_start_idx=3)
+    layer = MOLE(3, 4, 5, state, bias=True).double()
+    x = torch.randn(8, 2, 4, dtype=torch.float64, requires_grad=True)
+    with torch.inference_mode():
+        layer(x)
+    ids = torch.repeat_interleave(torch.arange(5), sizes)[3:11]
+    weights = torch.einsum("be,eoi->boi", coefficients, layer.weights)
+    expected = torch.einsum("bki,boi->bko", x, weights[ids]) + layer.bias
+    actual = layer(x)
+    _, plan = state.row_layout(3, len(x), x.device)
+    assert plan is not None
+    torch.testing.assert_close(actual, expected)
+    variables = (x, coefficients, layer.weights, layer.bias)
+    for a, b in zip(
+        torch.autograd.grad(actual.square().sum(), variables),
+        torch.autograd.grad(expected.square().sum(), variables),
+        strict=True,
+    ):
+        torch.testing.assert_close(a, b)
+    sizes[0] += 1
+    assert state.row_layout(3, len(x), x.device)[1] is not plan

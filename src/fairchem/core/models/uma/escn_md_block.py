@@ -38,9 +38,17 @@ if TYPE_CHECKING:
 
 
 def set_mole_ac_start_index(module: nn.Module, index: int) -> None:
-    for submodule in module.modules():
-        if isinstance(submodule, MOLE):
-            submodule.global_mole_tensors.ac_start_idx = index
+    if not hasattr(module, "_chunk_mole_states"):
+        # Initialize legacy serialized modules and directly constructed blocks.
+        module._chunk_mole_states = tuple(
+            {
+                id(m.global_mole_tensors): m.global_mole_tensors
+                for m in module.modules()
+                if isinstance(m, MOLE)
+            }.values()
+        )
+    for state in module._chunk_mole_states:
+        state.ac_start_idx = index
 
 
 class Edgewise(torch.nn.Module):

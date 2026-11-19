@@ -319,16 +319,27 @@ class UMASFastPytorchBackend(ExecutionBackend):
         for block in model.blocks:
             if not isinstance(block.edge_wise.so2_conv_1, SO2_Conv1_WithRadialBlock):
                 block.edge_wise.so2_conv_1 = convert_so2_conv1(
-                    block.edge_wise.so2_conv_1
+                    block.edge_wise.so2_conv_1, for_inference=True
                 )
             if not isinstance(block.edge_wise.so2_conv_2, SO2_Conv2_InternalBlock):
                 block.edge_wise.so2_conv_2 = convert_so2_conv2(
-                    block.edge_wise.so2_conv_2
+                    block.edge_wise.so2_conv_2, for_inference=True
                 )
+
+            if getattr(model, "compact_angular_weights", False):
+                for conv in (block.edge_wise.so2_conv_1, block.edge_wise.so2_conv_2):
+                    for order in conv.so2_m_conv:
+                        order.compact_weights = True
 
         # Create unified radial MLP for batched computation
         rad_funcs = [block.edge_wise.so2_conv_1.rad_func for block in model.blocks]
+        if all(rad_func is None for rad_func in rad_funcs):
+            return  # Already packed by an earlier preparation.
         model._unified_radial_mlp = UnifiedRadialMLP(rad_funcs)
+        # Packed weights own the prepared radial state. Keeping the source
+        # linears here doubles storage and exposes edits with no effect.
+        for block in model.blocks:
+            block.edge_wise.so2_conv_1.rad_func = None
 
     @staticmethod
     def get_layer_radial_emb(
@@ -380,9 +391,15 @@ class UMASFastPortableBackend(UMASFastPytorchBackend):
             model._portable_geometry = PortableGeometry(model)
 
     @staticmethod
-    def compute_geometry(edge_vectors, model):
+    def compute_geometry(
+        edge_vectors, model, *, distance=None, fold_envelope=False, valid=None
+    ):
         geometry = getattr(model, "_portable_geometry", None)
-        return None if geometry is None else geometry(edge_vectors)
+        if geometry is None:
+            return None
+        return geometry(
+            edge_vectors, distance=distance, fold_envelope=fold_envelope, valid=valid
+        )
 
     @staticmethod
     def validate(lmax, mmax, settings):
@@ -476,18 +493,19 @@ class UMASFastPortableBackend(UMASFastPytorchBackend):
             raise ValueError("portable l=2 edge degree requires three m=0 coefficients")
         wigner = compact_wigner(wigner_inv)
         radial = radial_output.reshape(-1, 3, sphere_channels)
-        blocks = (
-            wigner[:, 0:1, None] * radial[:, 0:1],
-            wigner[:, (2, 5, 8), None] * radial[:, 1:2],
-            wigner[:, (12, 17, 22, 27, 32), None] * radial[:, 2:3],
-        )
-        reduced = [
-            segmented_sum(
-                block.to(x.dtype) / rescale_factor, scatter_target, x.shape[0]
+        reduced = []
+        for degree, columns in enumerate(
+            (slice(0, 1), slice(2, 9, 3), slice(12, 33, 5))
+        ):
+            block = wigner[:, columns, None] * radial[:, degree : degree + 1]
+            reduced.append(
+                x[:, degree**2 : (degree + 1) ** 2]
+                + segmented_sum(
+                    block.to(x.dtype) / rescale_factor, scatter_target, x.shape[0]
+                )
             )
-            for block in blocks
-        ]
-        return x + torch.cat(reduced, dim=1)
+            del block
+        return torch.cat(reduced, dim=1)
 
 
 class UMASFastGPUBackend(UMASFastPytorchBackend):

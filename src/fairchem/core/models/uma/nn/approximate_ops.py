@@ -70,26 +70,32 @@ def compensated_node_sum(values, batch, num_systems):
     empty = values[:0].sum(0, dtype=torch.float32)
     if num_systems == 0:
         return empty.unsqueeze(0)[:0]
+    if len(batch) > 1 and not bool((batch[1:] >= batch[:-1]).all()):
+        order = batch.argsort(stable=True)
+        batch = batch[order]
+        values = values.index_select(0, order)
+    counts = torch.bincount(batch.to(torch.int64), minlength=num_systems).tolist()
     outputs = []
-    for system in range(num_systems):
-        total = values[batch == system].float()
+    for segment in values.split(counts):
+        total = segment.float()
         if len(total) == 0:
             outputs.append(empty)
             continue
         correction = torch.zeros_like(total)
         while len(total) > 1:
-            if len(total) % 2:
-                total = torch.cat((total, torch.zeros_like(total[:1])))
-                correction = torch.cat((correction, torch.zeros_like(correction[:1])))
-            left, right = total[::2], total[1::2]
+            paired = len(total) // 2 * 2
+            left, right = total[:paired:2], total[1:paired:2]
             joined = left + right
             error = torch.where(
                 left.abs() >= right.abs(),
                 (left - joined) + right,
                 (right - joined) + left,
             )
-            correction = correction[::2] + correction[1::2] + error
-            total = joined
+            joined_correction = correction[:paired:2] + correction[1:paired:2] + error
+            if paired < len(total):
+                joined = torch.cat((joined, total[-1:]))
+                joined_correction = torch.cat((joined_correction, correction[-1:]))
+            total, correction = joined, joined_correction
         outputs.append(total[0] + correction[0])
     return torch.stack(outputs)
 
@@ -168,6 +174,31 @@ def _validate_radial_options(points, fast_exp):
         raise ValueError("Choose a Gaussian approximation explicitly")
 
 
+def _sampled_table_error(coefficients, step):
+    # A fixed CPU grid includes the center and endpoints. Report sampled
+    # errors against the analytic function in its normalized coordinate.
+    probe = torch.linspace(-8, 8, 4097, dtype=torch.float64, device="cpu")
+    interval = ((probe + 8) / step).floor().long().clamp(0, len(coefficients) - 1)
+    t = (probe + 8) / step - interval
+    row = coefficients[interval].double()
+    value, d1, d2 = row[:, -1], torch.zeros_like(t), torch.zeros_like(t)
+    for power in range(4, -1, -1):
+        d2, d1, value = (
+            d2 * t + 2 * d1,
+            d1 * t + value,
+            value * t + row[:, power],
+        )
+    exact = (-probe.square()).exp()
+    return {
+        "samples": len(probe),
+        "max_abs_value": float((value - exact).abs().max()),
+        "max_abs_first": float((d1 / step + 2 * probe * exact).abs().max()),
+        "max_abs_second": float(
+            (d2 / step**2 - (4 * probe.square() - 2) * exact).abs().max()
+        ),
+    }
+
+
 class ApproximateGaussian(torch.nn.Module):
     """
     Gaussian radial approximation; geometry, normalization and weights stay FP32.
@@ -210,8 +241,13 @@ class ApproximateGaussian(torch.nn.Module):
                     6 * b0 - 3 * b1 + 0.5 * b2,
                 ),
                 dim=-1,
-            ).to(original.offset)
-            self.register_buffer("table_coefficients", coefficients, persistent=False)
+            ).to(dtype=original.offset.dtype)
+            self.sampled_error = _sampled_table_error(coefficients, self.step)
+            self.register_buffer(
+                "table_coefficients",
+                coefficients.to(original.offset.device),
+                persistent=False,
+            )
 
     @property
     def offset(self):
@@ -231,10 +267,11 @@ class ApproximateGaussian(torch.nn.Module):
         coordinate = (selected + 8) / self.step
         interval = coordinate.floor().long().clamp(0, self.points - 2)
         t = coordinate - interval
-        coefficients = self.table_coefficients[interval]
-        value = coefficients[:, 5]
+        value = self.table_coefficients[:, 5].index_select(0, interval)
         for power in range(4, -1, -1):
-            value = value * t + coefficients[:, power]
+            value = value * t + self.table_coefficients[:, power].index_select(
+                0, interval
+            )
         result = torch.empty_like(normalized)
         result[inside] = value
         result[~inside] = (-normalized[~inside].square()).exp()
@@ -275,6 +312,16 @@ def apply_feature_approximations(backbone, settings) -> dict:
             "exact_fallback": True,
             "smoothness": "C2",
         }
+        if points is not None:
+            table = backbone.distance_expansion
+            if not hasattr(table, "sampled_error"):
+                # Whole-module checkpoints created before error diagnostics.
+                table.sampled_error = _sampled_table_error(
+                    table.table_coefficients.cpu(), table.step
+                )
+            manifest["radial_approximation"]["sampled_normalized_error"] = (
+                table.sampled_error
+            )
     elif isinstance(current, ApproximateGaussian):
         _validate_radial_replacement(current, ApproximateGaussian)
         backbone.distance_expansion = current.original

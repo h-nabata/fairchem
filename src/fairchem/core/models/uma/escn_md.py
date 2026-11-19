@@ -189,6 +189,8 @@ def balance_channels_batched(
     start_idx: int,
     end_idx: int,
     target_offset: float = 0.0,
+    *,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Balance a contiguous range of channels to target sum per system.
 
@@ -210,7 +212,7 @@ def balance_channels_batched(
     Under graph parallelism the per-system sums are partial, so they are
     reduced across the group with a differentiable all-reduce.
     """
-    out_emb = emb.clone()
+    out_emb = emb.clone() if output is None else output
     num_systems = len(natoms)
     n_channels = end_idx - start_idx
 
@@ -355,6 +357,9 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
         graph_edge_order: str = "original",
         hessian_chunk_size: int = 64,
         requested_properties: tuple[str, ...] | None = None,
+        neighbor_cache_max_bytes: int | None = None,
+        compact_angular_weights: bool = False,
+        radial_layer_group_size: int | None = None,
     ) -> None:
         super().__init__()
         self.max_num_elements = max_num_elements
@@ -402,6 +407,9 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
         self.enforce_max_neighbors_strictly = False
         self.neighbor_skin = neighbor_skin
         self.neighbor_cache_entries = neighbor_cache_entries
+        self.neighbor_cache_max_bytes = neighbor_cache_max_bytes
+        self.compact_angular_weights = compact_angular_weights
+        self.radial_layer_group_size = radial_layer_group_size
         self.graph_search_method = graph_search_method
         self.graph_edge_order = graph_edge_order
         self._neighbor_cache = None
@@ -554,6 +562,11 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
             num_channels=self.sphere_channels,
         )
 
+        if self.compact_angular_weights:
+            for module in self.modules():
+                if isinstance(module, SO3_Linear):
+                    module.compact_weights = True
+
         coefficient_index = self.SO3_grid["lmax_lmax"].mapping.coefficient_idx(
             self.lmax, self.mmax
         )
@@ -567,8 +580,42 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
         natoms: torch.Tensor,
         batch: torch.Tensor,
     ) -> torch.Tensor:
+        charge_slice = slice(self.charge_channel_start, self.charge_channel_end)
+        spin_slice = slice(self.spin_channel_start, self.spin_channel_end)
+        charge_width = charge_slice.stop - charge_slice.start
+        spin_width = spin_slice.stop - spin_slice.start
+        disjoint = (
+            charge_slice.stop <= spin_slice.start
+            or spin_slice.stop <= charge_slice.start
+        )
+        if charge_width and spin_width and disjoint:
+            selected = torch.cat(
+                (
+                    x_message_prime[:, 0, charge_slice],
+                    x_message_prime[:, 0, spin_slice],
+                ),
+                dim=-1,
+            )
+            sums = selected.new_zeros((len(natoms), charge_width + spin_width))
+            sums.index_add_(0, batch, selected)
+            if gp_utils.initialized():
+                sums = gp_utils.all_reduce_sum_with_grad(sums)
+            targets = torch.cat(
+                (
+                    charge[:, None].expand(-1, charge_width),
+                    (spin - 1)[:, None].expand(-1, spin_width),
+                ),
+                dim=-1,
+            )
+            balanced = selected - ((sums - targets) / natoms[:, None])[batch]
+            output = x_message_prime.clone()
+            output[:, 0, charge_slice], output[:, 0, spin_slice] = balanced.split(
+                (charge_width, spin_width), dim=-1
+            )
+            return output
+        output = x_message_prime
         if self.charge_channel_end > self.charge_channel_start:
-            x_message_prime = balance_channels_batched(
+            output = balance_channels_batched(
                 emb=x_message_prime,
                 target=charge,
                 natoms=natoms,
@@ -578,16 +625,17 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
                 target_offset=0.0,
             )
         if self.spin_channel_end > self.spin_channel_start:
-            x_message_prime = balance_channels_batched(
-                emb=x_message_prime,
+            output = balance_channels_batched(
+                emb=output,
                 target=spin,
                 natoms=natoms,
                 batch=batch,
                 start_idx=self.spin_channel_start,
                 end_idx=self.spin_channel_end,
                 target_offset=1.0,
+                output=output if output is not x_message_prime else None,
             )
-        return x_message_prime
+        return output
 
     def _get_rotmat_and_wigner(
         self, edge_distance_vecs: torch.Tensor
@@ -621,16 +669,25 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
         # Both Wigner implementations return contiguous matrices or blocks.
         return wigner, wigner_inv
 
-    def _compute_geometry(self, edge_vectors):
+    def _compute_geometry(
+        self, edge_vectors, distance=None, fold_envelope=False, valid=None
+    ):
         """
         Compute the differentiable radial and angular numerical core.
         """
         geometry = getattr(self.backend, "compute_geometry", None)
         if geometry is not None:
-            result = geometry(edge_vectors, self)
+            result = geometry(
+                edge_vectors,
+                self,
+                distance=distance,
+                fold_envelope=fold_envelope,
+                valid=valid,
+            )
             if result is not None:
                 return result
-        distance = edge_vectors.norm(dim=-1)
+        if distance is None:
+            distance = edge_vectors.norm(dim=-1)
         wigner, inverse = self._get_rotmat_and_wigner(edge_vectors)
         return (
             self.distance_expansion(distance),
@@ -686,9 +743,9 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
                     gp_utils.get_gp_world_size(),
                 )[gp_utils.get_gp_rank()]
 
-            assert (
-                node_partition.numel() > 0
-            ), "Looks like there are no atoms in this graph parallel partition. Cannot proceed"
+            assert node_partition.numel() > 0, (
+                "Looks like there are no atoms in this graph parallel partition. Cannot proceed"
+            )
 
         if self.otf_graph:
             pbc = None
@@ -700,9 +757,9 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
                     device=data_dict["pos"].device,
                 )
             else:
-                assert (
-                    "pbc" in data_dict
-                ), "Since always_use_pbc is False, pbc conditions must be supplied by the input data"
+                assert "pbc" in data_dict, (
+                    "Since always_use_pbc is False, pbc conditions must be supplied by the input data"
+                )
                 pbc = data_dict["pbc"]
 
             if (
@@ -712,7 +769,9 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
                 from fairchem.core.graph.neighbor_cache import VerletNeighborCache
 
                 self._neighbor_cache = VerletNeighborCache(
-                    skin=self.neighbor_skin, max_entries=self.neighbor_cache_entries
+                    skin=self.neighbor_skin,
+                    max_entries=self.neighbor_cache_entries,
+                    max_bytes=getattr(self, "neighbor_cache_max_bytes", None),
                 )
             graph_dict = generate_graph(
                 data_dict,
@@ -720,6 +779,7 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
                 max_neighbors=self.max_neighbors,
                 enforce_max_neighbors_strictly=(self.enforce_max_neighbors_strictly),
                 radius_pbc_version=self.radius_pbc_version,
+                geometry_only=True,
                 pbc=pbc,
                 node_partition=node_partition,
                 neighbor_cache=getattr(self, "_neighbor_cache", None),
@@ -727,9 +787,9 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
             )
         else:
             # this assume edge_index is provided
-            assert (
-                "edge_index" in data_dict
-            ), "otf_graph is false, need to provide edge_index as input!"
+            assert "edge_index" in data_dict, (
+                "otf_graph is false, need to provide edge_index as input!"
+            )
 
             # Compute shifts from cell offsets
             if len(data_dict["natoms"]) == 1:
@@ -882,9 +942,13 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
             graph_dict = self._generate_graph(data_dict)
 
         with record_function("obtain wigner"):
+            folded_inverse = getattr(self, "_portable_geometry", None) is not None
             edge_distance_embedding, edge_envelope, wigner, wigner_inv = (
                 self._compute_geometry(
                     graph_dict["edge_distance_vec"],
+                    graph_dict["edge_distance"],
+                    folded_inverse,
+                    graph_dict.get("edge_valid"),
                 )
             )
             coefficient_index = (
@@ -931,25 +995,26 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
 
         # edge degree embedding
         with record_function("edge embedding"):
-            if "edge_valid" in graph_dict:
+            if not folded_inverse and "edge_valid" in graph_dict:
                 edge_envelope = torch.where(
                     graph_dict["edge_valid"].unsqueeze(-1), edge_envelope, 0
                 )
-            source_embedding = self.source_embedding(
-                data_dict["atomic_numbers_full"][graph_dict["edge_index"][0]]
-            )
-            target_embedding = self.target_embedding(
-                data_dict["atomic_numbers_full"][graph_dict["edge_index"][1]]
-            )
+            source_indices, target_indices = data_dict["atomic_numbers_full"][
+                graph_dict["edge_index"]
+            ].unbind(0)
+            source_embedding = self.source_embedding(source_indices)
+            target_embedding = self.target_embedding(target_indices)
             x_edge = torch.cat(
                 (edge_distance_embedding, source_embedding, target_embedding),
                 dim=1,
             )
 
             # Pre-fuse envelope into wigner_inv
-            if wigner_inv.ndim == 3:
-                edge_envelope = edge_envelope.unsqueeze(-1)
-            wigner_inv_envelope = wigner_inv * edge_envelope
+            wigner_inv_envelope = wigner_inv
+            if not folded_inverse:
+                if wigner_inv.ndim == 3:
+                    edge_envelope = edge_envelope.unsqueeze(-1)
+                wigner_inv_envelope = wigner_inv * edge_envelope
 
             x_message = self.edge_degree_embedding(
                 x_message,
@@ -965,26 +1030,30 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
         # Get edge embeddings for each layer
         # General backend: raw x_edge (rad_func computed inside SO2_Convolution)
         # Fast backends: precomputed radials
-        with record_function("layer_radial_emb"):
-            x_edge_per_layer = self.backend.get_layer_radial_emb(
-                x_edge,
-                self,
-                distance_features=edge_distance_embedding,
-                source_indices=data_dict["atomic_numbers_full"][
-                    graph_dict["edge_index"][0]
-                ],
-                target_indices=data_dict["atomic_numbers_full"][
-                    graph_dict["edge_index"][1]
-                ],
-                source_embedding=self.source_embedding.weight,
-                target_embedding=self.target_embedding.weight,
-            )
-
+        unified_radial = getattr(self, "_unified_radial_mlp", None)
+        group_size = getattr(self, "radial_layer_group_size", None) or self.num_layers
         for i in range(self.num_layers):
+            if unified_radial is None:
+                layer_radial = x_edge
+            else:
+                if i % group_size == 0:
+                    with record_function("layer_radial_emb"):
+                        radial_group = self.backend.get_layer_radial_emb(
+                            x_edge,
+                            self,
+                            distance_features=edge_distance_embedding,
+                            source_indices=source_indices,
+                            target_indices=target_indices,
+                            source_embedding=self.source_embedding.weight,
+                            target_embedding=self.target_embedding.weight,
+                            first_layer=i,
+                            end_layer=min(i + group_size, self.num_layers),
+                        )
+                layer_radial = radial_group[i % group_size]
             with record_function(f"message passing {i}"):
                 x_message = self.blocks[i](
                     x_message,
-                    x_edge_per_layer[i],
+                    layer_radial,
                     graph_dict["edge_index"],
                     wigner,
                     wigner_inv_envelope,
@@ -1070,6 +1139,9 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
         for name in (
             "neighbor_skin",
             "neighbor_cache_entries",
+            "neighbor_cache_max_bytes",
+            "compact_angular_weights",
+            "radial_layer_group_size",
             "graph_search_method",
             "graph_edge_order",
             "hessian_chunk_size",

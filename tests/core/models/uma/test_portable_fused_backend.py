@@ -427,3 +427,101 @@ def test_xpu_csr_cache_cross_stream_reuse():
         expected = torch.sort(target, stable=True)[0]
     second_stream.synchronize()
     torch.testing.assert_close(sorted_target, expected)
+
+
+def test_graph_capture_aggregates_changing_indices_without_host_topology(monkeypatch):
+    from fairchem.core.models.uma.nn import portable_wigner as w
+
+    monkeypatch.setattr(
+        w, "get_csr_topology", lambda *_: pytest.fail("capture used cached topology")
+    )
+    target = torch.tensor([0, 0, 1])
+    messages = torch.tensor([[1.0], [2.0], [4.0]])
+    with w.capture_safe_kernels():
+        assert w.segmented_sum(messages, target, 2).flatten().tolist() == [3, 4]
+        target.copy_(torch.tensor([1, 1, 0]))
+        assert w.segmented_sum(messages, target, 2).flatten().tolist() == [4, 3]
+        with w.capture_safe_kernels():
+            assert w._CAPTURE_SAFE.get()
+        assert w._CAPTURE_SAFE.get()
+    assert not w._CAPTURE_SAFE.get()
+
+
+def test_fused_family_switches_independent(monkeypatch):
+    from fairchem.core.models.uma.nn.portable_wigner import fused_policy_key
+
+    monkeypatch.setenv("FAIRCHEM_XPU_FUSED_KERNELS", "1")
+    monkeypatch.delenv("FAIRCHEM_XPU_FUSED_WIGNER", raising=False)
+    monkeypatch.setenv("FAIRCHEM_XPU_FUSED_RADIAL", "0")
+    monkeypatch.setenv("FAIRCHEM_XPU_WIGNER_CSR", "0")
+    assert fused_policy_key()[:3] == (True, False, False)
+    monkeypatch.setenv("FAIRCHEM_XPU_FUSED_WIGNER", "0")
+    monkeypatch.setenv("FAIRCHEM_XPU_FUSED_RADIAL", "1")
+    assert fused_policy_key()[:3] == (False, True, False)
+
+
+@pytest.mark.parametrize(
+    "needs",
+    [
+        (True, True, True, False, False),
+        (False, False, True, True, True),
+        (True, False, False, False, False),
+        (True, True, True, True, True),
+    ],
+)
+def test_chunked_projected_adjoint_selective_gradients_and_hvp(needs):
+    generator = torch.Generator().manual_seed(132)
+    edge = torch.tensor([[0, 1, 0, 2, 1], [1, 2, 2, 0, 1]])
+    inputs = [
+        torch.randn(shape, generator=generator, dtype=torch.double, requires_grad=True)
+        for shape in ((3, 9, 2), (5, 35), (5, 4), (24, 4), (24,))
+    ]
+    x, w, h, weight, bias = inputs
+    outputs = producer_projected_reference(
+        x, edge, w, RadialProjection(h, weight, bias), 2
+    )
+    seed = [
+        torch.randn(t.shape, generator=generator, dtype=t.dtype, requires_grad=True)
+        for t in outputs
+    ]
+    expected = torch.autograd.grad(outputs, inputs, seed, create_graph=True)
+    actual = producer_projected_adjoint(
+        *seed, x, edge, w, h, weight, bias, 2, needs=needs, chunk_edges=2
+    )
+    for needed, ref, grad in zip(needs, expected, actual):
+        if needed:
+            torch.testing.assert_close(grad, ref)
+        else:
+            assert grad is None
+    for gradients in (actual, expected):
+        loss = sum(g.square().sum() for needed, g in zip(needs, gradients) if needed)
+        hvp = torch.autograd.grad(loss, inputs, allow_unused=True, retain_graph=True)
+        if gradients is actual:
+            actual_hvp = hvp
+        else:
+            for first, second in zip(actual_hvp, hvp):
+                if first is None or second is None:
+                    # Native autograd can materialize zero for an unused input.
+                    other = second if first is None else first
+                    if other is not None:
+                        assert torch.count_nonzero(other) == 0
+                else:
+                    torch.testing.assert_close(first, second)
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="requires Intel XPU")
+def test_native_fused_consumer_residual_after_cancellation():
+    pytest.importorskip("triton.language.extra.intel.libdevice")
+    from fairchem.core.models.uma.nn.xpu_wigner_kernels import FusedConsumer
+
+    target = torch.zeros(2, dtype=torch.long, device="xpu")
+    topology = CSRTopologyCache().get(target, 1)
+    wigner = torch.zeros(2, 35, device="xpu")
+    wigner[:, 0] = 1
+    g0, g1, g2 = (torch.zeros(2, width, device="xpu") for width in (3, 4, 2))
+    g0[:, 0] = torch.tensor([2**24, -(2**24)], device="xpu")
+    residual = torch.ones(1, 9, 1, device="xpu")
+    output = FusedConsumer.apply(
+        g0, g1, g2, wigner, target, topology.order, topology.offsets, 1, 1, residual
+    )
+    torch.testing.assert_close(output, residual, rtol=0, atol=0)

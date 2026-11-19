@@ -12,6 +12,8 @@ from __future__ import annotations
 import os
 import threading
 from collections import OrderedDict
+from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass
 
 import torch
@@ -20,6 +22,89 @@ import torch
 M_TO_L = (0, 2, 6, 3, 7, 1, 5, 8, 4)
 L_TO_M = (0, 5, 1, 3, 8, 6, 2, 4, 7)
 _BLOCKS = ((0, 1, 0), (1, 3, 1), (4, 5, 10))
+
+
+_CAPTURE_SAFE = ContextVar("fairchem_capture_safe_wigner", default=False)
+
+
+@contextmanager
+def capture_safe_kernels():
+    """Capture dynamic indices using native gathers and scatter operations."""
+    token = _CAPTURE_SAFE.set(True)
+    try:
+        yield
+    finally:
+        _CAPTURE_SAFE.reset(token)
+
+
+def fused_kernel_enabled(family):
+    return (
+        os.environ.get(
+            f"FAIRCHEM_XPU_FUSED_{family}",
+            os.environ.get("FAIRCHEM_XPU_FUSED_KERNELS", "0"),
+        )
+        == "1"
+    )
+
+
+def csr_chunk_edges():
+    """Maximum edges per CSR partial. Zero preserves the one-stage consumer."""
+    value = os.environ.get("FAIRCHEM_XPU_WIGNER_CSR_CHUNK_EDGES", "0")
+    try:
+        chunk = int(value)
+    except ValueError as exc:
+        raise ValueError(
+            "FAIRCHEM_XPU_WIGNER_CSR_CHUNK_EDGES must be a nonnegative integer"
+        ) from exc
+    if chunk < 0 or chunk > 2**31 - 1:
+        raise ValueError(
+            "FAIRCHEM_XPU_WIGNER_CSR_CHUNK_EDGES must be between 0 and 2**31-1"
+        )
+    return chunk
+
+
+def split_csr_rows(offsets, chunk, output_row_bytes, *, budget=64 << 20):
+    """Partition ordered CSR edges and their partials into contiguous segments."""
+    nodes = offsets.numel() - 1
+    # Budget includes room for integer indexing temporaries. Check the bound
+    # before allocating per-node or per-group vectors.
+    if not chunk or _CAPTURE_SAFE.get() or nodes == 0 or 64 * (nodes + 1) > budget:
+        return None
+    if torch._C._are_functorch_transforms_active():
+        return None
+    lengths = offsets.diff().long()
+    counts = torch.div(lengths - 1, chunk, rounding_mode="floor") + 1
+    groups, largest = torch.stack((counts.sum(), counts.max())).tolist()
+    if (
+        largest < 2
+        or 64 * (nodes + 1) + (groups + 1) * (64 + output_row_bytes) > budget
+    ):
+        return None
+    zero = counts.new_zeros(1)
+    node_offsets = torch.cat((zero, counts.cumsum(0)))
+    node_ids = torch.arange(nodes, device=offsets.device)
+    owner = torch.repeat_interleave(node_ids, counts, output_size=groups)
+    relative = torch.arange(groups, device=offsets.device) - node_offsets[owner]
+    start = offsets[owner] + relative * chunk
+    partial_offsets = torch.cat((start, offsets[-1:])).to(offsets.dtype)
+    return partial_offsets, node_offsets.to(offsets.dtype)
+
+
+def fused_policy_key():
+    from fairchem.core.models.uma.nn.xpu_radial_kernels import _fast_math_enabled
+
+    wigner, radial = fused_kernel_enabled("WIGNER"), fused_kernel_enabled("RADIAL")
+    triton_module = None
+    if wigner or radial:
+        with suppress(ImportError):
+            import triton as triton_module
+    return (
+        wigner,
+        radial,
+        os.environ.get("FAIRCHEM_XPU_WIGNER_CSR", "1") == "1",
+        _fast_math_enabled(triton_module),
+        csr_chunk_edges(),
+    )
 
 
 def compact_wigner(value: torch.Tensor) -> torch.Tensor:
@@ -144,12 +229,14 @@ class CSRTopologyCache:
         self.max_bytes = max_bytes
         self._entries = OrderedDict()
         self._lock = threading.RLock()
+        self._generation = 0
         self.hits = 0
         self.misses = 0
 
     def clear(self):
         with self._lock:
             self._entries.clear()
+            self._generation += 1
 
     @staticmethod
     def _size(topology):
@@ -185,37 +272,45 @@ class CSRTopologyCache:
             target.storage_offset(),
         )
         with self._lock:
-            if version is not None and key in self._entries:
-                topology = self._entries[key]
-                if topology.owner_snapshot is None or torch.equal(
-                    topology.owner_snapshot, target
-                ):
-                    self.hits += 1
+            generation = self._generation
+            topology = self._entries.get(key) if version is not None else None
+        if topology is not None and (
+            topology.owner_snapshot is None
+            or torch.equal(topology.owner_snapshot, target)
+        ):
+            with self._lock:
+                self.hits += 1
+                if self._entries.get(key) is topology:
                     self._entries.move_to_end(key)
-                    topology.wait_on_current_stream()
-                    return topology
-                del self._entries[key]
+            topology.wait_on_current_stream()
+            return topology
+        with self._lock:
             self.misses += 1
-            if target.numel() and not bool(
-                ((target >= 0) & (target < num_nodes)).all()
+        source = target.detach().clone() if target.device.type == "cpu" else target
+        if source.numel() and not bool(((source >= 0) & (source < num_nodes)).all()):
+            raise ValueError("scatter target is outside [0,num_nodes)")
+        order = torch.argsort(source, stable=True)
+        lengths = torch.bincount(source.to(torch.int64), minlength=num_nodes)
+        offsets = torch.cat((lengths.new_zeros(1), lengths.cumsum(0)))
+        index32 = max(num_nodes, target.numel()) <= torch.iinfo(torch.int32).max
+        if index32:
+            order = order.to(torch.int32)
+            offsets = offsets.to(torch.int32)
+        topology = CSRTopology(target, order, lengths, offsets, index32)
+        if target.device.type == "cpu":
+            topology.owner_snapshot = source
+        if target.device.type in {"cuda", "xpu"}:
+            accelerator = getattr(torch, target.device.type)
+            topology.ready_event = accelerator.Event()
+            topology.ready_event.record(accelerator.current_stream(target.device))
+            topology.wait_on_current_stream()
+        with self._lock:
+            if (
+                version is not None
+                and self.max_entries > 0
+                and target._version == version
+                and self._generation == generation
             ):
-                raise ValueError("scatter target is outside [0,num_nodes)")
-            order = torch.argsort(target, stable=True)
-            lengths = torch.bincount(target.to(torch.int64), minlength=num_nodes)
-            offsets = torch.cat((lengths.new_zeros(1), lengths.cumsum(0)))
-            index32 = max(num_nodes, target.numel()) <= torch.iinfo(torch.int32).max
-            if index32:
-                order = order.to(torch.int32)
-                offsets = offsets.to(torch.int32)
-            topology = CSRTopology(target, order, lengths, offsets, index32)
-            if target.device.type == "cpu":
-                topology.owner_snapshot = target.detach().clone()
-            if target.device.type in {"cuda", "xpu"}:
-                accelerator = getattr(torch, target.device.type)
-                topology.ready_event = accelerator.Event()
-                topology.ready_event.record(accelerator.current_stream(target.device))
-                topology.wait_on_current_stream()
-            if version is not None and self.max_entries > 0:
                 # Drop stale versions without retaining each old owner forever.
                 for old in [k for k in self._entries if k[0] == id(target)]:
                     del self._entries[old]
@@ -245,23 +340,34 @@ class _SegmentSum(torch.autograd.Function):
     generate_vmap_rule = True
 
     @staticmethod
-    def forward(values, target, order, lengths, num_nodes):
+    def forward(values, target, order, lengths, offsets, num_nodes):
         sorted_values = values.index_select(0, order)
+        chunk = csr_chunk_edges()
+        if chunk:
+            plan = split_csr_rows(
+                offsets, chunk, values[0].numel() * values.element_size()
+            )
+            if plan is not None:
+                partial_offsets, node_offsets = plan
+                partials = torch.segment_reduce(
+                    sorted_values, "sum", offsets=partial_offsets
+                )
+                return torch.segment_reduce(partials, "sum", offsets=node_offsets)
         return torch.segment_reduce(sorted_values, "sum", lengths=lengths)
 
     @staticmethod
     def setup_context(ctx, inputs, output):
         ctx.save_for_backward(inputs[1])
         ctx.save_for_forward(inputs[1])
-        ctx.num_nodes = inputs[4]
+        ctx.num_nodes = inputs[5]
 
     @staticmethod
     def backward(ctx, grad_output):
         (target,) = ctx.saved_tensors
-        return grad_output.index_select(0, target), None, None, None, None
+        return grad_output.index_select(0, target), None, None, None, None, None
 
     @staticmethod
-    def jvp(ctx, grad_values, _target, _order, _lengths, _num_nodes):
+    def jvp(ctx, grad_values, _target, _order, _lengths, _offsets, _num_nodes):
         (target,) = ctx.saved_tensors
         return grad_values.new_zeros(
             (ctx.num_nodes,) + grad_values.shape[1:]
@@ -276,7 +382,11 @@ def segmented_sum(values, target, num_nodes):
         raise ValueError(
             "Segment values and target indices must have the same leading length"
         )
-    if torch.compiler.is_compiling() or values.device.type == "xpu":
+    if (
+        torch.compiler.is_compiling()
+        or values.device.type == "xpu"
+        or _CAPTURE_SAFE.get()
+    ):
         # segment_reduce kernel coverage varies across XPU releases. The XPU
         # fused consumer below owns CSR rows; this reference retains index_add.
         return values.new_zeros((num_nodes,) + values.shape[1:]).index_add(
@@ -290,6 +400,7 @@ def segmented_sum(values, target, num_nodes):
         topology.owner_snapshot if topology.owner_snapshot is not None else target,
         topology.order,
         topology.lengths,
+        topology.offsets,
         num_nodes,
     )
 
@@ -334,10 +445,13 @@ def _validate_kernel_indices(index, num_nodes):
         if version is not None and key in _VALIDATED_INDICES:
             _VALIDATED_INDICES.move_to_end(key)
             return
-        if index.numel() and bool(((index < 0) | (index >= num_nodes)).any()):
-            raise ValueError("edge indices are outside the node range")
-        size = index.untyped_storage().nbytes()
-        if version is None or size > 32 * 1024 * 1024:
+    if index.numel() and bool(((index < 0) | (index >= num_nodes)).any()):
+        raise ValueError("edge indices are outside the node range")
+    size = index.untyped_storage().nbytes()
+    if version is None or size > 32 * 1024 * 1024:
+        return
+    with _VALIDATION_LOCK:
+        if index._version != version:
             return
         for stale in [k for k in _VALIDATED_INDICES if k[0] == id(index)]:
             del _VALIDATED_INDICES[stale]
@@ -356,7 +470,8 @@ def _validate_kernel_indices(index, num_nodes):
 def _want_xpu_kernel(*values):
     if (
         torch.compiler.is_compiling()
-        or os.environ.get("FAIRCHEM_XPU_FUSED_KERNELS", "0") != "1"
+        or not fused_kernel_enabled("WIGNER")
+        or _CAPTURE_SAFE.get()
         or getattr(torch._C, "_are_functorch_transforms_active", lambda: False)()
         or torch.is_autocast_enabled("xpu")
         or not all(
@@ -453,7 +568,12 @@ def consumer(g0, g1, g2, wigner, target, num_nodes, channels, residual=None):
     residual_compatible = residual is None or (
         residual.device == g0.device and residual.dtype == g0.dtype
     )
-    if _want_xpu_kernel(g0, g1, g2, wigner) and edges and residual_compatible:
+    if (
+        edges
+        and residual_compatible
+        and os.environ.get("FAIRCHEM_XPU_WIGNER_CSR", "1") == "1"
+        and _want_xpu_kernel(g0, g1, g2, wigner)
+    ):
         from fairchem.core.models.uma.nn.xpu_wigner_kernels import FusedConsumer
 
         topology = get_csr_topology(target, num_nodes)
@@ -472,47 +592,130 @@ def consumer(g0, g1, g2, wigner, target, num_nodes, channels, residual=None):
     return consumer_reference(g0, g1, g2, wigner, target, num_nodes, channels, residual)
 
 
-def producer_adjoint(g0, g1, g2, x, edge_index, wigner, radial, channels):
-    """
-    Analytic differentiable adjoint, also used by the optional XPU kernels.
-    """
+def _producer_edge_adjoint(g0, g1, g2, x, edge_index, wigner, radial, channels, needs):
+    """Differentiate only the requested operands before accumulating node gradients."""
+    need_x, need_w, need_r = needs
     edges = edge_index.shape[1]
-    double_channels = 2 * channels
-    x_edge = torch.cat((x[edge_index[0]], x[edge_index[1]]), dim=-1)
-    rotated = _rotate_blocks(x_edge, wigner)
-    packed = _pack_coefficients(rotated)
-    r0, r1, r2 = radial.split((6 * channels, 4 * channels, 2 * channels), -1)
-    d_packed = (g0 * r0, _scale_pair(g1, r1), _scale_pair(g2, r2))
-    d_coeffs = _unpack_coefficients(*d_packed, double_channels)
-    dx_blocks, dw_blocks = [], []
-    for start, width, offset in _BLOCKS:
-        dw = torch.stack(d_coeffs[start : start + width], dim=1)
-        matrix = wigner[:, offset : offset + width * width].reshape(edges, width, width)
-        dx_blocks.append(torch.bmm(matrix.transpose(1, 2), dw))
-        dw_blocks.append(
-            torch.bmm(dw, x_edge[:, start : start + width].transpose(1, 2)).flatten(1)
+    dx_edge = dw = dr = None
+    if need_w or need_r:
+        x_edge = torch.cat((x[edge_index[0]], x[edge_index[1]]), dim=-1)
+    if need_x or need_w:
+        r0, r1, r2 = radial.split((6 * channels, 4 * channels, 2 * channels), -1)
+        d_coeffs = _unpack_coefficients(
+            g0 * r0, _scale_pair(g1, r1), _scale_pair(g2, r2), 2 * channels
         )
-    dx_edge = torch.cat(dx_blocks, dim=1)
-    dx = torch.zeros_like(x).index_add(0, edge_index[0], dx_edge[:, :, :channels])
-    dx = dx.index_add(0, edge_index[1], dx_edge[:, :, channels:])
-    dr = torch.cat(
-        (
-            g0 * packed[0],
-            (g1 * packed[1]).reshape(edges, 2, 4 * channels).sum(dim=1),
-            (g2 * packed[2]).reshape(edges, 2, 2 * channels).sum(dim=1),
-        ),
-        dim=1,
+        dx_blocks, dw_blocks = [], []
+        for start, width, offset in _BLOCKS:
+            adj = torch.stack(d_coeffs[start : start + width], dim=1)
+            if need_x:
+                matrix = wigner[:, offset : offset + width * width].reshape(
+                    edges, width, width
+                )
+                dx_blocks.append(torch.bmm(matrix.transpose(1, 2), adj))
+            if need_w:
+                dw_blocks.append(
+                    torch.bmm(
+                        adj, x_edge[:, start : start + width].transpose(1, 2)
+                    ).flatten(1)
+                )
+        if need_x:
+            dx_edge = torch.cat(dx_blocks, dim=1)
+        if need_w:
+            dw = torch.cat(dw_blocks, dim=1)
+    if need_r:
+        packed = _pack_coefficients(_rotate_blocks(x_edge, wigner))
+        dr = torch.cat(
+            (
+                g0 * packed[0],
+                (g1 * packed[1]).reshape(edges, 2, 4 * channels).sum(dim=1),
+                (g2 * packed[2]).reshape(edges, 2, 2 * channels).sum(dim=1),
+            ),
+            dim=1,
+        )
+    return dx_edge, dw, dr
+
+
+def _accumulate_node_gradient(dx, dx_edge, index, channels):
+    dx = dx.index_add(0, index[0], dx_edge[:, :, :channels])
+    return dx.index_add(0, index[1], dx_edge[:, :, channels:])
+
+
+def producer_adjoint(
+    g0, g1, g2, x, edge_index, wigner, radial, channels, needs=(True, True, True)
+):
+    dx_edge, dw, dr = _producer_edge_adjoint(
+        g0, g1, g2, x, edge_index, wigner, radial, channels, needs
     )
-    return dx, torch.cat(dw_blocks, dim=1), dr
+    dx = (
+        _accumulate_node_gradient(torch.zeros_like(x), dx_edge, edge_index, channels)
+        if needs[0]
+        else None
+    )
+    return dx, dw, dr
 
 
 def producer_projected_adjoint(
-    g0, g1, g2, x, edge_index, wigner, hidden, weight, bias, channels
+    g0,
+    g1,
+    g2,
+    x,
+    edge_index,
+    wigner,
+    hidden,
+    weight,
+    bias,
+    channels,
+    needs=(True, True, True, True, True),
+    *,
+    chunk_edges=None,
 ):
-    """Differentiate the fused radial projection using native FP32 operations."""
-    radial = torch.nn.functional.linear(hidden, weight, bias)
-    dx, dw, dr = producer_adjoint(g0, g1, g2, x, edge_index, wigner, radial, channels)
-    return dx, dw, dr @ weight, dr.transpose(0, 1) @ hidden, dr.sum(dim=0)
+    """Stream projected radial and its adjoint by edge, including higher derivatives."""
+    need_x, need_w, need_h, need_weight, need_bias = needs
+    need_r = need_h or need_weight or need_bias
+    # Bound each [chunk, 12*C] radial temporary to about 4 MiB in FP32.
+    if chunk_edges is None:
+        chunk_edges = max(1, (4 << 20) // (12 * channels * x.element_size()))
+    dx = torch.zeros_like(x) if need_x else None
+    dweight = dbias = None
+    dw_chunks, dh_chunks = [], []
+    # Include an empty slice to preserve shape, dtype and derivative connectivity.
+    for start in range(0, max(1, hidden.shape[0]), chunk_edges):
+        sl = slice(start, start + chunk_edges)
+        h = hidden[sl]
+        index = edge_index[:, sl]
+        radial = (
+            torch.nn.functional.linear(h, weight, bias) if need_x or need_w else None
+        )
+        dx_edge, dw, dr = _producer_edge_adjoint(
+            g0[sl],
+            g1[sl],
+            g2[sl],
+            x,
+            index,
+            wigner[sl],
+            radial,
+            channels,
+            (need_x, need_w, need_r),
+        )
+        if need_x:
+            dx = _accumulate_node_gradient(dx, dx_edge, index, channels)
+        if need_w:
+            dw_chunks.append(dw)
+        if need_h:
+            dh_chunks.append(dr @ weight)
+        if need_weight:
+            part = dr.transpose(0, 1) @ h
+            dweight = part if dweight is None else dweight + part
+        if need_bias:
+            part = dr.sum(dim=0)
+            dbias = part if dbias is None else dbias + part
+    return (
+        dx,
+        torch.cat(dw_chunks) if need_w else None,
+        torch.cat(dh_chunks) if need_h else None,
+        dweight,
+        dbias,
+    )
 
 
 def consumer_adjoint(grad, g0, g1, g2, wigner, target, channels):

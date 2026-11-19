@@ -118,6 +118,17 @@ predictor = pretrained_mlip.get_predict_unit(
 )
 ```
 
+For memory-limited runs, set `compact_angular_weights=True` to apply the
+original real/imaginary SO(2) weights in fast backends and reuse each degree's
+SO(3) weight in the l=2 backbone. Set `radial_layer_group_size=1` to project
+one message-passing layer's radial features at a time. A larger group batches
+more work in the first linear operation. Both options change GEMM shapes and
+can change FP32 rounding and throughput. The prepared radial module owns the
+packed weights in its state dictionary. The byte budget
+`neighbor_cache_max_bytes` limits retained candidate topology, while
+`mole_cache_max_bytes` counts retained merged models and their lazy tensor
+buffers. The active model can exceed its cache budget.
+
 Compilation can then be enabled with `compile=True, compile_scope="blocks"`;
 keep `activation_checkpointing=False`. Test `xpu_graph=True` separately with
 merged MoLE weights. These are opt-in because compilation/capture
@@ -127,9 +138,19 @@ Construct a new predictor after changing settings; changing a local `settings`
 variable does not reconfigure an existing predictor. Prepared-MoLE caching also
 requires a new predictor after model parameters or buffers are modified.
 
-Triton-XPU kernels additionally require `FAIRCHEM_XPU_FUSED_KERNELS=1` and a
-compatible Intel Triton backend. With that environment variable unset, the normal
-portable path remains usable without Triton. The radial GEMM requests IEEE FP32
+With a compatible Intel Triton backend, set `FAIRCHEM_XPU_FUSED_KERNELS=1`
+to enable both experimental kernel families. `FAIRCHEM_XPU_FUSED_RADIAL` and
+`FAIRCHEM_XPU_FUSED_WIGNER` accept `0` or `1` and override that common setting
+independently. For graphs with high-degree target nodes, compare the CSR consumer
+with the native per-edge scatter using `FAIRCHEM_XPU_WIGNER_CSR=0`. This setting
+preserves the fused Wigner producer. To compare ordered reductions, keep CSR
+enabled and set `FAIRCHEM_XPU_WIGNER_CSR_CHUNK_EDGES` to a positive row-size
+threshold (for example, 64). When a node exceeds the threshold, the consumer
+splits each row into consecutive runs of at most that many edges and sums the
+partials in CSR order before adding the residual. The default is 0. If the
+estimated partials and index workspace exceed 64 MiB, it uses the original
+single-stage kernel. Changing the threshold can change FP32 rounding. XPU Graph capture uses native Wigner
+gathers and scatter so replay reads the current edge indices. The radial GEMM requests IEEE FP32
 matrix products; the Wigner kernels use explicit FP32 products and sums. Both
 decline or reject enabled fast-math where detectable; the predictor rejects ambient oneDNN TF32 permission
 instead of changing the application's global precision settings. Their backward
