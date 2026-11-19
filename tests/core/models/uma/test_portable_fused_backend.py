@@ -525,3 +525,68 @@ def test_native_fused_consumer_residual_after_cancellation():
         g0, g1, g2, wigner, target, topology.order, topology.offsets, 1, 1, residual
     )
     torch.testing.assert_close(output, residual, rtol=0, atol=0)
+
+
+def test_two_stage_csr_preserves_groups_residual_and_hvp(monkeypatch):
+    from fairchem.core.models.uma.nn.portable_wigner import (
+        capture_safe_kernels,
+        split_csr_rows,
+    )
+
+    monkeypatch.setenv("FAIRCHEM_XPU_WIGNER_CSR_CHUNK_EDGES", "3")
+    target = torch.tensor([2, 1, 2, 2, 2, 2, 2, 2, 2], dtype=torch.long)
+    topology = CSRTopologyCache().get(target, 4)
+    partial, nodes = split_csr_rows(topology.offsets, 3, 72)
+    assert partial.tolist() == [0, 1, 4, 7, 9]
+    assert nodes.tolist() == [0, 0, 1, 4, 4]
+    assert split_csr_rows(topology.offsets, 8, 72) is None
+    assert split_csr_rows(topology.offsets, 3, 72, budget=400) is None
+    with capture_safe_kernels():
+        assert split_csr_rows(topology.offsets, 3, 72) is None
+
+    gen = torch.Generator().manual_seed(421)
+    inputs = [
+        torch.randn(shape, dtype=torch.double, generator=gen, requires_grad=True)
+        for shape in ((9, 3), (9, 4), (9, 2), (9, 35), (4, 9, 1))
+    ]
+    g0, g1, g2, w, residual = inputs
+    results = []
+    for threshold in ("3", "0"):
+        monkeypatch.setenv("FAIRCHEM_XPU_WIGNER_CSR_CHUNK_EDGES", threshold)
+        y = consumer(g0, g1, g2, w, target, 4, 1, residual)
+        first = torch.autograd.grad(y.square().sum(), inputs, create_graph=True)
+        second = torch.autograd.grad(sum(v.sum() for v in first), inputs)
+        results.append((y, *first, *second))
+    for actual, expected in zip(*results):
+        torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(results[0][0][[0, 3]], residual[[0, 3]])
+
+
+@pytest.mark.skipif(not torch.xpu.is_available(), reason="requires Intel XPU")
+def test_native_two_stage_csr_high_degree_and_empty_rows(monkeypatch):
+    pytest.importorskip("triton.language.extra.intel.libdevice")
+    from fairchem.core.models.uma.nn.xpu_wigner_kernels import FusedConsumer
+
+    target = torch.tensor([2, 1, 2, 2, 2, 2, 2, 2, 2], device="xpu")
+    topo = CSRTopologyCache().get(target, 4)
+    gen = torch.Generator(device="xpu").manual_seed(421)
+    gs = [
+        torch.randn(9, width * 3, device="xpu", generator=gen, requires_grad=True)
+        for width in (3, 4, 2)
+    ]
+    w = torch.randn(9, 35, device="xpu", generator=gen, requires_grad=True)
+    residual = torch.randn(4, 9, 3, device="xpu", generator=gen, requires_grad=True)
+    monkeypatch.setenv("FAIRCHEM_XPU_WIGNER_CSR_CHUNK_EDGES", "3")
+    actual = FusedConsumer.apply(
+        *gs, w, target, topo.order, topo.offsets, 4, 3, residual
+    )
+    expected = consumer_reference(*gs, w, target, 4, 3, residual)
+    values = []
+    for y in (actual, expected):
+        grad = torch.autograd.grad(
+            y.square().sum(), (*gs, w, residual), create_graph=True
+        )
+        hvp = torch.autograd.grad(sum(v.sum() for v in grad), (*gs, w, residual))
+        values.append((y, *grad, *hvp))
+    for a, b in zip(*values):
+        torch.testing.assert_close(a, b, atol=3e-4, rtol=3e-4)
