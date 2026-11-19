@@ -45,6 +45,8 @@ NumPy1.26互換版とIntel向けwheelの導入方法は下記ガイドに記載�
 
 ## Intel XPU対応フォークの導入・運用ガイド
 
+2026年11月19日の[監査項目別の修正・回帰試験・B70での検証手順](docs/core/common_tasks/intel_xpu_implementation_20261119.md)には、厳密FP32/FP64、B系列、2枚のGPUでのバッチ処理、ASE・TorchSim・LAMMPSの変更をまとめています。
+
 このブランチ`intel-xpu-fp32`は、UMAをIntel GPU上のPyTorch XPUで利用するための
 互換性修正、FP32／FP64の共通最適化（A系列）、明示指定する近似計算（B系列）を含みます。
 upstreamのロゴ・タイトルは冒頭に、機能説明・導入例などの本文はこのガイドの後に残しています。
