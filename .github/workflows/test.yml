@@ -67,6 +67,16 @@ jobs:
           - name: core
             paths: tests/core/models tests/core/graph tests/core/calculate tests/core/components tests/core/common tests/core/datasets tests/core/evaluator tests/core/modules tests/core/scripts tests/core/launchers tests/core/test_cli.py tests/core/test_download_large_files.py tests/data tests/demo
 
+        include:
+          - python_version: '3.11'
+            shard:
+              name: regression
+              paths: tests/core/regression_suite
+          - python_version: '3.14'
+            shard:
+              name: regression
+              paths: tests/core/regression_suite
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
@@ -110,6 +120,10 @@ jobs:
             packages/fairchem-data-omol[dev] \
             packages/fairchem-demo-ocpapi[dev] \
             -r tests/requirements.txt # pin test packages
+
+      - name: Install numerical regression dependencies
+        if: matrix.shard.name == 'regression'
+        run: pip install 'packages/fairchem-core[regression]'
 
       - name: Install torchsim (Python 3.12+)
         if: ${{ matrix.python_version == '3.12' || matrix.python_version == '3.13' || matrix.python_version == '3.14' }}

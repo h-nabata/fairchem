@@ -897,6 +897,10 @@ nvidia = [
 ray = [
     { name = "ray", extra = ["serve"] },
 ]
+regression = [
+    { name = "phonopy" },
+    { name = "pymatgen" },
+]
 torchsim = [
     { name = "torch-sim-atomistic", marker = "python_full_version >= '3.12'" },
 ]
@@ -926,9 +930,11 @@ requires-dist = [
     { name = "nvidia-cutlass-dsl", marker = "(platform_machine == 'aarch64' or platform_machine == 'x86_64') and sys_platform == 'linux' and extra == 'nvidia'", specifier = "==4.7.1" },
     { name = "orjson" },
     { name = "pandas", marker = "extra == 'extras'" },
+    { name = "phonopy", marker = "extra == 'regression'", specifier = ">=2.37" },
     { name = "pre-commit", marker = "extra == 'dev'" },
     { name = "pyarrow", marker = "extra == 'extras'" },
     { name = "pymatgen", marker = "extra == 'extras'", specifier = ">=2025.1.9" },
+    { name = "pymatgen", marker = "extra == 'regression'", specifier = ">=2025.1.9" },
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "pytest-cov", marker = "extra == 'dev'" },
     { name = "pyyaml" },
@@ -956,7 +962,7 @@ requires-dist = [
     { name = "websockets" },
     { name = "x3dase", marker = "extra == 'adsorbml'" },
 ]
-provides-extras = ["adsorbml", "dev", "docs", "extras", "nvidia", "ray", "torchsim"]
+provides-extras = ["adsorbml", "dev", "docs", "extras", "nvidia", "ray", "regression", "torchsim"]
 
 [[package]]
 name = "fastapi"
