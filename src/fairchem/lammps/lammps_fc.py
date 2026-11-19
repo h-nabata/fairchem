@@ -40,9 +40,9 @@ def check_input_script(input_script: str):
 
 def check_atom_id_match_masses(types_arr, masses):
     for atom_id in types_arr:
-        assert np.allclose(
-            masses[atom_id], atomic_masses[atom_id], atol=1e-1
-        ), f"Atom {chemical_symbols[atom_id]} (type {atom_id}) has mass {masses[atom_id]} but is expected to have mass {atomic_masses[atom_id]}."
+        assert np.allclose(masses[atom_id], atomic_masses[atom_id], atol=1e-1), (
+            f"Atom {chemical_symbols[atom_id]} (type {atom_id}) has mass {masses[atom_id]} but is expected to have mass {atomic_masses[atom_id]}."
+        )
 
 
 def atomic_data_from_lammps_data(
@@ -54,27 +54,27 @@ def atomic_data_from_lammps_data(
     task_name,
     charge: int = 0,
     spin: int = 0,
+    dtype: torch.dtype = torch.float32,
 ):
-    # TODO: do we need to take of care of wrapping atoms that are outside the cell?
-    pos = torch.as_tensor(x, dtype=torch.float32)
-    pbc = torch.tensor(periodicity, dtype=torch.bool).unsqueeze(0)
-    edge_index = torch.empty((2, 0), dtype=torch.long)
-    cell_offsets = torch.empty((0, 3), dtype=torch.float32)
-    nedges = torch.tensor([0], dtype=torch.long)
-    tags = torch.zeros(nlocal, dtype=torch.long)
-    fixed = torch.zeros(nlocal, dtype=torch.long)
-    batch = torch.zeros(nlocal, dtype=torch.long)
+    pos = torch.as_tensor(x, dtype=dtype, device="cpu")
+    pbc = torch.tensor(periodicity, dtype=torch.bool, device="cpu").unsqueeze(0)
+    edge_index = torch.empty((2, 0), dtype=torch.long, device="cpu")
+    cell_offsets = torch.empty((0, 3), dtype=dtype, device="cpu")
+    nedges = torch.tensor([0], dtype=torch.long, device="cpu")
+    tags = torch.zeros(nlocal, dtype=torch.long, device="cpu")
+    fixed = torch.zeros(nlocal, dtype=torch.long, device="cpu")
+    batch = torch.zeros(nlocal, dtype=torch.long, device="cpu")
     atomic_data = AtomicData(
         pos=pos,
-        atomic_numbers=torch.tensor(atomic_numbers),
-        cell=cell,
+        atomic_numbers=torch.as_tensor(atomic_numbers, dtype=torch.long, device="cpu"),
+        cell=torch.as_tensor(cell, dtype=dtype, device="cpu"),
         pbc=pbc,
-        natoms=torch.tensor([nlocal], dtype=torch.long),
+        natoms=torch.tensor([nlocal], dtype=torch.long, device="cpu"),
         edge_index=edge_index,
         cell_offsets=cell_offsets,
         nedges=nedges,
-        charge=torch.LongTensor([charge]),
-        spin=torch.LongTensor([spin]),
+        charge=torch.tensor([charge], dtype=torch.long, device="cpu"),
+        spin=torch.tensor([spin], dtype=torch.long, device="cpu"),
         fixed=fixed,
         tags=tags,
         batch=batch,
@@ -116,7 +116,7 @@ def lookup_atomic_number_by_mass(mass_arr: np.ndarray | float) -> np.ndarray | i
     min_diffs = np.min(diffs, axis=1)
 
     # Check if any mass is outside tolerance
-    bad_matches = min_diffs > 0.1
+    bad_matches = ~np.isfinite(min_diffs) | (min_diffs > 0.1)
     if np.any(bad_matches):
         bad_masses = mass_arr[bad_matches]
         raise ValueError(f"No atomic mass found within 0.1 of {bad_masses}")
@@ -133,17 +133,14 @@ def lookup_atomic_number_by_mass(mass_arr: np.ndarray | float) -> np.ndarray | i
 
 def separate_run_commands(input_script: str) -> tuple[list[str], list[str]]:
     lines = input_script.splitlines()
-    run_cmds = []
-    script = []
-    for line in lines:
-        if line.startswith("run"):
-            run_cmds.append(line)
-        else:
-            script.append(line)
-    return script, run_cmds
+    for index, line in enumerate(lines):
+        command = line.split("#", 1)[0].split(maxsplit=1)
+        if command and command[0] in {"run", "minimize", "rerun"}:
+            return lines[:index], lines[index:]
+    return lines, []
 
 
-def restricted_cell_from_lammps_box(boxlo, boxhi, xy, yz, xz):
+def restricted_cell_from_lammps_box(boxlo, boxhi, xy, yz, xz, dtype=torch.float32):
     lx = boxhi[0] - boxlo[0]
     ly = boxhi[1] - boxlo[1]
     lz = boxhi[2] - boxlo[2]
@@ -156,26 +153,60 @@ def restricted_cell_from_lammps_box(boxlo, boxhi, xy, yz, xz):
             [xy, ly, 0],  # b vector
             [xz, yz, lz],  # c vector
         ],
-        dtype=torch.float32,
+        dtype=dtype,
+        device="cpu",
     )
     return unit_cell_matrix.unsqueeze(0)
 
 
 class FixExternalCallback:
-    def __init__(self, charge: int = 0, spin: int = 0):
+    def __init__(self, charge: int = 0, spin: int = 0, type_to_atomic_number=None):
         self.charge = charge
         self.spin = spin
+        self.type_to_atomic_number = dict(type_to_atomic_number or {})
+        for type_id, number in self.type_to_atomic_number.items():
+            if (
+                not isinstance(type_id, int)
+                or type_id < 1
+                or not isinstance(number, int)
+                or not 1 <= number < len(atomic_masses)
+            ):
+                raise ValueError(
+                    "Expected positive integer LAMMPS types mapped to atomic numbers 1..118"
+                )
+        self._masses = None
+        self._numbers = None
+
+    def _atomic_numbers(self, atom_types, masses):
+        # LAMMPS exposes a mutable type table. Copy masses, so a later mass
+        # command invalidates just those entries even if LAMMPS reuses its buffer.
+        if self._masses is None or self._masses.shape != masses.shape:
+            self._masses = np.full(masses.shape, np.nan)
+            self._numbers = np.zeros(masses.shape, dtype=np.int64)
+        if np.any(atom_types <= 0) or np.any(atom_types >= len(masses)):
+            raise ValueError("LAMMPS returned an atom type outside the mass table")
+        self._numbers[self._masses != masses] = 0
+        self._masses[:] = masses
+        numbers = self._numbers[atom_types]
+        if np.any(numbers == 0):
+            for type_id in np.unique(atom_types[numbers == 0]):
+                number = self.type_to_atomic_number.get(type_id)
+                if number is None:
+                    number = lookup_atomic_number_by_mass(masses[type_id])
+                self._numbers[type_id] = number
+            numbers = self._numbers[atom_types]
+        return numbers
 
     def __call__(self, lmp, ntimestep, nlocal, tag, x, f):
-        # force copy here, otherwise we can accident modify the original array in lammps
-        # TODO: only need to get atomic numbers once and cache it?
-        # is there a way to check atom types are mapped correctly?
-        atom_type_np = lmp.numpy.extract_atom("type")[:nlocal]
-        masses = lmp.numpy.extract_atom("mass")
-        atomic_mass_arr = masses[atom_type_np]
-        atomic_numbers = lookup_atomic_number_by_mass(atomic_mass_arr)
+        atom_types = lmp.numpy.extract_atom("type")[:nlocal]
+        atomic_numbers = self._atomic_numbers(
+            atom_types, lmp.numpy.extract_atom("mass")
+        )
         boxlo, boxhi, xy, yz, xz, periodicity, box_change = lmp.extract_box()
-        cell = restricted_cell_from_lammps_box(boxlo, boxhi, xy, yz, xz)
+        predictor = lmp._predictor
+        settings = getattr(predictor, "inference_settings", None)
+        dtype = getattr(settings, "base_precision_dtype", torch.float32)
+        cell = restricted_cell_from_lammps_box(boxlo, boxhi, xy, yz, xz, dtype=dtype)
 
         x_wrapped = wrap_positions(
             x, cell=cell.squeeze().numpy(), pbc=periodicity, eps=0
@@ -190,20 +221,32 @@ class FixExternalCallback:
             lmp._task_name,
             charge=self.charge,
             spin=self.spin,
+            dtype=dtype,
         )
-        results = lmp._predictor.predict(atomic_data)
+        if getattr(predictor, "supports_requested_properties", False):
+            properties = (
+                ("energy", "forces", "stress") if box_change else ("energy", "forces")
+            )
+            results = predictor.predict(atomic_data, requested_properties=properties)
+        else:
+            results = predictor.predict(atomic_data)
         assert "forces" in results, "forces must be in results"
-        f[:] = results["forces"].cpu().numpy()[:]
+        f[:] = results["forces"].detach().cpu().numpy()[:]
         lmp.fix_external_set_energy_global(FIX_EXT_ID, results["energy"].item())
 
         # during NPT for example, box_change should be set to 1 by lammps to allow the cell to change
         if box_change:
             # stress is defined as -virial/volume in lammps
-            assert (
-                "stress" in results
-            ), f"stress must be in results to compute virial. Predictios can be enabled by setting `predict_untrained_stress=set('{lmp._task_name}')` "
+            assert "stress" in results, (
+                f"stress must be in results to compute virial. Predictios can be enabled by setting `predict_untrained_stress=set('{lmp._task_name}')` "
+            )
             volume = torch.det(cell).abs().item()
-            v = (-results["stress"].detach().cpu() * volume)[0].tolist()
+            v = (
+                (-results["stress"].detach().cpu() * volume)
+                .reshape(3, 3)
+                .flatten()
+                .tolist()
+            )
             # virials need to be in this order: xx, yy, zz, xy, xz, yz. https://docs.lammps.org/Library_utility.html#_CPPv437lammps_fix_external_set_virial_globalPvPKcPd
             virial_arr = [v[0], v[4], v[8], v[1], v[2], v[5]]
             lmp.fix_external_set_virial_global(FIX_EXT_ID, virial_arr)
@@ -215,6 +258,7 @@ def run_lammps_with_fairchem(
     task_name: str,
     charge: int = 0,
     spin: int = 0,
+    type_to_atomic_number=None,
 ):
     machine = None
     if "LAMMPS_MACHINE_NAME" in os.environ:
@@ -230,7 +274,9 @@ def run_lammps_with_fairchem(
         logging.info(f"Running input script: {input_script}")
         lmp.commands_list(script)
         lmp.command(FIX_EXTERNAL_CMD)
-        fix_external_call_back = FixExternalCallback(charge=charge, spin=spin)
+        fix_external_call_back = FixExternalCallback(
+            charge=charge, spin=spin, type_to_atomic_number=type_to_atomic_number
+        )
         lmp.set_fix_external_callback(FIX_EXT_ID, fix_external_call_back, lmp)
         lmp.commands_list(run_cmds)
     return lmp
@@ -249,6 +295,11 @@ def main(cfg: DictConfig):
         cfg.task_name,
         cfg.charge,
         cfg.spin,
+        **(
+            {"type_to_atomic_number": cfg.type_to_atomic_number}
+            if cfg.get("type_to_atomic_number")
+            else {}
+        ),
     )
     # this is required to cleanup the predictor
     del lmp._predictor

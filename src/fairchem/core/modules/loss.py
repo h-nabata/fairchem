@@ -73,9 +73,9 @@ class DDPMTLoss(nn.Module):
             "per_structure": self.per_structure,
         }
         self.coefficient = coefficient
-        assert self.reduction in list(
-            self.reduction_map.keys()
-        ), "Reduction must be one of: 'mean', 'sum', 'per_structure'"
+        assert self.reduction in list(self.reduction_map.keys()), (
+            "Reduction must be one of: 'mean', 'sum', 'per_structure'"
+        )
 
     def sum(self, input, mult_mask, num_samples, loss, natoms):
         # this sum will reduce the loss down to a single scalar
@@ -84,7 +84,9 @@ class DDPMTLoss(nn.Module):
     def _ddp_mean(self, num_samples, loss):
         # global_samples can be 0 if the head has no valid samples in the batch
         # protect against division by zero
-        global_samples = max(distutils.all_reduce(num_samples, device=loss.device), 1)
+        global_samples = distutils.all_reduce(
+            num_samples, device=loss.device
+        ).clamp_min(1)
         # Multiply by world size since gradients are averaged across DDP replicas
         # warning this is probably incorrect for any model parallel approach
         # Graph parallel note: numerator and denominator are inflated by the same
@@ -106,33 +108,31 @@ class DDPMTLoss(nn.Module):
 
     def per_structure(self, input, mult_mask, num_samples, loss, natoms):
         struct_idx = torch.repeat_interleave(
-            torch.arange(natoms.numel(), device=input.device), natoms
+            torch.arange(natoms.numel(), device=input.device),
+            natoms,
+            output_size=loss.shape[0],
         )
-        assert torch.unique(struct_idx).numel() == natoms.numel()
-        per_struct_loss = torch.zeros(
-            natoms.numel(), device=input.device
-        ).scatter_reduce(0, struct_idx, loss, reduce="sum")
-
-        # normalize by the number of free atoms in the structure
-        free_natoms = torch.bincount(struct_idx[mult_mask], minlength=natoms.numel())
-        zero_idx = torch.where(free_natoms == 0)[0]
-        free_natoms[zero_idx] = natoms[zero_idx]
-        assert torch.all(free_natoms > 0)
-        assert torch.all(free_natoms <= natoms)
-        per_struct_loss = per_struct_loss / free_natoms
-
-        # takes the mean across all systems in the batch
-        num_samples = torch.nonzero(per_struct_loss).numel()
-        return self._ddp_mean(num_samples, per_struct_loss.sum())
+        per_struct_loss = loss.new_zeros(natoms.numel()).scatter_add_(
+            0, struct_idx, loss
+        )
+        free_natoms = torch.zeros_like(natoms).scatter_add_(
+            0, struct_idx, mult_mask.reshape(-1).to(dtype=natoms.dtype)
+        )
+        denom = torch.where(free_natoms == 0, natoms, free_natoms).clamp_min(1)
+        per_struct_loss = per_struct_loss / denom
+        # Preserve the established weighting of structures with zero loss.
+        return self._ddp_mean(
+            torch.count_nonzero(per_struct_loss), per_struct_loss.sum()
+        )
 
     def _reduction(self, input, mult_mask, loss, natoms):
-        num_samples = loss[mult_mask].numel()
-        if self.reduction in self.reduction_map:
-            return self.reduction_map[self.reduction](
-                input, mult_mask, num_samples, loss, natoms
-            )
-        else:
-            raise ValueError("Reduction must be one of: 'mean', 'sum'")
+        num_samples = None
+        if self.reduction == "mean":
+            values_per_mask = loss.numel() // max(1, mult_mask.numel())
+            num_samples = mult_mask.sum(dtype=torch.long) * values_per_mask
+        return self.reduction_map[self.reduction](
+            input, mult_mask, num_samples, loss, natoms
+        )
 
     def forward(
         self,
@@ -142,9 +142,9 @@ class DDPMTLoss(nn.Module):
         natoms: torch.Tensor,
     ):
         # ensure torch doesn't do any unwanted broadcasting
-        assert (
-            input.shape[0] == target.shape[0] == mult_mask.shape[0]
-        ), f"Mismatched shapes: {input.shape} and {target.shape} and {mult_mask.shape}"
+        assert input.shape[0] == target.shape[0] == mult_mask.shape[0], (
+            f"Mismatched shapes: {input.shape} and {target.shape} and {mult_mask.shape}"
+        )
 
         # Ensure torch doesn't do any unwanted broadcasting
         target = target.view(input.shape)
@@ -159,12 +159,7 @@ class DDPMTLoss(nn.Module):
         )
         loss = self._reduction(input, mult_mask, loss, natoms)
 
-        # Zero out nans, if any
-        found_nans_or_infs = not torch.all(loss.isfinite())
-        if found_nans_or_infs is True:
-            logging.warning("Found nans while computing loss")
-            loss = torch.nan_to_num(loss, nan=0.0)
-
+        loss = torch.nan_to_num(loss, nan=0.0)
         return self.coefficient * loss
 
 
@@ -292,9 +287,9 @@ class DDPLoss(nn.Module):
             "mean": self.mean,
             "sum": self.sum,
         }
-        assert self.reduction in list(
-            self.reduction_map.keys()
-        ), "Reduction must be one of: 'mean', 'sum'"
+        assert self.reduction in list(self.reduction_map.keys()), (
+            "Reduction must be one of: 'mean', 'sum'"
+        )
 
     def sum(self, input, loss, natoms):
         # this sum will reduce the loss down to a single scalar
@@ -327,9 +322,9 @@ class DDPLoss(nn.Module):
         natoms: torch.Tensor,
     ):
         # ensure torch doesn't do any unwanted broadcasting
-        assert (
-            input.shape == target.shape
-        ), f"Mismatched shapes: {input.shape} and {target.shape}"
+        assert input.shape == target.shape, (
+            f"Mismatched shapes: {input.shape} and {target.shape}"
+        )
 
         # zero out nans, if any
         found_nans_or_infs = not torch.all(input.isfinite())

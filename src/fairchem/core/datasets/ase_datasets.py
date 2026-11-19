@@ -13,13 +13,16 @@ import logging
 import os
 import warnings
 from abc import ABC, abstractmethod
-from functools import cache, partial
+from functools import partial
 from glob import glob
+from operator import index as integer_index
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import ase
 import numpy as np
+from ase.io.formats import string2index
+from ase.io.trajectory import TrajectoryReader
 from tqdm import tqdm
 
 from fairchem.core.common.registry import registry
@@ -89,8 +92,8 @@ class AseAtomsDataset(BaseDataset, ABC):
 
         self.atoms_transform = atoms_transform
 
-        if self.config.get("keep_in_memory", False):
-            self.__getitem__ = cache(self.__getitem__)
+        # Cache source frames so stochastic transforms are still evaluated per access.
+        self._atoms_cache = {} if config.get("keep_in_memory", False) else None
 
         self.ids = self._load_dataset_get_ids(config)
         self.num_samples = len(self.ids)
@@ -98,7 +101,7 @@ class AseAtomsDataset(BaseDataset, ABC):
         if len(self.ids) == 0:
             raise ValueError(
                 rf"No valid ase data found! \n"
-                f"Double check that the src path and/or glob search pattern gives ASE compatible data: {config['src']}"
+                f"Double check that the src path and/or glob search pattern gives ASE compatible data: {config.get('src', config.get('index_file'))}"
             )
 
     def __getitem__(self, idx):
@@ -106,8 +109,14 @@ class AseAtomsDataset(BaseDataset, ABC):
         if isinstance(idx, slice):
             return [self[i] for i in range(*idx.indices(len(self)))]
 
-        # Get atoms object via derived class method
-        atoms = self.get_atoms(idx)
+        idx = range(len(self))[integer_index(idx)]
+        if self._atoms_cache is None:
+            atoms = self.get_atoms(idx)
+        else:
+            if idx not in self._atoms_cache:
+                self._atoms_cache[idx] = self.get_atoms(idx)
+            # ASE Atoms.copy() drops the calculator, including file-backed labels.
+            atoms = copy.deepcopy(self._atoms_cache[idx])
 
         # Transform atoms object
         if self.atoms_transform is not None:
@@ -217,9 +226,9 @@ class AseReadDataset(AseAtomsDataset):
     """
 
     def _load_dataset_get_ids(self, config) -> list[Path]:
-        self.ase_read_args = config.get("ase_read_args", {})
-
-        if ":" in self.ase_read_args.get("index", ""):
+        self.ase_read_args = dict(config.get("ase_read_args", {}))
+        index = self.ase_read_args.get("index")
+        if isinstance(index, slice) or (isinstance(index, str) and ":" in index):
             raise NotImplementedError(
                 "To read multiple structures from a single file, please use AseReadMultiStructureDataset."
             )
@@ -234,7 +243,7 @@ class AseReadDataset(AseAtomsDataset):
             self.relaxed_ase_read_args = copy.deepcopy(self.ase_read_args)
             self.relaxed_ase_read_args["index"] = "-1"
 
-        return list(self.path.glob(f'{config.get("pattern", "*")}'))
+        return list(self.path.glob(f"{config.get('pattern', '*')}"))
 
     def get_atoms(self, idx: int) -> ase.Atoms:
         try:
@@ -318,67 +327,76 @@ class AseReadMultiStructureDataset(AseAtomsDataset):
     """
 
     def _load_dataset_get_ids(self, config) -> list[str]:
-        self.ase_read_args = config.get("ase_read_args", {})
-        if not hasattr(self.ase_read_args, "index"):
-            self.ase_read_args["index"] = ":"
+        self.ase_read_args = dict(config.get("ase_read_args", {}))
+        selection = self.ase_read_args.pop("index", ":")
+        if isinstance(selection, str):
+            selection = string2index(selection)
+        if not isinstance(selection, (int, slice)) or (
+            isinstance(selection, slice) and selection.step == 0
+        ):
+            raise ValueError(f"Expected an integer or a frame slice, got {selection!r}")
+        self._relaxed_energies = {}
+        ids = []
 
-        if config.get("index_file", None) is not None:
-            with open(config["index_file"]) as f:
-                index = f.readlines()
+        def add_frames(filename, count):
+            frames = range(count)[selection]
+            for frame in (frames,) if isinstance(frames, int) else frames:
+                ids.append(f"{filename} {frame}")
 
-            ids = []
-            for line in index:
-                filename = line.split(" ", maxsplit=1)[0]
-                ids = [f"{filename} {i}" for i in range(int(line.split(" ")[1]))]
-
+        if config.get("index_file") is not None:
+            with open(config["index_file"]) as index_file:
+                for number, line in enumerate(index_file, 1):
+                    if not line.strip():
+                        continue
+                    try:
+                        filename, count_text = line.rstrip().rsplit(maxsplit=1)
+                        count = int(count_text)
+                        if count < 0:
+                            raise ValueError("negative frame count")
+                    except ValueError as err:
+                        raise ValueError(
+                            f"Invalid trajectory index at line {number}"
+                        ) from err
+                    add_frames(filename, count)
             return ids
 
         self.path = Path(config["src"])
         if self.path.is_file():
-            raise ValueError(
-                f"The specified src is not a directory: {self.config['src']}"
-            )
-
-        filenames = list(self.path.glob(f'{config.get("pattern", "*")}'))
-
-        ids = []
-
+            raise ValueError(f"The specified src is not a directory: {self.path}")
+        filenames = self.path.glob(config.get("pattern", "*"))
         if config.get("use_tqdm", True):
             filenames = tqdm(filenames)
         for filename in filenames:
             try:
-                structures = ase.io.read(filename, **self.ase_read_args)
+                if filename.suffix == ".traj" and not self.ase_read_args:
+                    with TrajectoryReader(filename) as trajectory:
+                        count = len(trajectory)
+                else:
+                    count = sum(
+                        1
+                        for _ in ase.io.iread(filename, index=":", **self.ase_read_args)
+                    )
             except Exception as err:
                 warnings.warn(f"{err} occurred for: {filename}", stacklevel=2)
-            else:
-                for i, _ in enumerate(structures):
-                    ids.append(f"{filename} {i}")
-
+                continue
+            add_frames(filename, count)
         return ids
 
     def get_atoms(self, idx: int) -> ase.Atoms:
-        try:
-            std_id = self.ids[idx]
-            identifiers = std_id.split(" ")
-            atoms = ase.io.read("".join(identifiers[:-1]), **self.ase_read_args)[
-                int(identifiers[-1])
-            ]
-        except Exception as err:
-            warnings.warn(f"{err} occurred for: {idx}", stacklevel=2)
-            raise err
-
-        if "sid" not in atoms.info:
-            atoms.info["sid"] = "".join(identifiers[:-1])
-        if "fid" not in atoms.info:
-            atoms.info["fid"] = int(identifiers[-1])
-
+        filename, frame = self.ids[idx].rsplit(maxsplit=1)
+        atoms = ase.io.read(filename, index=int(frame), **self.ase_read_args)
+        atoms.info.setdefault("sid", filename)
+        atoms.info.setdefault("fid", int(frame))
         return atoms
 
     def get_relaxed_energy(self, identifier) -> float:
-        relaxed_atoms = ase.io.read(
-            "".join(identifier.split(" ")[:-1]), **self.ase_read_args
-        )[-1]
-        return relaxed_atoms.get_potential_energy(apply_constraint=False)
+        filename, _ = identifier.rsplit(maxsplit=1)
+        if filename not in self._relaxed_energies:
+            atoms = ase.io.read(filename, index=-1, **self.ase_read_args)
+            self._relaxed_energies[filename] = atoms.get_potential_energy(
+                apply_constraint=False
+            )
+        return self._relaxed_energies[filename]
 
 
 @registry.register_dataset("ase_db")
@@ -452,7 +470,7 @@ class AseDBDataset(AseAtomsDataset):
         elif os.path.isfile(config["src"]):
             filepaths = [config["src"]]
         elif os.path.isdir(config["src"]):
-            filepaths = sorted(glob(f'{config["src"]}/*'))
+            filepaths = sorted(glob(f"{config['src']}/*"))
         else:
             filepaths = sorted(glob(config["src"]))
 

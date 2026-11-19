@@ -198,9 +198,9 @@ def test_scaled_positions_lammps_vs_ase(cell_name, cell, fractional_positions):
         wrapped_original = normalize_fractional(fractional_positions)
         wrapped_ase = normalize_fractional(ase_scaled_positions)
 
-        assert np.allclose(
-            wrapped_ase, wrapped_original, atol=1e-5
-        ), f"Cell {cell_name}: Scaled positions don't match.\nASE: {wrapped_ase}\nOriginal: {wrapped_original}"
+        assert np.allclose(wrapped_ase, wrapped_original, atol=1e-5), (
+            f"Cell {cell_name}: Scaled positions don't match.\nASE: {wrapped_ase}\nOriginal: {wrapped_original}"
+        )
 
         lmp.close()
 
@@ -296,3 +296,85 @@ def test_lammps_hydra_entrypoint_startup(monkeypatch, tmp_path):
     assert run_args["charge"] == 0
     assert run_args["spin"] == 1
     assert not hasattr(lammps_state["lmp"], "_predictor")
+
+
+def test_run_boundary_preserves_script_and_non_run_commands():
+    prefix = ["units metal", "run_style verlet", "# run 10"]
+    rest = ["   run 10", "velocity all scale 600", "minimize 0 0 10 10", "run 20"]
+    assert lammps_fc.separate_run_commands("\n".join(prefix + rest)) == (prefix, rest)
+
+
+def test_callback_mass_table_and_fp64(monkeypatch):
+    import torch
+
+    cb = lammps_fc.FixExternalCallback(type_to_atomic_number={3: 1})
+    masses = np.array([0.0, 12.011, 15.999, 2.014, 0.0])
+    types = np.array([2, 1, 2, 3])
+    original = lammps_fc.lookup_atomic_number_by_mass
+    calls = []
+
+    def lookup(mass):
+        calls.append(float(mass))
+        return original(mass)
+
+    monkeypatch.setattr(lammps_fc, "lookup_atomic_number_by_mass", lookup)
+    assert cb._atomic_numbers(types, masses).tolist() == [8, 6, 8, 1]
+    cb._atomic_numbers(types, masses)
+    assert len(calls) == 2
+    masses[1] = 14.007
+    assert cb._atomic_numbers(types, masses).tolist() == [8, 7, 8, 1]
+    assert len(calls) == 3
+    value = 1.0 + 2**-32
+    cell = restricted_cell_from_lammps_box([0] * 3, [value] * 3, 0, 0, 0, torch.float64)
+    data = lammps_fc.atomic_data_from_lammps_data(
+        [[value] * 3], [1], 1, cell, [True] * 3, "omat", dtype=torch.float64
+    )
+    assert data.cell[0, 0, 0].item() == data.pos[0, 0].item() == value
+    assert data.cell_offsets.dtype == torch.float64
+
+
+def test_lammps_callback_repeated_runs_preserve_types_and_precision(tmp_path):
+    from types import SimpleNamespace
+    import torch
+
+    class Predictor:
+        supports_requested_properties = True
+        inference_settings = SimpleNamespace(base_precision_dtype=torch.float64)
+
+        def __init__(self):
+            self.steps = []
+
+        def predict(self, data, requested_properties):
+            self.steps.append(
+                (data.atomic_numbers.tolist(), data.pos.dtype, requested_properties)
+            )
+            return {"energy": data.pos.sum() * 0, "forces": torch.zeros_like(data.pos)}
+
+    predictor = Predictor()
+    script = tmp_path / "two_runs.in"
+    script.write_text(
+        "\n".join(
+            (
+                "units metal",
+                "atom_style atomic",
+                "boundary p p p",
+                "region sim block 0 5 0 5 0 5",
+                "create_box 1 sim",
+                "create_atoms 1 single 1 1 1",
+                "mass 1 12.011",
+                "pair_style zero 2.0",
+                "pair_coeff * *",
+                "run 0",
+                "mass 1 15.999",
+                "run 0",
+            )
+        )
+    )
+    lmp = lammps_fc.run_lammps_with_fairchem(predictor, str(script), "omat")
+    try:
+        assert predictor.steps == [
+            ([6], torch.float64, ("energy", "forces")),
+            ([8], torch.float64, ("energy", "forces")),
+        ]
+    finally:
+        lmp.close()
