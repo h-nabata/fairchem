@@ -1,7 +1,7 @@
 # Experimental Intel XPU inference
 
 This branch adds single-device UMA inference through PyTorch's native `xpu`
-backend. It targets FP32 model parameters and inputs. It has **not yet been
+backend. It includes strict FP32 and an opt-in FP64 preset. It has **not yet been
 validated on an Intel Arc Pro B70**: CPU regression tests and simulated device
 dispatch cannot establish real XPU kernel correctness or performance.
 
@@ -21,21 +21,18 @@ prebuilt wheels because it can introduce version conflicts. IPEX is not
 required. From this repository:
 
 ```bash
-uv venv --python 3.12 .venv-xpu
-uv pip install --python .venv-xpu/bin/python 'torch==2.15.0' \
-    --index https://download.pytorch.org/whl/xpu
-uv pip install --python .venv-xpu/bin/python -e packages/fairchem-core
-.venv-xpu/bin/python -c 'import torch; print(torch.__version__); print(torch.xpu.is_available())'
+UV_PROJECT_ENVIRONMENT="$PWD/.venv-xpu" uv sync --locked --project packages/fairchem-core-xpu --python 3.12
+.venv-xpu/bin/python -c 'import torch; print(torch.__version__, torch.xpu.is_available())'
 ```
 
-Install the XPU wheel first so the editable install reuses it. The existing
-`uv sync` defaults select CUDA and should not be used for this environment.
-The CPU/CUDA dependency groups keep PyTorch 2.13. This branch widens the
-package requirement to `>=2.13,<2.16`; this is experimental compatibility,
-not a claim that every training, CUDA or compiled path is tested on all three
-minor versions. Upstream's Linux package dependencies still install NVIDIA
-libraries for other features. Their presence does not make UMA execute on
-CUDA, and this branch does not remove those dependencies globally.
+The Intel-only package uses the same source tree and import names as
+`fairchem-core`. Its metadata pins the XPU build of PyTorch and moves CUDA
+graph v3, NVIDIA D3 and Nitro dependencies into the optional `nvidia` extra.
+Use a separate environment for each build. The regular package still installs
+its CUDA dependencies. Its default uv group remains `cu130`; select
+`--no-default-groups --group xpu` on the regular project if you also need
+the standard dependency set with Intel PyTorch. A lock in either project
+applies to that specific project.
 
 ## FP32 calculation
 
@@ -88,8 +85,10 @@ as reporting the device's `has_fp64` property when available.
 
 MoLE merging now preserves the loaded parameter and buffer dtypes, including
 mixed FP32/FP64 buffers. Synthetic CPU FP64 merged/unmerged calculations are
-covered by regression tests. The supported XPU network precision remains
-FP32; those CPU checks do not establish full FP64 network support on Intel GPUs.
+covered by regression tests. Select `inference_settings="xpu-fp64"` to run the network in double precision.
+The loader checks the required device operations. For each checkpoint and
+driver, compare energy, forces and stress against a CPU FP64 reference before
+using this mode for production calculations.
 
 ## Hardware acceptance test
 
