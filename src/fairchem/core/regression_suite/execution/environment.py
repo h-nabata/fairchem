@@ -40,6 +40,8 @@ def execution_environment(device: str) -> dict[str, Any]:
             accelerator_name=properties.name,
             compute_capability=[properties.major, properties.minor],
         )
+    elif parsed.type == "xpu":
+        result["accelerator_name"] = torch.xpu.get_device_name(parsed)
     return result
 
 

@@ -79,22 +79,22 @@ def _benchmark_nve(
     dynamics = VelocityVerlet(benchmark_atoms, timestep_fs * units.fs)
     if warmup_steps:
         dynamics.run(warmup_steps)
-    is_cuda = device.type == "cuda"
-    if is_cuda:
-        torch.cuda.synchronize(device)
-        torch.cuda.reset_peak_memory_stats(device)
+    backend = getattr(torch, device.type) if device.type in {"xpu", "cuda"} else None
+    if backend is not None:
+        backend.synchronize(device)
+        backend.reset_peak_memory_stats(device)
     start = time.perf_counter()
     dynamics.run(steps)
-    if is_cuda:
-        torch.cuda.synchronize(device)
+    if backend is not None:
+        backend.synchronize(device)
     elapsed = time.perf_counter() - start
     if elapsed <= 0.0:
         raise ValueError("inference benchmark duration must be positive")
     milliseconds_per_step = 1000.0 * elapsed / steps
     nanoseconds_per_day = steps / elapsed * timestep_fs * 24.0 * 3600.0 / 1.0e6
     peak_memory = None
-    if is_cuda:
-        peak_memory = torch.cuda.max_memory_allocated(device) / 1024.0**2
+    if backend is not None:
+        peak_memory = backend.max_memory_allocated(device) / 1024.0**2
     return milliseconds_per_step, nanoseconds_per_day, peak_memory
 
 

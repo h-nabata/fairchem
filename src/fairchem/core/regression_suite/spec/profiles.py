@@ -95,8 +95,7 @@ def build_inference_settings(
         explicit.pop("_target_", None)
         return dataclasses.replace(
             guess_inference_settings(str(profile.preset)),
-            **explicit,
-            **overrides,
+            **(explicit | dict(overrides)),
         )
     settings_config = OmegaConf.merge(
         OmegaConf.create(explicit),

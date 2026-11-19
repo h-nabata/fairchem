@@ -80,13 +80,26 @@ def resolve_device(device: str, run_on: str, *, source: str = "--device cuda") -
     has a visible GPU and the CPU otherwise. ``source`` names what asked for
     the device in the error raised when a local CUDA run has no GPU.
     """
-    local_gpu = run_on == "local" and torch.cuda.is_available()
     if device == "auto":
-        return "cuda" if run_on == "slurm" or local_gpu else "cpu"
-    if device == "cuda" and run_on == "local" and not local_gpu:
-        raise DeviceUnavailableError(
-            f"{source} needs a visible GPU to run locally, and this host has none"
-        )
+        return "cuda" if run_on == "slurm" or torch.cuda.is_available() else "cpu"
+    try:
+        parsed = torch.device(device)
+    except (RuntimeError, ValueError) as err:
+        raise CommandError(f"Invalid accelerator device {device!r}") from err
+    if parsed.type not in {"cpu", "cuda", "xpu"} or (
+        parsed.type == "cpu" and parsed.index is not None
+    ):
+        raise CommandError(f"Unsupported regression device {device!r}")
+    if parsed.type in {"cuda", "xpu"} and run_on == "local":
+        backend = getattr(torch, parsed.type, None)
+        if backend is None or not backend.is_available():
+            raise DeviceUnavailableError(
+                f"{source} needs a visible GPU to run locally, and this host has none"
+            )
+        if parsed.index is not None and parsed.index >= backend.device_count():
+            raise DeviceUnavailableError(f"No visible {device} for this run")
+        if parsed.type == "xpu" and parsed.index is None:
+            return f"xpu:{backend.current_device()}"
     return device
 
 

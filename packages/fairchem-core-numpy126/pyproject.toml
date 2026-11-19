@@ -51,6 +51,7 @@ ray = ["ray[serve]>=2.56.1"]
 
 [project.scripts]
 fairchem = "fairchem.core._cli:main"
+fairchem-regression = "fairchem.core.regression_suite.cli:main"
 
 [project.urls]
 repository = "https://github.com/facebookresearch/fairchem"

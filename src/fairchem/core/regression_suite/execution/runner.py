@@ -157,7 +157,7 @@ def _performance_sidecar(
     CPU runs omit the metrics they cannot measure, such as GPU memory.
     """
     metric_specs = suite.performance_metrics
-    if torch.device(identity["device"]).type != "cuda":
+    if torch.device(identity["device"]).type == "cpu":
         populated = {sample["metric"] for sample in samples}
         metric_specs = {
             name: spec for name, spec in metric_specs.items() if name in populated
@@ -195,12 +195,15 @@ def _validate_effective_settings(predictor, expected: Mapping[str, Any]) -> None
     )
 
 
-def _release_predictor(*, compiled: bool) -> None:
+def _release_predictor(*, compiled: bool, device: str) -> None:
     if compiled:
         torch.compiler.reset()
     gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    parsed = torch.device(device)
+    if parsed.type in {"cuda", "xpu"}:
+        backend = getattr(torch, parsed.type)
+        with backend.device(parsed):
+            backend.empty_cache()
 
 
 def _smoke_cases(
@@ -357,7 +360,7 @@ def run_suite(config: DictConfig | Mapping[str, Any]) -> dict[str, Any]:
         records.extend(group_records)
         samples.extend(group_samples)
         del predictor
-        _release_predictor(compiled=settings.compile)
+        _release_predictor(compiled=settings.compile, device=identity["device"])
     sidecar = None
     if identity["role"] != "reference" and not smoke and shard_index is None:
         sidecar = _performance_sidecar(suite, samples, identity=identity)

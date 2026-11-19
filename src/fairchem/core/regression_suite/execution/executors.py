@@ -55,7 +55,9 @@ def create_slurm_executor(
         "mem_gb": resources.mem_gb,
         "timeout_min": resources.timeout_hr * 60,
         "slurm_partition": resources.partition,
-        "gpus_per_node": gpus_per_node if device == "cuda" else 0,
+        "gpus_per_node": gpus_per_node
+        if device.split(":")[0] in {"cuda", "xpu"}
+        else 0,
         "cpus_per_task": resources.cpus_per_task,
         "tasks_per_node": 1,
         "nodes": 1,
@@ -171,6 +173,12 @@ class LocalExecutor:
             workers = min(task_count, max(1, _cpu_count() // _CPU_TASK_THREADS))
             threads = os.environ.get("OMP_NUM_THREADS", str(_CPU_TASK_THREADS))
             return [{"CUDA_VISIBLE_DEVICES": "", "OMP_NUM_THREADS": threads}] * workers
+        if self.device.split(":")[0] == "xpu":
+            # Preserve the parent visibility and the predictor's ordinal.
+            # One worker owns this GPU; callers can launch another on xpu:1.
+            return [{}]
+        if self.device.startswith("cuda:"):
+            return [{}]
         gpus = visible_gpus()
         if not gpus:
             raise RuntimeError("local GPU tasks require a visible CUDA device")

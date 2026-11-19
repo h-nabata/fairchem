@@ -52,3 +52,24 @@ def test_profiles_build_valid_settings_and_declare_unsupported_suites(profile):
         elastic.compile or elastic.execution_mode == "umas_fast_gpu"
     )
     assert "finite-difference-frequencies" not in unsupported
+
+
+def test_xpu_ordinal_and_cross_device_reference(monkeypatch):
+    import torch
+    from fairchem.core.regression_suite.cli import _parser
+    from fairchem.core.regression_suite.execution.executors import LocalExecutor
+    from fairchem.core.regression_suite.execution.settings import (
+        DeviceUnavailableError,
+        resolve_device,
+    )
+
+    monkeypatch.setattr(torch.xpu, "is_available", lambda: True)
+    monkeypatch.setattr(torch.xpu, "device_count", lambda: 2)
+    monkeypatch.setattr(torch.xpu, "current_device", lambda: 1)
+    assert resolve_device("xpu", "local") == "xpu:1"
+    assert resolve_device("xpu:0", "local") == "xpu:0"
+    with pytest.raises(DeviceUnavailableError):
+        resolve_device("xpu:2", "local")
+    assert _parser().parse_args(["full", "xpu", "--device", "xpu:1"]).device == "xpu:1"
+    worker = LocalExecutor(".", name="test", gpus_per_node=1, device="xpu:1")
+    assert worker._slots(3) == [{}]

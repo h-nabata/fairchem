@@ -667,6 +667,7 @@ def load_candidate_launch_manifest(candidate_dir: str | Path) -> dict[str, Any]:
 
 def launch_candidate(
     *,
+    device: str | None = None,
     baseline_dir: str | Path,
     baseline_source: str,
     candidate_dir: str | Path,
@@ -716,7 +717,7 @@ def launch_candidate(
             "run_name": run_name,
             "status": "planned",
             "executor": executor,
-            "device": baseline["device"],
+            "device": device or baseline["device"],
             "scope": baseline["scope"],
             "git_commit": commit,
             "baseline_dir": str(baseline_root),

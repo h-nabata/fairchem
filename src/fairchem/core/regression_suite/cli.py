@@ -471,7 +471,11 @@ def _fast(args: argparse.Namespace, settings: DictConfig, output: TextIO) -> int
         run_fast,
         output,
         run_on=run_on,
-        device=_baseline_device(baseline, run_on),
+        device=(
+            resolve_device(args.device, run_on, source=args.device)
+            if args.device
+            else _baseline_device(baseline, run_on)
+        ),
         group=baseline_run_directory(resolved.path).name,
         baseline=baseline_provenance(baseline, resolved.path, suites),
         baseline_dir=resolved.path,
@@ -491,7 +495,11 @@ def _full(args: argparse.Namespace, settings: DictConfig, output: TextIO) -> int
     _print_baseline(resolved, baseline)
     repo_dir = checkout_root()
     run_on = resolve_run_on(args.run_on)
-    _baseline_device(baseline, run_on)
+    device = (
+        resolve_device(args.device, run_on, source=args.device)
+        if args.device
+        else _baseline_device(baseline, run_on)
+    )
     run = f"{_short_commit(repo_dir)}-{_timestamp()}"
     name = f"{args.profile}-{run}"
     candidate_dir = artifact_root() / "candidates" / name
@@ -501,6 +509,7 @@ def _full(args: argparse.Namespace, settings: DictConfig, output: TextIO) -> int
             baseline_dir=resolved.path,
             baseline_source=resolved.source,
             candidate_dir=candidate_dir,
+            device=device,
             report_dir=report_dir,
             checkpoint=args.checkpoint,
             checkpoint_id=args.checkpoint_id,
@@ -715,10 +724,7 @@ def _run(args: argparse.Namespace, _settings: DictConfig) -> int:
     return 0
 
 
-_DEVICES = ("auto", "cpu", "cuda")
-_DEVICE_HELP = (
-    "where tasks run (default auto: cuda on SLURM, or locally when a GPU is visible)"
-)
+_DEVICE_HELP = "auto, cpu, cuda, or an explicit Intel device, for example xpu:1"
 _BASELINE_HELP = (
     "baseline reference: hf:ORG/REPO/PATH[@REVISION], "
     "wandb:[ENTITY/PROJECT/]NAME[:ALIAS], a local name or path, or current "
@@ -761,9 +767,7 @@ def _parser() -> argparse.ArgumentParser:
         "never becomes current or is published",
     )
     baseline.add_argument("--run-on", choices=("slurm", "local"), default="slurm")
-    baseline.add_argument(
-        "--device", choices=_DEVICES, default="auto", help=_DEVICE_HELP
-    )
+    baseline.add_argument("--device", default="auto", help=_DEVICE_HELP)
     baseline.add_argument("--wait", action="store_true", help="wait for SLURM jobs")
     baseline.add_argument(
         "--wandb",
@@ -814,9 +818,11 @@ def _parser() -> argparse.ArgumentParser:
     checks["quick"].add_argument(
         "--checkpoint-id", help="identity for a checkpoint path"
     )
-    checks["quick"].add_argument(
-        "--device", choices=_DEVICES, default="auto", help=_DEVICE_HELP
-    )
+    checks["quick"].add_argument("--device", default="auto", help=_DEVICE_HELP)
+    for name in ("fast", "full"):
+        checks[name].add_argument(
+            "--device", help="candidate device (default: baseline device)"
+        )
     for check in checks.values():
         check.add_argument(
             "--wandb",
