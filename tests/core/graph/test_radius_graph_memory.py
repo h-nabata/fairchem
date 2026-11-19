@@ -181,7 +181,16 @@ def test_sparse_grid_does_not_pad_vacuum_to_densest_bucket():
     data = _data([atoms])
     with _LargestTensor() as sizes:
         edges, cells, neighbors = radius_graph_pbc_v2(data, 3.0, 100)
-    assert _edges_as_tuples(edges, cells) == _ase_edges([atoms], 3.0)
+    # Every pair in the 0.2-wide cluster is within the cutoff. The distant
+    # atom has no neighbors. ASE's reference neighbor list also pads the
+    # vacuum to the most occupied bin and can exhaust memory on this fixture.
+    expected = [
+        (source, target, 0, 0, 0)
+        for source in range(64)
+        for target in range(64)
+        if source != target
+    ]
+    assert _edges_as_tuples(edges, cells) == expected
     assert neighbors.tolist() == [64 * 63]
     # All actual candidates fit well below this limit. The old representation
     # allocates 65 * 125 * 64 = 520,000 int64 entries for padded candidates.

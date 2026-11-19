@@ -17,6 +17,7 @@ from fairchem.core.datasets.collaters.simple_collater import data_list_collater
 from fairchem.core.graph.geometry import (
     compute_minkowski_op,
     minimum_image_displacement,
+    wrap_positions_torch,
 )
 
 _ORTHO_CELL = torch.diag(
@@ -81,6 +82,61 @@ def _assert_matches_general_find_mic(
 def test_minimum_image_matches_general_find_mic(cell, pbc, dr):
     batch = torch.zeros(dr.shape[0], dtype=torch.long)
     _assert_matches_general_find_mic(dr, cell, pbc, batch)
+
+
+@pytest.mark.parametrize("cell", [_ORTHO_CELL, _SKEWED_CELL])
+@pytest.mark.parametrize("per_atom_flags", [False, True])
+def test_shared_cell_wraps_all_vectors_without_explicit_batch(cell, per_atom_flags):
+    dr = torch.tensor(
+        [[12.2, 0.1, 1.0], [18.0, 7.7, -3.5], [-13.1, 0.5, 27.0]], dtype=cell.dtype
+    )
+    flags = torch.tensor([[True, True, False]])
+    pbc = torch.cat((flags, ~flags, flags)) if per_atom_flags else flags
+    expected = torch.cat(
+        [
+            minimum_image_displacement(
+                vector[None], cell, flag[None], torch.zeros(1, dtype=torch.long)
+            )
+            for vector, flag in zip(dr, pbc.expand(len(dr), -1), strict=True)
+        ]
+    )
+    torch.testing.assert_close(minimum_image_displacement(dr, cell, pbc), expected)
+
+
+@pytest.mark.parametrize("pbc", [[True, False, False], [True, True, False]])
+def test_minimum_image_ignores_large_common_nonperiodic_norm(pbc):
+    cell = torch.tensor([[[1.0, 1.0, 0.0], [-1.0, 1.0, 0.0], [0.0, 0.0, 9.0]]])
+    dr = torch.tensor([[0.2, 0.2, 10000.0]])
+    torch.testing.assert_close(
+        minimum_image_displacement(dr, cell, torch.tensor(pbc)), dr
+    )
+
+
+def test_minimum_image_promotes_displacements_with_higher_precision_cell():
+    dr = torch.tensor([[12.0, 0.0, 0.0], [23.0, 0.0, 0.0]], dtype=torch.float32)
+    expected = torch.tensor([[2.0, 0.0, 0.0], [3.0, 0.0, 0.0]], dtype=torch.float64)
+    torch.testing.assert_close(
+        minimum_image_displacement(dr, _ORTHO_CELL, torch.tensor([True, False, False])),
+        expected,
+    )
+
+
+@pytest.mark.parametrize("complete", [False, True])
+def test_wrapping_narrow_skew_cell_with_another_incomplete_cell(complete):
+    cells = torch.tensor(
+        [
+            [[1.0, 0.0, 0.0], [1.0, 1e-4, 0.0], [0.0, 0.0, 2.0 if complete else 0.0]],
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]],
+        ]
+    )
+    pos = torch.tensor([[3.0, 0.00015, 0.4], [0.1, 3.0, 2.0]], requires_grad=True)
+    pbc = torch.tensor([[True, True, complete], [True, True, False]])
+    wrapped = wrap_positions_torch(pos, cells, pbc)
+    expected = torch.tensor([[1.0, 0.00005, 0.4], [0.1, 0.0, 2.0]])
+    torch.testing.assert_close(wrapped, expected)
+    torch.testing.assert_close(
+        torch.autograd.grad(wrapped.sum(), pos)[0], torch.ones_like(pos)
+    )
 
 
 # ── Precomputed minkowski_op ──

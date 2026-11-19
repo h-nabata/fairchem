@@ -14,8 +14,9 @@ from collections import OrderedDict
 import torch
 
 from fairchem.core.graph.radius_graph_pbc import (
-    get_max_neighbors_mask,
+    get_counts,
     radius_graph_pbc_v2,
+    sum_partitions,
     system_pbc_flags,
     validate_graph_parameters,
 )
@@ -31,7 +32,9 @@ class VerletNeighborCache:
     a caller's mutable view. A bounded LRU limits the number of retained lists.
     """
 
-    def __init__(self, skin: float = 0.5, max_entries: int = 1):
+    def __init__(
+        self, skin: float = 0.5, max_entries: int = 1, max_bytes: int | None = None
+    ):
         if not math.isfinite(skin) or skin <= 0:
             raise ValueError("neighbor skin must be finite and positive")
         self.skin = float(skin)
@@ -41,6 +44,10 @@ class VerletNeighborCache:
             or max_entries < 1
         ):
             raise ValueError("max_entries must be a positive integer")
+        if max_bytes is not None and (type(max_bytes) is not int or max_bytes < 0):
+            raise ValueError("max_bytes must be a nonnegative integer or None")
+        self.max_bytes = max_bytes
+        self.reused_graphs = 0
         self.max_entries = max_entries
         self.rebuilds = 0
         self.hits = 0
@@ -53,14 +60,18 @@ class VerletNeighborCache:
         self._lock = threading.RLock()
 
     def __deepcopy__(self, memo):
-        copied = type(self)(self.skin, self.max_entries)
+        copied = type(self)(self.skin, self.max_entries, self.max_bytes)
         memo[id(self)] = copied
         return copied
 
     def __getstate__(self):
         # A model checkpoint must not retain derived topology, accelerator
         # events or the thread lock. Rebuild them on its destination device.
-        return {"skin": self.skin, "max_entries": self.max_entries}
+        return {
+            "skin": self.skin,
+            "max_entries": self.max_entries,
+            "max_bytes": self.max_bytes,
+        }
 
     def __setstate__(self, state):
         self.__init__(**state)
@@ -75,17 +86,19 @@ class VerletNeighborCache:
 
     @property
     def stats(self):
-        return {
-            "rebuilds": self.rebuilds,
-            "hits": self.hits,
-            "tie_fallbacks": self.tie_fallbacks,
-            "cap_fallbacks": self.cap_fallbacks,
-            "boundary_fallbacks": self.boundary_fallbacks,
-            "candidate_edges": 0
-            if self._entry is None
-            else self._entry["edges"].shape[1],
-            "entries": len(self._entries),
-        }
+        with self._lock:
+            entries = self._entries.values()
+            return {
+                "rebuilds": self.rebuilds,
+                "hits": self.hits,
+                "reused_graphs": self.reused_graphs,
+                "tie_fallbacks": self.tie_fallbacks,
+                "cap_fallbacks": self.cap_fallbacks,
+                "boundary_fallbacks": self.boundary_fallbacks,
+                "candidate_edges": sum(e["edges"].shape[1] for e in entries),
+                "retained_bytes": sum(e["bytes"] for e in entries),
+                "entries": len(entries),
+            }
 
     @staticmethod
     def _metadata(data, pbc):
@@ -103,9 +116,10 @@ class VerletNeighborCache:
         return values
 
     @staticmethod
-    def _same_metadata(saved, current):
+    def _matches(entry, current, pos, skin):
+        checks = []
         for name, value in current.items():
-            old = saved[name]
+            old = entry["metadata"][name]
             if value is None or old is None:
                 if value is not old:
                     return False
@@ -113,10 +127,18 @@ class VerletNeighborCache:
                 value.shape != old.shape
                 or value.dtype != old.dtype
                 or value.device != old.device
-                or not torch.equal(value, old)
             ):
                 return False
-        return True
+            else:
+                checks.append((value == old).all().to(pos.device))
+        if len(pos):
+            displacement = (pos - entry["pos"]).norm(dim=-1).max()
+            checks.append(
+                2 * displacement < skin * (1 - 32 * torch.finfo(pos.dtype).eps)
+            )
+        # Keep exact value comparisons, including NumPy-backed tensors, while
+        # synchronizing once per viable entry instead of once per field.
+        return bool(torch.stack(checks).all())
 
     @staticmethod
     def _stream_event(device):
@@ -172,16 +194,7 @@ class VerletNeighborCache:
                     ]:
                         if tensor is not None and tensor.device == data.pos.device:
                             tensor.record_stream(stream)
-                valid = self._same_metadata(candidate["metadata"], metadata)
-                if valid and len(data.pos):
-                    displacement = (data.pos - candidate["pos"]).norm(dim=-1).max()
-                    # Strict inequality leaves margin for finite-precision
-                    # triangle inequalities at the skin boundary.
-                    valid = bool(
-                        2 * displacement
-                        < self.skin * (1 - 32 * torch.finfo(data.pos.dtype).eps)
-                    )
-                if valid:
+                if self._matches(candidate, metadata, data.pos, self.skin):
                     entry = candidate
                     self._entries.move_to_end(generation)
                     break
@@ -214,98 +227,120 @@ class VerletNeighborCache:
                     "event": None,
                 }
                 entry["event"] = self._stream_event(data.pos.device)
-                self._entries[self._generation] = entry
-                self._generation += 1
-                while len(self._entries) > self.max_entries:
-                    self._entries.popitem(last=False)
+                entry["bytes"] = sum(
+                    t.untyped_storage().nbytes()
+                    for t in (
+                        entry["pos"],
+                        entry["edges"],
+                        entry["cells"],
+                        entry["counts"],
+                        *entry["metadata"].values(),
+                    )
+                    if t is not None
+                )
+                if self.max_bytes is None or entry["bytes"] <= self.max_bytes:
+                    self._entries[self._generation] = entry
+                    self._generation += 1
+                    total = sum(e["bytes"] for e in self._entries.values())
+                    while len(self._entries) > self.max_entries or (
+                        self.max_bytes is not None and total > self.max_bytes
+                    ):
+                        _, evicted = self._entries.popitem(last=False)
+                        total -= evicted["bytes"]
+                    self._entry = entry
                 self.rebuilds += 1
             else:
                 self.hits += 1
-            self._entry = entry
-            edges, cells = entry["edges"], entry["cells"]
-            shifts = edge_cell_offsets(data.cell, cells, entry["counts"])
-            # Advanced indexing owns these endpoint buffers. Reuse them for the
-            # roundoff bound instead of gathering both coordinates a second time.
-            source_pos = data.pos[edges[0]]
-            target_pos = data.pos[edges[1]]
-            # Match graph-v2's subtraction order, not get_pbc_distances' order.
-            distance2 = (target_pos - (source_pos + shifts)).square().sum(-1)
-            # Last-bit differences between batched offset products must not
-            # decide whether a cutoff-boundary edge exists. Ambiguous cases
-            # use the fresh graph's arithmetic and traversal.
-            rounding = (
-                16
-                * torch.finfo(data.pos.dtype).eps
-                * source_pos.abs_().add_(target_pos.abs_()).add_(shifts.abs()).sum(-1)
-            )
-            del source_pos, target_pos, shifts
-            distance_error = rounding * (2 * distance2.sqrt() + rounding)
-            del rounding
-            if bool(((distance2 - cutoff * cutoff).abs() <= distance_error).any()):
+                self._entry = entry
+        edges, cells = entry["edges"], entry["cells"]
+        shifts = edge_cell_offsets(data.cell, cells, entry["counts"])
+        # Advanced indexing owns these endpoint buffers. Reuse them for the
+        # roundoff bound instead of gathering both coordinates a second time.
+        source_pos = data.pos[edges[0]]
+        target_pos = data.pos[edges[1]]
+        # Match graph-v2's subtraction order, not get_pbc_distances' order.
+        distance2 = (target_pos - (source_pos + shifts)).square().sum(-1)
+        # Last-bit differences between batched offset products must not
+        # decide whether a cutoff-boundary edge exists. Ambiguous cases
+        # use the fresh graph's arithmetic and traversal.
+        rounding = (
+            16
+            * torch.finfo(data.pos.dtype).eps
+            * source_pos.abs_().add_(target_pos.abs_()).add_(shifts.abs()).sum(-1)
+        )
+        del source_pos, target_pos, shifts
+        distance_error = rounding * (2 * distance2.sqrt() + rounding)
+        del rounding
+        ambiguous = (distance2 - cutoff * cutoff).abs() <= distance_error
+        # Wrapped search and original-frame arithmetic can also disagree
+        # at zero for translated atoms. Self loops in the primary image
+        # are exactly zero in both frames.
+        ambiguous |= (distance2 <= distance_error) & cells.ne(0).any(-1)
+        if bool(ambiguous.any()):
+            with self._lock:
                 self.boundary_fallbacks += 1
-                return radius_graph_pbc_v2(
-                    data, cutoff, max_neighbors, strict, pbc=pbc, method=method
+            return radius_graph_pbc_v2(
+                data, cutoff, max_neighbors, strict, pbc=pbc, method=method
+            )
+        keep = (distance2 <= cutoff * cutoff) & (distance2 != 0)
+        edges, cells, distance2 = edges[:, keep], cells[keep], distance2[keep]
+        distance_error = distance_error[keep]
+        del keep
+        degrees = get_counts(edges[1], len(data.pos))
+        if max_neighbors > 0 and len(distance2) > 1:
+            overfull = degrees > max_neighbors
+            if bool(overfull.any()):
+                # Order statistics move by at most the largest input error.
+                # Guard both strict k/k+1 selection and the non-strict
+                # (k+1)th-distance + 0.01 degeneracy threshold. Checking
+                # exact equalities alone would miss near-degenerate pairs.
+                selected = torch.nonzero(overfull[edges[1]]).flatten()
+                order = selected[torch.argsort(distance2[selected], stable=True)]
+                order = order[torch.argsort(edges[1, order], stable=True)]
+                starts = degrees[overfull].cumsum(0) - degrees[overfull]
+                error_per_atom = distance_error.new_zeros(len(data.pos))
+                error_per_atom.scatter_reduce_(
+                    0, edges[1], distance_error, reduce="amax"
                 )
-            keep = (distance2 <= cutoff * cutoff) & (distance2 != 0)
-            edges, cells, distance2 = edges[:, keep], cells[keep], distance2[keep]
-            distance_error = distance_error[keep]
-            del keep
-            if len(data.pos) == 0:
-                return edges, cells, torch.zeros_like(data.natoms, dtype=torch.long)
-            needs_capping = False
-            if max_neighbors > 0 and len(distance2) > 1:
-                degrees = torch.zeros(
-                    len(data.pos), dtype=torch.long, device=data.pos.device
-                )
-                degrees.scatter_add_(0, edges[1], torch.ones_like(edges[1]))
-                overfull = degrees > max_neighbors
-                needs_capping = bool(overfull.any())
-                if needs_capping:
-                    # Order statistics move by at most the largest input error.
-                    # Guard both strict k/k+1 selection and the non-strict
-                    # (k+1)th-distance + 0.01 degeneracy threshold. Checking
-                    # exact equalities alone would miss near-degenerate pairs.
-                    selected = torch.nonzero(overfull[edges[1]]).flatten()
-                    order = selected[torch.argsort(distance2[selected], stable=True)]
-                    order = order[torch.argsort(edges[1, order], stable=True)]
-                    starts = degrees[overfull].cumsum(0) - degrees[overfull]
-                    error_per_atom = distance_error.new_zeros(len(data.pos))
-                    error_per_atom.scatter_reduce_(
-                        0, edges[1], distance_error, reduce="amax"
+                if strict:
+                    gap = (
+                        distance2[order[starts + max_neighbors]]
+                        - distance2[order[starts + max_neighbors - 1]]
                     )
-                    if strict:
-                        gap = (
-                            distance2[order[starts + max_neighbors]]
-                            - distance2[order[starts + max_neighbors - 1]]
-                        )
-                        ambiguous = bool((gap <= 2 * error_per_atom[overfull]).any())
-                    else:
-                        thresholds = distance2.new_full((len(data.pos),), torch.inf)
-                        thresholds[overfull] = (
-                            distance2[order[starts + max_neighbors]] + 0.01
-                        )
-                        ambiguous = bool(
-                            (
-                                (distance2 - thresholds[edges[1]]).abs()
-                                <= distance_error + error_per_atom[edges[1]]
-                            ).any()
-                        )
-                    if ambiguous:
+                    ambiguous = bool((gap <= 2 * error_per_atom[overfull]).any())
+                else:
+                    thresholds = distance2.new_full((len(data.pos),), torch.inf)
+                    thresholds[overfull] = (
+                        distance2[order[starts + max_neighbors]] + 0.01
+                    )
+                    ambiguous = bool(
+                        (
+                            (distance2 - thresholds[edges[1]]).abs()
+                            <= distance_error + error_per_atom[edges[1]]
+                        ).any()
+                    )
+                if ambiguous:
+                    with self._lock:
                         self.cap_fallbacks += 1
                         self.tie_fallbacks += int(strict)
-                        return radius_graph_pbc_v2(
-                            data, cutoff, max_neighbors, strict, pbc=pbc, method=method
-                        )
-            mask, counts = get_max_neighbors_mask(
-                data.natoms,
-                edges[1],
-                distance2,
-                max_neighbors,
-                enforce_max_strictly=strict,
-            )
-            if not needs_capping:
-                # Cutoff filtering above already owns these outputs. Selecting
-                # every edge again wastes two gathers and dynamic-size index
-                # synchronization on the ordinary uncapped/under-cap MD path.
-                return edges, cells, counts
-            return edges[:, mask], cells[mask], counts
+                    return radius_graph_pbc_v2(
+                        data, cutoff, max_neighbors, strict, pbc=pbc, method=method
+                    )
+                # The guarded sort already identified each atom's cutoff.
+                # Distances at a strict selection boundary are separated,
+                # so thresholding has the same tie semantics as fresh search.
+                if strict:
+                    thresholds = distance2.new_full((len(data.pos),), torch.inf)
+                    thresholds[overfull] = distance2[order[starts + max_neighbors - 1]]
+                mask = distance2 <= thresholds[edges[1]]
+                if strict:
+                    degrees.clamp_max_(max_neighbors)
+                else:
+                    degrees = get_counts(edges[1, mask], len(data.pos))
+                edges, cells = edges[:, mask], cells[mask]
+        indptr = torch.cat((data.natoms.new_zeros(1), data.natoms.cumsum(0)))
+        counts = sum_partitions(degrees, indptr)
+        if valid:
+            with self._lock:
+                self.reused_graphs += 1
+        return edges, cells, counts

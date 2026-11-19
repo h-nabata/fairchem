@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import operator
 from functools import lru_cache
+from itertools import groupby
 
 import numpy as np
 import torch
@@ -100,84 +101,182 @@ def source_cloud(
         )
         images = []
         start = 0
-        for count, n in zip(cells_per_image.tolist(), natoms.tolist()):
+        for count, n in zip(cells_per_image.tolist(), natoms.tolist(), strict=True):
             images.append(torch.arange(start, start + count, device=device).repeat(n))
             start += count
         images = torch.cat(images)
         return sources, images, atom_pos[sources] + pbc_offsets[images]
-    sources, images, keys = [], [], []
+    sources, images = [], []
+    # Reduce target bounds once, including arbitrary target subsets.
+    indices = target_images.long()[:, None].expand(-1, 3)
+    lower_bounds = atom_pos.new_full((len(natoms), 3), math.inf)
+    upper_bounds = atom_pos.new_full((len(natoms), 3), -math.inf)
+    lower_bounds.scatter_reduce_(0, indices, target_pos, reduce="amin")
+    upper_bounds.scatter_reduce_(0, indices, target_pos, reduce="amax")
+    sizes = torch.stack(
+        (natoms, cells_per_image, lower_bounds[:, 0].isfinite()), dim=1
+    ).tolist()
     atom_start = image_start = 0
-    for system, (n, count) in enumerate(zip(natoms.tolist(), cells_per_image.tolist())):
-        target = target_pos[target_images == system]
-        if n and len(target):
-            lower, upper = target.amin(0), target.amax(0)
+    for system, (n, count, has_targets) in enumerate(sizes):
+        if n and has_targets:
+            lower, upper = lower_bounds[system], upper_bounds[system]
             atoms = atom_pos[atom_start : atom_start + n]
+            offsets = pbc_offsets[image_start : image_start + count]
             margin = (
                 32
                 * torch.finfo(atom_pos.dtype).eps
-                * (
-                    atoms.abs().amax()
-                    + pbc_offsets[image_start : image_start + count].abs().amax()
-                    + prune
-                    + 1
-                )
+                * (atoms.abs().amax() + offsets.abs().amax() + prune + 1)
             )
-            for chunk in range(0, count, 16):
-                image = torch.arange(
-                    image_start + chunk,
-                    image_start + min(chunk + 16, count),
-                    device=device,
-                )
-                positions = atoms[:, None] + pbc_offsets[image]
-                delta = (lower - positions).clamp(min=0) + (positions - upper).clamp(
-                    min=0
-                )
-                selected = delta.square().sum(-1) <= (prune + margin) ** 2
-                atom, tile = torch.where(selected)
-                # Do not retain the last full image tile while concatenating
-                # and sorting the selected cloud below.
-                del positions, delta, selected
-                sources.append(atom + atom_start)
-                images.append(image[tile])
-                keys.append((atom + atom_start) * len(unit_cell) + image[tile])
+            # A flattened, atom-major walk bounds both image and atom
+            # dimensions and already emits the required traversal order.
+            for start in range(0, n * count, 32768):
+                flat = torch.arange(start, min(start + 32768, n * count), device=device)
+                atom = flat // count
+                image = flat % count
+                positions = atoms[atom] + offsets[image]
+                delta = (lower - positions).clamp_min(0) + (
+                    positions - upper
+                ).clamp_min(0)
+                keep = delta.square().sum(-1) <= (prune + margin) ** 2
+                sources.append(atom[keep] + atom_start)
+                images.append(image[keep] + image_start)
+                del positions, delta, keep
         atom_start += n
         image_start += count
     if not sources:
         empty = torch.empty(0, device=device, dtype=torch.long)
         return empty, empty, atom_pos.new_empty((0, 3))
-    sources, images, keys = torch.cat(sources), torch.cat(images), torch.cat(keys)
-    order = torch.argsort(keys)
-    sources, images = sources[order], images[order]
+    sources, images = torch.cat(sources), torch.cat(images)
     return sources, images, atom_pos[sources] + pbc_offsets[images]
 
 
+_PAIR_TILE = 262144
+
+
 def alternative_candidates(
-    source_pos, target_pos, source_images, target_images, radius, method
+    source_pos,
+    target_pos,
+    source_images,
+    target_images,
+    radius,
+    method,
+    *,
+    return_distances=False,
+    num_systems=None,
 ):
-    """
-    Return exact candidates from tiled all-pairs or a balanced bounding-volume tree.
-    """
-    device = source_pos.device
+    """Search system-local source clouds, returning target-grouped candidates."""
     if method not in {"all_pairs", "bvh"}:
         raise ValueError(f"Unsupported alternative search method: {method}")
+    empty = source_images.new_empty(0, dtype=torch.long)
     if not len(source_pos) or not len(target_pos):
-        empty = torch.empty(0, dtype=torch.long, device=device)
-        return empty, empty
-    if method == "all_pairs":
-        source_parts, target_parts = [], []
-        tile = max(1, 262144 // max(1, len(source_pos)))
-        for start in range(0, len(target_pos), tile):
-            target = target_pos[start : start + tile]
-            distance2 = (target[:, None] - source_pos).square().sum(-1)
-            keep = (distance2 <= radius * radius) & (
-                target_images[start : start + tile, None] == source_images
+        return (
+            (empty, empty, source_pos.new_empty(0))
+            if return_distances
+            else (empty, empty)
+        )
+    if num_systems is None:
+        num_systems = int(torch.maximum(source_images.max(), target_images.max())) + 1
+        if num_systems > 1:
+            # The graph builder passes validated, contiguous system runs.
+            # Standalone callers may provide interleaved point clouds.
+            source_order = source_images.argsort(stable=True)
+            target_order = target_images.argsort(stable=True)
+            result = alternative_candidates(
+                source_pos[source_order],
+                target_pos[target_order],
+                source_images[source_order],
+                target_images[target_order],
+                radius,
+                method,
+                return_distances=return_distances,
+                num_systems=num_systems,
             )
-            targets, sources = torch.where(keep)
-            del distance2, keep
-            source_parts.append(sources)
-            target_parts.append(targets + start)
-        return torch.cat(source_parts), torch.cat(target_parts)
+            sources = source_order[result[0]]
+            targets = target_order[result[1]]
+            order = targets.argsort(stable=True)
+            pair = (sources[order], targets[order])
+            return (*pair, result[2][order]) if return_distances else pair
+    if num_systems == 1:
+        sizes = [(len(source_pos), len(target_pos))]
+    else:
+        counts = torch.zeros(
+            (2, num_systems), device=source_pos.device, dtype=torch.long
+        )
+        for row, ids in zip(counts, (source_images, target_images), strict=True):
+            row.scatter_add_(0, ids.long(), torch.ones_like(ids, dtype=torch.long))
+        sizes = counts.T.tolist()
+    source_parts, target_parts, distances = [], [], []
+    source_start = target_start = 0
+    for (ns, nt), same_size in groupby(map(tuple, sizes)):
+        repeats = sum(1 for _ in same_size)
+        # Batch independent, equally sized small systems in one distance
+        # kernel without introducing cross-system pairs or padding.
+        if (
+            method == "all_pairs"
+            and repeats > 1
+            and ns
+            and nt
+            and ns * nt <= _PAIR_TILE
+        ):
+            batch_width = _PAIR_TILE // (ns * nt)
+            for start in range(0, repeats, batch_width):
+                length = min(batch_width, repeats - start)
+                source = source_pos[source_start : source_start + length * ns].view(
+                    length, ns, 3
+                )
+                target = target_pos[target_start : target_start + length * nt].view(
+                    length, nt, 3
+                )
+                d2 = (target[:, :, None] - source[:, None]).square().sum(-1)
+                system, ti, si = torch.where(d2 <= radius * radius)
+                source_parts.append(source_start + system * ns + si)
+                target_parts.append(target_start + system * nt + ti)
+                if return_distances:
+                    distances.append(d2[system, ti, si])
+                source_start += length * ns
+                target_start += length * nt
+            continue
+        for _ in range(repeats):
+            source = source_pos[source_start : source_start + ns]
+            target = target_pos[target_start : target_start + nt]
+            if ns and nt and method == "bvh":
+                si, ti = _bvh_candidates(source, target, radius)
+                source_parts.append(si + source_start)
+                target_parts.append(ti + target_start)
+                if return_distances:
+                    distances.append((target[ti] - source[si]).square().sum(-1))
+            elif ns and nt:
+                source_width = min(ns, _PAIR_TILE)
+                target_width = max(1, _PAIR_TILE // source_width)
+                for t in range(0, nt, target_width):
+                    for s in range(0, ns, source_width):
+                        d2 = (
+                            (
+                                target[t : t + target_width, None]
+                                - source[s : s + source_width]
+                            )
+                            .square()
+                            .sum(-1)
+                        )
+                        ti, si = torch.where(d2 <= radius * radius)
+                        source_parts.append(si + s + source_start)
+                        target_parts.append(ti + t + target_start)
+                        if return_distances:
+                            distances.append(d2[ti, si])
+            source_start += ns
+            target_start += nt
+    pair = (
+        (torch.cat(source_parts), torch.cat(target_parts))
+        if source_parts
+        else (empty, empty)
+    )
+    if return_distances:
+        return (*pair, torch.cat(distances) if distances else source_pos.new_empty(0))
+    return pair
 
+
+def _bvh_candidates(source_pos, target_pos, radius):
+    device = source_pos.device
     # Median-split tree with eight sources per leaf. Exact bounding boxes, not
     # the longest-axis sorting heuristic, decide which leaves may be discarded.
     leaf_size = 8
@@ -225,10 +324,5 @@ def alternative_candidates(
     valid = leaf_indices < len(order)
     expanded_targets = targets[:, None].expand(-1, leaf_size)[valid]
     expanded_sources = order[leaf_indices[valid]]
-    same_system = target_images[expanded_targets] == source_images[expanded_sources]
-    expanded_targets, expanded_sources = (
-        expanded_targets[same_system],
-        expanded_sources[same_system],
-    )
     sort = torch.argsort(expanded_targets, stable=True)
     return expanded_sources[sort], expanded_targets[sort]

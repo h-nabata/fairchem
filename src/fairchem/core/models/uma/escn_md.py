@@ -709,7 +709,7 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
                 )
             return torch.nn.SiLU()(self.mix_csd(torch.cat((chg_emb, spin_emb), dim=1)))
 
-    def _generate_graph(self, data_dict):
+    def _generate_graph(self, data_dict, *, geometry_only=False):
         node_partition = None
         rank_assignments = None
         if gp_utils.initialized():
@@ -779,7 +779,7 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
                 max_neighbors=self.max_neighbors,
                 enforce_max_neighbors_strictly=(self.enforce_max_neighbors_strictly),
                 radius_pbc_version=self.radius_pbc_version,
-                geometry_only=True,
+                geometry_only=geometry_only,
                 pbc=pbc,
                 node_partition=node_partition,
                 neighbor_cache=getattr(self, "_neighbor_cache", None),
@@ -939,7 +939,7 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
                 data_dict["cell"].requires_grad_(True)
 
         with record_function("generate_graph"):
-            graph_dict = self._generate_graph(data_dict)
+            graph_dict = self._generate_graph(data_dict, geometry_only=True)
 
         with record_function("obtain wigner"):
             folded_inverse = getattr(self, "_portable_geometry", None) is not None
