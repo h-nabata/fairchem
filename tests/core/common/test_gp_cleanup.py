@@ -9,7 +9,29 @@ from __future__ import annotations
 
 import pytest
 
-from fairchem.core.common import gp_utils
+from fairchem.core.common import distutils, gp_utils
+
+
+@pytest.mark.parametrize("initialized", [False, True])
+def test_port_release_wait_only_after_destroying_a_process_group(
+    monkeypatch, initialized
+):
+    calls = []
+    active = initialized
+
+    def destroy():
+        nonlocal active
+        active = False
+        calls.append("destroy")
+
+    monkeypatch.setattr(distutils.dist, "is_initialized", lambda: active)
+    monkeypatch.setattr(distutils.dist, "destroy_process_group", destroy)
+    monkeypatch.setattr(distutils.time, "sleep", lambda seconds: calls.append(seconds))
+    monkeypatch.setenv(distutils.CURRENT_DEVICE_TYPE_STR, "cpu")
+    distutils.cleanup()
+    distutils.cleanup()
+    assert calls == (["destroy", 0.5] if initialized else [])
+    assert distutils.CURRENT_DEVICE_TYPE_STR not in distutils.os.environ
 
 
 @pytest.fixture()

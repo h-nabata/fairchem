@@ -1,0 +1,242 @@
+{
+  "base_commit": "a536295dd6a3aecd4c7e1209ef6f1be1e0945cbe",
+  "torch": "2.15.0+cpu",
+  "python": "3.12.14",
+  "device": "cpu",
+  "threads": 2,
+  "notes": "CPU allocator events only; excludes inputs prepared before profiling, Python/native-library memory and GPU memory. Timings are component measurements on a shared host, not whole UMA throughput.",
+  "measurements": [
+    {
+      "component": "lanczos_reorthogonalization",
+      "dtype": "torch.float32",
+      "dimension": 32768,
+      "basis_vectors": 32,
+      "passes": 2,
+      "before": {
+        "tracked_peak_extra_bytes": 393216,
+        "positive_allocated_bytes": 16777472,
+        "median_seconds": 0.0014193460001479252,
+        "seconds_samples": [
+          0.0018990619998930924,
+          0.0012880980000318232,
+          0.0012775719999353896,
+          0.0018084559999351768,
+          0.0016051180000431486,
+          0.0012151969999649737,
+          0.001164861999995992,
+          0.0015389479999612377,
+          0.0014193460001479252
+        ]
+      },
+      "after": {
+        "tracked_peak_extra_bytes": 262148,
+        "positive_allocated_bytes": 8519936,
+        "median_seconds": 0.0012701409998499003,
+        "seconds_samples": [
+          0.0015982769998572621,
+          0.0012701409998499003,
+          0.001216610000028595,
+          0.0013577740000982885,
+          0.001406758000030095,
+          0.0012801459999991494,
+          0.0012511719999110937,
+          0.0011489280000205326,
+          0.0011911710000731546
+        ]
+      }
+    },
+    {
+      "component": "analytic_hessian",
+      "dtype": "torch.float32",
+      "coordinates": 768,
+      "chunk_size": 64,
+      "before": {
+        "tracked_peak_extra_bytes": 3161608,
+        "positive_allocated_bytes": 11895132,
+        "median_seconds": 0.0023250469998856715,
+        "seconds_samples": [
+          0.0025456400001075963,
+          0.0021609279999665887,
+          0.002267748999884134,
+          0.002281950999986293,
+          0.0025079630001982878,
+          0.0025004720000652014,
+          0.0020895310001378675,
+          0.002451867999980095,
+          0.0023250469998856715
+        ]
+      },
+      "after": {
+        "tracked_peak_extra_bytes": 2965000,
+        "positive_allocated_bytes": 11895132,
+        "median_seconds": 0.002226887999995597,
+        "seconds_samples": [
+          0.002587212999969779,
+          0.002592049999975643,
+          0.002374862000124267,
+          0.00213686099982624,
+          0.0022958920001201477,
+          0.0021711330000471207,
+          0.0022267570000167325,
+          0.002226887999995597,
+          0.0021639230001255783
+        ]
+      }
+    },
+    {
+      "component": "synthetic_resident_loop",
+      "dtype": "torch.float32",
+      "output_elements": 1048576,
+      "temporary_elements": 2097152,
+      "steps": 4,
+      "before": {
+        "tracked_peak_extra_bytes": 16777216,
+        "positive_allocated_bytes": 50331648,
+        "median_seconds": 0.014352075999795488,
+        "seconds_samples": [
+          0.04467110100017635,
+          0.029765597000050548,
+          0.01929487200004587,
+          0.014352075999795488,
+          0.023321462000012616,
+          0.005946863000190206,
+          0.006138222999879872,
+          0.006284194000045318,
+          0.007615717999897242
+        ]
+      },
+      "after": {
+        "tracked_peak_extra_bytes": 12582912,
+        "positive_allocated_bytes": 50331648,
+        "median_seconds": 0.0004447930000424094,
+        "seconds_samples": [
+          0.0003563489999578451,
+          0.0003692789998694934,
+          0.0006390359999386419,
+          0.0005290600001899293,
+          0.0004447930000424094,
+          0.00036980000004405156,
+          0.0005341380001482321,
+          0.0005295109999678971,
+          0.0003291179998541338
+        ]
+      }
+    },
+    {
+      "component": "lanczos_reorthogonalization",
+      "dtype": "torch.float64",
+      "dimension": 32768,
+      "basis_vectors": 32,
+      "passes": 2,
+      "before": {
+        "tracked_peak_extra_bytes": 786432,
+        "positive_allocated_bytes": 33554944,
+        "median_seconds": 0.002464577999944595,
+        "seconds_samples": [
+          0.002613562000078673,
+          0.002606361000061952,
+          0.0023737599999549275,
+          0.0025059800000235555,
+          0.0024825650000366295,
+          0.002464577999944595,
+          0.002168980000078591,
+          0.002241180000055465,
+          0.002300959999956831
+        ]
+      },
+      "after": {
+        "tracked_peak_extra_bytes": 524296,
+        "positive_allocated_bytes": 17039872,
+        "median_seconds": 0.0022901629999978468,
+        "seconds_samples": [
+          0.0027246610000020155,
+          0.002200548000018898,
+          0.002550648000124056,
+          0.0024390590001530654,
+          0.0022901629999978468,
+          0.002028617999940252,
+          0.0022002379998866672,
+          0.00234963399998378,
+          0.002235501000086515
+        ]
+      }
+    },
+    {
+      "component": "analytic_hessian",
+      "dtype": "torch.float64",
+      "coordinates": 768,
+      "chunk_size": 64,
+      "before": {
+        "tracked_peak_extra_bytes": 6322696,
+        "positive_allocated_bytes": 23777680,
+        "median_seconds": 0.003059296999936123,
+        "seconds_samples": [
+          0.0032827150000684924,
+          0.0030090909999671567,
+          0.0031071089999841206,
+          0.003086086999928739,
+          0.00308950199996616,
+          0.0028941069999746105,
+          0.0029624109999986104,
+          0.003059296999936123,
+          0.0029978039999605244
+        ]
+      },
+      "after": {
+        "tracked_peak_extra_bytes": 5929480,
+        "positive_allocated_bytes": 23777680,
+        "median_seconds": 0.002920425999946019,
+        "seconds_samples": [
+          0.003395535999970889,
+          0.0030479889999242005,
+          0.002920425999946019,
+          0.0028115619998061447,
+          0.0029509020000659802,
+          0.002873625999882279,
+          0.0029153089999454096,
+          0.0028766010000254028,
+          0.0029287590000421915
+        ]
+      }
+    },
+    {
+      "component": "synthetic_resident_loop",
+      "dtype": "torch.float64",
+      "output_elements": 1048576,
+      "temporary_elements": 2097152,
+      "steps": 4,
+      "before": {
+        "tracked_peak_extra_bytes": 33554432,
+        "positive_allocated_bytes": 100663296,
+        "median_seconds": 0.014544948999855478,
+        "seconds_samples": [
+          0.013945559999910984,
+          0.01512801900003069,
+          0.023997804999908112,
+          0.014930930999980774,
+          0.014544948999855478,
+          0.01393180900004154,
+          0.013784788000066328,
+          0.014179434999959994,
+          0.014698069000132818
+        ]
+      },
+      "after": {
+        "tracked_peak_extra_bytes": 25165824,
+        "positive_allocated_bytes": 100663296,
+        "median_seconds": 0.0007349410000188072,
+        "seconds_samples": [
+          0.0008033550000163814,
+          0.0009688450002158788,
+          0.0008553229999961331,
+          0.0006708450000587618,
+          0.0006819820000600885,
+          0.0007349410000188072,
+          0.0006900539999605826,
+          0.0007344109999394277,
+          0.0007569249999050953
+        ]
+      }
+    }
+  ]
+}

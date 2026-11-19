@@ -51,6 +51,11 @@ upstreamのロゴ・タイトルは冒頭に、機能説明・導入例などの
 **Intelで最初に使用する設定は`device="xpu:0", inference_settings="xpu"`です。**
 下部のupstream手順にある`pip install fairchem-core`だけでは、このフォークの修正は入りません。
 
+2026年11月16日の[デバイス割当て・併用・メモリ再監査](docs/core/common_tasks/intel_xpu_runtime_audit_20261116.md)では、
+独自XPU kernelの起動先、Graph cacheの精度条件、複数predictorのthread設定を修正し、
+Hessian・曲率解析・連続計算の一時メモリを削減しました。
+検査対象と実GPUで未確認の項目は同記録に区別して記載しています。
+
 2026年11月15日のA/B併用・メモリ再監査は
 [併用監査記録](docs/core/common_tasks/intel_xpu_combination_audit_20261115.md)を参照してください。
 23通りの二因子組合せ試験と、非対応な65通りの設定の拒否を追加しています。

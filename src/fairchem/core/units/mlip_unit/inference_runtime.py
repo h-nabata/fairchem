@@ -443,11 +443,22 @@ class NumericCoreRuntime:
             return None
         # Captured workspaces are never shared across submission streams.
         stream = torch.xpu.current_stream(tensors[0].device)
+        # Replay bypasses operator dispatch: a capture made under another
+        # autocast/TF32 policy keeps those kernels even after the policy changes.
+        # no_grad and inference_mode also have different tensor/autograd rules.
+        policy = (
+            torch.is_inference_mode_enabled(),
+            torch.get_autocast_dtype("xpu")
+            if torch.is_autocast_enabled("xpu")
+            else None,
+            torch.get_float32_matmul_precision(),
+            getattr(torch.backends.mkldnn, "allow_tf32", None),
+        )
         return (
             leaves,
             spec,
             tensors,
-            (repr(spec), tuple(description), stream, torch.is_grad_enabled()),
+            (repr(spec), tuple(description), stream, torch.is_grad_enabled(), policy),
         )
 
     def __call__(self, *args, **kwargs):

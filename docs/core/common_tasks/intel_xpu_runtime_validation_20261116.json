@@ -1,0 +1,59 @@
+{
+  "base_commit": "a536295dd6a3aecd4c7e1209ef6f1be1e0945cbe",
+  "test_paths_file": "intel_xpu_runtime_test_paths_20261116.txt",
+  "selected": 2225,
+  "passed": 2167,
+  "skipped": 58,
+  "deselected": 54,
+  "failed": 0,
+  "errors": 0,
+  "elapsed_seconds": 316.097,
+  "skip_reasons": {
+    "Requires a real Intel XPU": 9,
+    "CUDA not available, skipping GPU test": 37,
+    "Requires real Intel XPU graph support": 1,
+    "UMA Nitro runs only on compute capability 8.x-12.x": 1,
+    "Requires an Intel XPU": 1,
+    "Requires real Intel XPU and Triton-XPU": 1,
+    "Requires real Intel XPU streams": 1,
+    "requires two Intel XPUs": 4,
+    "requires an Intel XPU": 3
+  },
+  "additional_native_xpu_tests": 4,
+  "gloo_separate_attempt": {
+    "status": "environment_blocked",
+    "error": "PermissionError: [Errno 1] Operation not permitted while multiprocessing.Manager creates a socket; followed by EOFError before Gloo initialization"
+  },
+  "source_and_test_sha256_unchanged_during_suite": {
+    "src/fairchem/core/calculate/batched_inference.py": "7ff9de3753d8db29f38c33340d623b7c63ed36feadc134fe6caa0c8c5893ea9e",
+    "src/fairchem/core/calculate/series_b_curvature.py": "98b604c696f608587ab9ca76af9a14e496885b2a6cbb917d628832078fc3e6e2",
+    "src/fairchem/core/common/distutils.py": "74df3a1f4a40150b75c2e6ee3e2c522fd8cd1870f286288c70f9789c3fe292d9",
+    "src/fairchem/core/models/uma/nn/xpu_radial_kernels.py": "aa1dee8d97fe504c000d7bfc599098e58a8fbabaa68030d0ef8830e4aa08231a",
+    "src/fairchem/core/models/uma/nn/xpu_wigner_kernels.py": "9c43556d1d63cb1e861251edb006ae67dc51945a570d5854f4cffe5e4dae2b25",
+    "src/fairchem/core/models/uma/outputs.py": "ffbb4dae6df8369920dbe11f5790fd0af629c34e0c0d6b049910c7c7296032e4",
+    "src/fairchem/core/units/mlip_unit/api/inference.py": "7580d8810f4687a5c65b8078d7462d3ac40bc6dbb2b1b8dcdbf6df293aea2c5b",
+    "src/fairchem/core/units/mlip_unit/inference_runtime.py": "0bcc9a743044acead9d7cf92e7e815e3cb7dbe3ba43bf7d8c3637495eebf33bc",
+    "src/fairchem/core/units/mlip_unit/predict.py": "795594b95955a4436ce522ade2b026bc7718ffd5ebd7c89a1f15aea1a1e35be3",
+    "tests/core/common/test_gp_cleanup.py": "b7368e75e024d71247eb1427cef5dca862a6d15faa5bb0925b5b875a7af627f5",
+    "tests/core/calculate/test_runtime_lifetimes.py": "210ef366d85d3ae875ae41f5f6ee9d968cbf2cac1d3afe9efad113fad497a01d",
+    "tests/core/models/uma/test_xpu_kernel_device_scope.py": "a574b3cb6bdea4227305f3dd7a3e0111c39f741eecd370ff178c8a82ab10c92f",
+    "tests/core/units/mlip_unit/test_graph_precision_policy.py": "16c359cd26e192d14d1f119098791dad738ca9c74c68fc04817feeecf6cc8476",
+    "tests/core/units/mlip_unit/test_thread_configuration.py": "d273cb58304b7955322e9a85f2a356cc4963965926aa634d34bec7b348c35933"
+  },
+  "pre_commit": {
+    "status": "passed",
+    "files": 20,
+    "hooks": [
+      "ruff",
+      "ruff-format",
+      "blacken-docs",
+      "trailing-whitespace",
+      "check-added-large-files",
+      "end-of-file-fixer"
+    ]
+  },
+  "dependency_check": {
+    "status": "passed",
+    "packages": 196
+  }
+}

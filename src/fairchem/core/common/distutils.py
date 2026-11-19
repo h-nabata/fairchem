@@ -173,11 +173,13 @@ def setup(config) -> None:
 
 
 def cleanup() -> None:
-    if dist.is_initialized():
+    had_process_group = dist.is_initialized()
+    if had_process_group:
         dist.destroy_process_group()
     if CURRENT_DEVICE_TYPE_STR in os.environ:
         os.environ.pop(CURRENT_DEVICE_TYPE_STR)
-    time.sleep(0.5)  # Give OS time to release ports
+    if had_process_group:
+        time.sleep(0.5)  # Give OS time to release ports only after using them.
 
 
 @requires(ray_installed, message="Requires `ray[serve]` to be installed")

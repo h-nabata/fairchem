@@ -165,9 +165,14 @@ def _product(hvp, vector, template):
 def _orthogonalize(vector, basis):
     # Two modified Gram-Schmidt passes avoid duplicate/ghost Ritz vectors,
     # especially for degenerate eigenvalues and near-breakdown in FP32.
+    # Operator products are also stored in the projected subspace. Own the
+    # residual once, then reuse it without overwriting those stored products.
+    if not basis:
+        return vector
+    vector = vector.clone()
     for _ in range(2):
         for q in basis:
-            vector = vector - torch.dot(q, vector) * q
+            vector.sub_(torch.dot(q, vector) * q)
     return vector
 
 
@@ -369,6 +374,9 @@ def hutchinson_estimates(
                 raise ValueError(
                     "Hutchinson statistics overflowed in FP64; rescale the HVP operator"
                 )
+            # Only the online statistics carry over to the next HVP. In large
+            # systems these vectors need not overlap the next model's graph.
+            del probe, sample, delta, trace_sample, trace_delta
         variance = (m2 / (options.samples - 1)).clamp_min(0)
         trace_variance = (trace_m2 / (options.samples - 1)).clamp_min(0)
     return HutchinsonResult(

@@ -874,13 +874,17 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
 
     def _setup_threads(self, settings: InferenceSettings) -> None:
         """
-        Configure thread settings.
+        Configure CPU intra-op threads, leaving the process-owned inter-op pool.
+
+        PyTorch permits set_num_interop_threads only once, before inter-op work
+        starts. Predictor construction must not consume that application-wide
+        initialization or fail when another library already initialized it.
         """
-        if settings.torch_num_threads is not None:
-            if torch.get_num_interop_threads() != settings.torch_num_threads:
-                torch.set_num_interop_threads(settings.torch_num_threads)
-            if torch.get_num_threads() != settings.torch_num_threads:
-                torch.set_num_threads(settings.torch_num_threads)
+        if (
+            settings.torch_num_threads is not None
+            and torch.get_num_threads() != settings.torch_num_threads
+        ):
+            torch.set_num_threads(settings.torch_num_threads)
 
     def _setup_device(self, device: str) -> None:
         """
