@@ -406,6 +406,18 @@ def _copy_data_to_device(
     )
 
 
+def _has_standard_mole_check(model) -> bool:
+    """Inspect hooks without retaining the current model across a fallback reload."""
+    from fairchem.core.models.base import HydraModel
+    from fairchem.core.models.uma.escn_moe import eSCNMDMoeBackbone
+
+    return (
+        getattr(model.on_predict_check, "__func__", None) is HydraModel.on_predict_check
+        and getattr(model.backbone.on_predict_check, "__func__", None)
+        is eSCNMDMoeBackbone.on_predict_check
+    )
+
+
 def _prepare_inference_gradients(backbone, data: AtomicData) -> None:
     regress_config = getattr(backbone, "regress_config", None)
     if regress_config is None or regress_config.direct_forces:
@@ -1397,28 +1409,21 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         if not self.lazy_model_intialized:
             self._initialize(data)  # may fall back: nitro -> multigpu -> general
             revision = get_commit_hash_for_repo(os.path.dirname(__file__))
-            backend = getattr(self.model.module.backbone, "backend", None)
+            backend_name = type(
+                getattr(self.model.module.backbone, "backend", None) or self.model.module
+            ).__name__
             logging.warning(
                 f"Running ({revision or 'unknown commit'}) with inference settings: "
-                f"{describe_inference_settings(self.inference_settings)}, "
+                f"{describe_inference_settings(self.inference_settings)}\n"
                 f"execution_mode={self.inference_settings.execution_mode}, "
-                f"backend={type(backend or self.model.module).__name__}, nitro={self.inference_settings.nitro}"
+                f"backend={backend_name}, nitro={self.inference_settings.nitro}"
             )
 
         # Nitro's merged contract only reads composition/task/charge/spin.
         # Check CPU-origin metadata before uploading it: copying those fields
         # to CUDA only to read them back on every ASE MD step adds host waits.
         # The full owned input copy below is retained for model-side mutations.
-        from fairchem.core.models.base import HydraModel
-        from fairchem.core.models.uma.escn_moe import eSCNMDMoeBackbone
-
-        model = self.model.module
-        standard_mole_check = (
-            getattr(model.on_predict_check, "__func__", None)
-            is HydraModel.on_predict_check
-            and getattr(model.backbone.on_predict_check, "__func__", None)
-            is eSCNMDMoeBackbone.on_predict_check
-        )
+        standard_mole_check = _has_standard_mole_check(self.model.module)
         # An exact cache hit has revalidated every system's element counts,
         # spin, charge, dataset, and (where relevant) the p-norm batch size.
         metadata_checked = cached_routing and standard_mole_check
