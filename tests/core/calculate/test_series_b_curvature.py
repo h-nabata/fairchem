@@ -261,3 +261,29 @@ def test_actual_uma_adapter_snapshot_modes_and_estimates_match_dense_hessian():
         adapter(vector.double())
     with pytest.raises(ValueError, match="one nonempty"):
         PredictorHVP(predictor, atomicdata_list_to_batch([before, before]))
+
+
+@pytest.mark.parametrize("block_stats", [True, False])
+@pytest.mark.parametrize("size", [1, 5, 30])
+def test_hutchinson_blocks_preserve_all_estimates(size, block_stats):
+    matrix, _ = _matrix()
+    expected = hutchinson_estimates(
+        matrix.mv, torch.zeros_like(matrix[0]), options=HutchinsonOptions(samples=13)
+    )
+    result = hutchinson_estimates(
+        matrix.mv,
+        torch.zeros_like(matrix[0]),
+        options=HutchinsonOptions(
+            samples=13, probe_block_size=size, device_block_statistics=block_stats
+        ),
+    )
+    for name, value in vars(result).items():
+        if torch.is_tensor(value):
+            torch.testing.assert_close(
+                value,
+                getattr(expected, name),
+                rtol=1e-12 if block_stats else 0,
+                atol=1e-12 if block_stats else 0,
+            )
+        else:
+            assert value == getattr(expected, name)

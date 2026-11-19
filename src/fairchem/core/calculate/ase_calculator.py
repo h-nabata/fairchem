@@ -176,17 +176,33 @@ class FAIRChemCalculator(Calculator):
 
         self.predictor = predict_unit
 
-        if predict_unit.inference_settings.external_graph_gen is True:
-            r_edges = True
-            max_neigh = 300
-            radius = 6.0  # Default radius for edge generation
-            logging.warning(
-                "External graph generation is enabled, limiting neighbors to 300."
+        settings = predict_unit.inference_settings
+        graph = getattr(predict_unit, "graph_settings", None)
+        if not isinstance(graph, dict):
+            backbone = getattr(
+                getattr(getattr(predict_unit, "model", None), "module", None),
+                "backbone",
+                None,
             )
-        else:
-            r_edges = False
-            max_neigh = None
-            radius = 6.0  # Still need radius even for internal graph gen
+            graph = {
+                name: getattr(backbone, name)
+                for name in (
+                    "cutoff",
+                    "max_neighbors",
+                    "otf_graph",
+                    "enforce_max_neighbors_strictly",
+                )
+                if hasattr(backbone, name)
+                and isinstance(getattr(backbone, name), (float, int, bool))
+            }
+        otf_graph = graph.get("otf_graph")
+        r_edges = settings.external_graph_gen is True or otf_graph is False
+        if settings.external_graph_gen is True and otf_graph is True:
+            raise ValueError(
+                "external_graph_gen=True conflicts with backbone otf_graph=True"
+            )
+        radius = graph.get("cutoff", 6.0) if r_edges else 6.0
+        max_neigh = graph.get("max_neighbors", 300) if r_edges else None
 
         a2g_kwargs = {
             "task_name": self.task_name,
@@ -194,6 +210,9 @@ class FAIRChemCalculator(Calculator):
             "r_data_keys": ["spin", "charge"],
             "max_neigh": max_neigh,
             "radius": radius,
+            "enforce_max_neighbors_strictly": graph.get(
+                "enforce_max_neighbors_strictly", True
+            ),
             "target_dtype": predict_unit.inference_settings.base_precision_dtype,
         }
 

@@ -465,3 +465,23 @@ def test_metadata_cache_waits_for_producer_and_owns_cross_stream_storage():
     torch.testing.assert_close(
         initial.atomic_numbers.cpu(), _state().atomic_numbers.long()
     )
+
+
+def test_periodic_conversion_accepts_int16_system_indices():
+    state = _state(periodic=True)
+    expected = interface._simstate_to_atomicdata_batch(state, "omol", torch.float32)
+    state.system_idx = state.system_idx.short()
+    actual = interface._simstate_to_atomicdata_batch(state, "omol", torch.float32)
+    torch.testing.assert_close(actual.pos, expected.pos)
+    torch.testing.assert_close(actual.batch, expected.batch)
+
+
+def test_torchsim_refuses_empty_external_edges(monkeypatch):
+    from types import SimpleNamespace
+
+    predictor = HarmonicPredictor()
+    predictor.model = SimpleNamespace(
+        module=SimpleNamespace(backbone=SimpleNamespace(otf_graph=False))
+    )
+    with pytest.raises(ValueError, match="internally generated graph"):
+        _wrapper(monkeypatch, predictor, dtype=torch.float32)

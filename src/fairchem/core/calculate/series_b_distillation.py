@@ -10,11 +10,13 @@ from __future__ import annotations
 import copy
 import gc
 import math
+import operator
 import os
 import tempfile
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from functools import lru_cache
 from numbers import Integral, Real
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -69,7 +71,8 @@ def _owned_data(data):
     if not isinstance(data, AtomicData):
         raise TypeError("Distillation inputs must be AtomicData")
     owned = _clone_tensor_tree(
-        data, tensor_transform=lambda tensor: tensor.detach().cpu().clone()
+        data,
+        tensor_transform=lambda tensor: tensor.detach().to(device="cpu", copy=True),
     )
     if owned.pos.numel() == 0 or not torch.isfinite(owned.pos).all():
         raise ValueError("Distillation inputs require finite, nonempty positions")
@@ -117,23 +120,83 @@ class DistillationSample:
 
     def __post_init__(self):
         data = _owned_data(self.data)
+        self._initialize(data, self.targets)
+
+    def _initialize(self, data, targets):
         if (
-            not isinstance(self.targets, Mapping)
-            or not self.targets
-            or set(self.targets) - _PROPERTIES
+            not isinstance(targets, Mapping)
+            or not targets
+            or set(targets) - _PROPERTIES
         ):
             raise ValueError("targets must be a nonempty energy/forces/stress mapping")
         targets = {
-            name: _property_tensor(value, name, data).detach().cpu().clone()
-            for name, value in self.targets.items()
+            name: _property_tensor(value, name, data)
+            .detach()
+            .to(device="cpu", copy=True)
+            for name, value in targets.items()
         }
         object.__setattr__(self, "data", data)
         object.__setattr__(self, "targets", targets)
 
+    @classmethod
+    def _from_owned_data(cls, data, targets):
+        sample = cls.__new__(cls)
+        sample._initialize(data, targets)
+        return sample
+
+
+class _ShardedSamples(Sequence):
+    """Private, job-owned shards. Reads return independent CPU samples."""
+
+    def __init__(self, samples, directory, shard_size):
+        self._directory = tempfile.TemporaryDirectory(
+            dir=directory, prefix="fairchem-labels-"
+        )
+        self._shard_size = shard_size
+        self._count = 0
+        shard = []
+        try:
+            for sample in samples:
+                shard.append(sample)
+                self._count += 1
+                if len(shard) == shard_size:
+                    torch.save(shard, self._path((self._count - 1) // shard_size))
+                    shard.clear()
+            if shard:
+                torch.save(shard, self._path((self._count - 1) // shard_size))
+        except BaseException:
+            self._directory.cleanup()
+            raise
+
+    def _path(self, number):
+        return Path(self._directory.name) / f"{number}.pt"
+
+    def _read(self, number):
+        # Only read data written into this instance's private temporary directory.
+        return torch.load(self._path(number), map_location="cpu", weights_only=False)
+
+    def __len__(self):
+        return self._count
+
+    def __iter__(self):
+        for start in range(0, len(self), self._shard_size):
+            yield from self._read(start // self._shard_size)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return tuple(self[i] for i in range(*index.indices(len(self))))
+        index = operator.index(index)
+        if index < 0:
+            index += len(self)
+        if not 0 <= index < len(self):
+            raise IndexError("distillation sample index out of range")
+        shard, offset = divmod(index, self._shard_size)
+        return self._read(shard)[offset]
+
 
 @dataclass(frozen=True)
 class DistillationDataset:
-    samples: tuple[DistillationSample, ...]
+    samples: Sequence[DistillationSample]
     provenance: dict = field(default_factory=dict)
 
     def __post_init__(self):
@@ -154,6 +217,15 @@ class DistillationDataset:
         object.__setattr__(self, "samples", tuple(owned))
         object.__setattr__(self, "provenance", copy.deepcopy(self.provenance))
 
+    @classmethod
+    def _from_owned_samples(cls, samples, provenance):
+        if not len(samples):
+            raise ValueError("A nonempty sequence of DistillationSample is required")
+        dataset = cls.__new__(cls)
+        object.__setattr__(dataset, "samples", samples)
+        object.__setattr__(dataset, "provenance", provenance)
+        return dataset
+
 
 @_release_failed_workflow
 def collect_teacher_labels(
@@ -162,6 +234,8 @@ def collect_teacher_labels(
     *,
     teacher_id: str,
     properties: tuple[str, ...] = ("energy", "forces"),
+    shard_directory: str | Path | None = None,
+    shard_size: int = 32,
 ) -> DistillationDataset:
     """
     Evaluate an explicit predictor to build an owned physical-unit dataset.
@@ -170,6 +244,9 @@ def collect_teacher_labels(
     The teacher's normal lazy preparation/cache may run; its weights, precision
     settings and training mode are not changed by this helper. Include domain-
     relevant TS, compressed, and nonequilibrium structures in the supplied data.
+    When shard_directory is supplied, hold at most one shard of new labels in
+    memory. Private temporary files live as long as the returned dataset.
+    Its samples must have serializable metadata. Each file read owns its tensors.
     A finite training set is not evidence of transferability to unseen systems.
     """
     if not isinstance(teacher_id, str) or not teacher_id.strip():
@@ -181,6 +258,13 @@ def collect_teacher_labels(
         or len(set(properties)) != len(properties)
     ):
         raise ValueError("properties must be unique energy/forces/stress names")
+
+    if (
+        isinstance(shard_size, bool)
+        or not isinstance(shard_size, Integral)
+        or shard_size < 1
+    ):
+        raise ValueError("shard_size must be a positive integer")
 
     def samples():
         for structure in structures:
@@ -194,7 +278,7 @@ def collect_teacher_labels(
                 raise ValueError(
                     "Teacher did not return all requested physical properties"
                 )
-            sample = DistillationSample(
+            sample = DistillationSample._from_owned_data(
                 data, {name: output[name] for name in properties}
             )
             # Release the predictor's output/graph before yielding the CPU
@@ -203,14 +287,28 @@ def collect_teacher_labels(
             yield sample
             del sample
 
-    return DistillationDataset(
-        samples(),
+    owned = (
+        tuple(samples())
+        if shard_directory is None
+        else _ShardedSamples(samples(), shard_directory, int(shard_size))
+    )
+    return DistillationDataset._from_owned_samples(
+        owned,
         {
             "teacher_id": teacher_id,
             "properties": list(properties),
             "label_units": "teacher predictor physical units",
         },
     )
+
+
+@lru_cache(maxsize=16)
+def _element_reference_table(entries, device, dtype):
+    # Index zero and the last index also catch invalid atomic numbers.
+    table = [math.nan] * 120
+    for number, value in entries:
+        table[number] = value
+    return torch.tensor(table, device=device, dtype=dtype)
 
 
 @dataclass(frozen=True)
@@ -283,15 +381,19 @@ class PropertyOutputAdapter:
             if name == "energy":
                 value = value + self.energy_offset
                 if self.element_references:
-                    numbers = data.atomic_numbers.detach().cpu().tolist()
-                    missing = set(numbers) - self.element_references.keys()
-                    if missing:
+                    table = _element_reference_table(
+                        tuple(sorted(self.element_references.items())),
+                        value.device,
+                        value.dtype,
+                    )
+                    numbers = data.atomic_numbers.long()
+                    atomic = table[numbers.clamp(0, 119)]
+                    unknown = torch.isnan(atomic)
+                    if unknown.any():
+                        missing = numbers[unknown].unique().tolist()
                         raise ValueError(
                             f"Missing element references for {sorted(missing)}"
                         )
-                    atomic = value.new_tensor(
-                        [self.element_references[number] for number in numbers]
-                    )
                     value = value + torch.zeros_like(value).index_add(
                         0, data.batch, atomic
                     )
@@ -352,7 +454,12 @@ def distill_student(
         raise TypeError("weights must be DistillationWeights")
     # Revalidate/copy so a caller's post-construction edits cannot inject bad
     # values midway through a job or alias the training examples.
-    dataset = DistillationDataset(dataset.samples, dataset.provenance)
+    if isinstance(dataset.samples, _ShardedSamples):
+        dataset = DistillationDataset._from_owned_samples(
+            dataset.samples, copy.deepcopy(dataset.provenance)
+        )
+    else:
+        dataset = DistillationDataset(dataset.samples, dataset.provenance)
     if any(set(weights.active) - sample.targets.keys() for sample in dataset.samples):
         raise ValueError("Every sample must contain all positively weighted properties")
     # A warm UMA stores the previous forward's routing graph in shared MoLE
@@ -391,9 +498,12 @@ def distill_student(
     devices = [] if device.type == "cpu" else [device.index or 0]
     rng_backend = "cuda" if device.type == "cpu" else device.type
     history = []
-    with MODEL_STATE_LOCK, torch.random.fork_rng(
-        devices=devices, device_type=rng_backend
-    ), torch.enable_grad(), torch.autocast(device.type, enabled=False):
+    with (
+        MODEL_STATE_LOCK,
+        torch.random.fork_rng(devices=devices, device_type=rng_backend),
+        torch.enable_grad(),
+        torch.autocast(device.type, enabled=False),
+    ):
         torch.random.default_generator.manual_seed(int(seed))
         if devices:
             getattr(torch, device.type).default_generators[devices[0]].manual_seed(
@@ -412,8 +522,10 @@ def distill_student(
             data = _clone_tensor_tree(
                 sample.data,
                 tensor_transform=lambda tensor: tensor.to(
-                    device=device, dtype=dtype if tensor.is_floating_point() else None
-                ).clone(),
+                    device=device,
+                    dtype=dtype if tensor.is_floating_point() else None,
+                    copy=True,
+                ),
             )
             data["_requested_properties"] = weights.active
             data.pos.requires_grad_(True)
@@ -444,12 +556,13 @@ def distill_student(
             gradients = [
                 parameter.grad for parameter in parameters if parameter.grad is not None
             ]
-            if not gradients or any(
-                not torch.isfinite(gradient).all() for gradient in gradients
+            if (
+                not gradients
+                or not torch.stack([torch.isfinite(g).all() for g in gradients]).all()
             ):
                 raise ValueError("Missing or nonfinite student parameter gradients")
             optimizer.step()
-            if any(not torch.isfinite(parameter).all() for parameter in parameters):
+            if not torch.stack([torch.isfinite(p).all() for p in parameters]).all():
                 raise ValueError("Nonfinite student parameters after optimizer step")
             history.append(float(loss.detach().cpu()))
             optimizer.zero_grad(set_to_none=True)
@@ -482,6 +595,7 @@ def export_distilled_checkpoint(
     tasks_config: list,
     architecture_note: str,
     overwrite: bool = False,
+    share_ema_storage: bool = False,
 ) -> Path:
     """
     Export a standard checkpoint only after strict architecture/state matching.
@@ -490,11 +604,15 @@ def export_distilled_checkpoint(
     actual output convention. This validates serialization/shape compatibility,
     not physical accuracy. Construct the resulting predictor with this checkpoint
     path explicitly; production UMA checkpoints are never rewritten here.
+    With share_ema_storage=True the file stores each raw tensor once and its
+    EMA entry references the same storage. Treat both serialized states as read-only.
     """
     if not isinstance(result, DistillationResult):
         raise TypeError("result must be DistillationResult")
     if not isinstance(architecture_note, str) or not architecture_note.strip():
         raise ValueError("architecture_note must describe the trained architecture")
+    if not isinstance(share_ema_storage, bool):
+        raise TypeError("share_ema_storage must be a boolean")
     if not isinstance(overwrite, bool):
         raise TypeError("overwrite must be a boolean")
     if not isinstance(model_config, Mapping) or "_target_" not in model_config:
@@ -503,7 +621,7 @@ def export_distilled_checkpoint(
         raise TypeError("tasks_config must be a list of task configurations")
 
     def cpu_state_tensor(value):
-        value = value.detach().cpu().clone()
+        value = value.detach().to(device="cpu", copy=True)
         if (value.is_floating_point() or value.is_complex()) and not torch.isfinite(
             value
         ).all():
@@ -512,9 +630,15 @@ def export_distilled_checkpoint(
 
     # PyTorch state_dicts also carry version metadata and may contain a
     # module's arbitrary get_extra_state() payload, rather than only tensors.
-    state = _clone_tensor_tree(
-        result.model.state_dict(), tensor_transform=cpu_state_tensor
+    # With keep_vars, tied parameters are the same Python object in both
+    # entries. The clone memo preserves that tie when storage sharing is selected.
+    raw = (
+        result.model.state_dict(keep_vars=True)
+        if share_ema_storage
+        else result.model.state_dict()
     )
+    state = _clone_tensor_tree(raw, tensor_transform=cpu_state_tensor)
+    del raw
     config, tasks = copy.deepcopy(dict(model_config)), copy.deepcopy(tasks_config)
     with MODEL_STATE_LOCK, torch.random.fork_rng(devices=[]), torch.device("cpu"):
         reconstructed = hydra.utils.instantiate(config)
@@ -525,12 +649,14 @@ def export_distilled_checkpoint(
     # EMA state and serializing; some models contain bound-method cycles.
     del reconstructed
     gc.collect()
+    # The serialized raw and EMA weights are identical snapshots. Share their
+    # read-only tensor storage; deepcopy still separates mutable extra-state containers.
+    ema_values = _clone_tensor_tree(
+        state, tensor_transform=(lambda value: value) if share_ema_storage else None
+    )
     ema_state = OrderedDict(
         [("n_averaged", torch.tensor(0, device="cpu"))]
-        + [
-            (f"module.{name}", value)
-            for name, value in _clone_tensor_tree(state).items()
-        ]
+        + [(f"module.{name}", value) for name, value in ema_values.items()]
     )
     if hasattr(state, "_metadata"):
         ema_state._metadata = {

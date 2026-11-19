@@ -143,17 +143,7 @@ class _SimStateConverter:
             self._template is not None
             and self._signature == signature
             and (not same_owners or self._versions == versions)
-            and all(
-                (old is None and new is None)
-                or (
-                    old is not None
-                    and new is not None
-                    and old.dtype == new.dtype
-                    and old.device == new.device
-                    and torch.equal(old, new)
-                )
-                for old, new in zip(self._snapshots, owners)
-            )
+            and _metadata_matches(self._snapshots, owners)
         )
         if not hit:
             batch = _simstate_to_atomicdata_batch(state, task_name, target_dtype)
@@ -212,6 +202,20 @@ class _SimStateConverter:
         return batch
 
 
+def _metadata_matches(snapshots, values):
+    comparisons = []
+    for old, new in zip(snapshots, values, strict=True):
+        if old is None or new is None:
+            if old is not new:
+                return False
+            continue
+        if old.dtype != new.dtype or old.device != new.device or old.shape != new.shape:
+            return False
+        # The converter has validated that all metadata lives on the geometry device.
+        comparisons.append((old == new).all())
+    return not comparisons or bool(torch.stack(comparisons).all())
+
+
 def _integer_metadata(value, name, size, device, minimum=None, maximum=None):
     """
     Validate integral values before casting, without truncating physical metadata.
@@ -252,16 +256,29 @@ def _validate_geometry(positions, cell, n_systems, periodic):
     """
     Reject malformed geometry before graph construction or periodic wrapping.
     """
-    if not torch.isfinite(positions).all():
-        raise ValueError("positions must contain finite values after dtype conversion")
     if cell.shape != (n_systems, 3, 3) or cell.device != positions.device:
         raise ValueError(
             "cell must have shape (n_systems, 3, 3) on the positions device"
         )
-    if not torch.isfinite(cell).all():
-        raise ValueError("cell must contain finite values after dtype conversion")
-    if periodic and torch.any(torch.linalg.det(cell) == 0):
-        raise ValueError("Periodic wrapping requires a nonsingular cell")
+    checks = [
+        (
+            torch.isfinite(positions).all(),
+            "positions must contain finite values after dtype conversion",
+        ),
+        (
+            torch.isfinite(cell).all(),
+            "cell must contain finite values after dtype conversion",
+        ),
+    ]
+    if periodic:
+        checks.append(
+            (
+                (torch.linalg.det(cell) != 0).all(),
+                "Periodic wrapping requires a nonsingular cell",
+            )
+        )
+    if not torch.stack([ok for ok, _ in checks]).all():
+        raise ValueError(next(message for ok, message in checks if not ok))
 
 
 def _simstate_to_atomicdata_batch(
@@ -291,8 +308,6 @@ def _simstate_to_atomicdata_batch(
     positions = sim_state.positions.to(dtype=target_dtype, copy=True)
     if positions.ndim != 2 or positions.shape[1] != 3 or positions.shape[0] == 0:
         raise ValueError("positions must have nonempty shape (n_atoms, 3)")
-    if not torch.isfinite(positions).all():
-        raise ValueError("positions must contain finite values after dtype conversion")
     atomic_numbers = _integer_metadata(
         sim_state.atomic_numbers,
         "atomic_numbers",
@@ -339,14 +354,13 @@ def _simstate_to_atomicdata_batch(
     ):
         raise ValueError("TorchSim pbc must contain three boolean values")
     pbc = sim_state.pbc.bool().unsqueeze(0).expand(n_systems, 3).clone()
-    _validate_geometry(positions, cell, n_systems, bool(pbc.any()))
+    periodic = bool(pbc.any())
+    _validate_geometry(positions, cell, n_systems, periodic)
 
-    if torch.any(pbc):
+    if periodic:
         cell_col = cell.transpose(-2, -1)  # (n_systems, 3, 3) column vectors
         pbc_single = pbc[0] if pbc.ndim > 0 else pbc  # (3,) or bool
-        positions = pbc_wrap_batched(
-            positions, cell_col, sim_state.system_idx, pbc_single
-        )
+        positions = pbc_wrap_batched(positions, cell_col, batch_indices, pbc_single)
 
     natoms = n_atoms_per_system  # (n_systems,)
 
@@ -537,6 +551,17 @@ class FairChemModel(_TSModelInterface):
             device=device_str,
             **loader_kwargs,
         )
+        settings = getattr(self.predictor, "inference_settings", None)
+        model_wrapper = getattr(self.predictor, "model", None)
+        backbone = getattr(getattr(model_wrapper, "module", None), "backbone", None)
+        if (
+            getattr(settings, "external_graph_gen", False) is True
+            or getattr(backbone, "otf_graph", None) is False
+        ):
+            raise ValueError(
+                "TorchSim requires an internally generated graph (otf_graph=True)"
+            )
+
         if dtype is None:
             # Do not round FP64 coordinates through a default FP32 simulation
             # dtype before the FP64 predictor sees them. Explicit simulation
@@ -619,7 +644,14 @@ class FairChemModel(_TSModelInterface):
             if getattr(self.predictor, "supports_requested_properties", False)
             else {}
         )
-        predictions = self.predictor.predict(batch, **predict_kwargs)
+        # The converter owns every tensor, including when metadata is cached.
+        # Only local predictors exposing this private entry may consume that ownership.
+        predict = getattr(type(self.predictor), "_predict_owned_batch", None)
+        predictions = (
+            predict(self.predictor, batch, **predict_kwargs)
+            if predict
+            else self.predictor.predict(batch, **predict_kwargs)
+        )
 
         # Convert predictions to torch-sim format
         results: dict[str, torch.Tensor] = {}
@@ -644,7 +676,9 @@ class FairChemModel(_TSModelInterface):
                     f"expected {expected_shapes[name]}"
                 )
             value = value.detach().to(device=self._device, dtype=self._dtype, copy=True)
-            if not torch.isfinite(value).all():
-                raise ValueError(f"Predictor {name!r} contains nonfinite values")
             results[name] = value
+        finite = {name: torch.isfinite(value).all() for name, value in results.items()}
+        if not torch.stack(list(finite.values())).all():
+            name = next(name for name, ok in finite.items() if not ok)
+            raise ValueError(f"Predictor {name!r} contains nonfinite values")
         return results

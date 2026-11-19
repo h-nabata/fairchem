@@ -141,3 +141,13 @@ def test_singlepoint_runner(dftd3_atoms):
         assert np.shape(result["forces"]) == (len(atoms), 3)
         npt.assert_allclose(result["energy"], atoms.get_potential_energy())
         npt.assert_allclose(result["forces"], atoms.get_forces(), atol=1.0e-10)
+
+
+def test_d3_wrapper_invalidates_nested_metadata(dftd3_atoms):
+    calculator = dftd3_atoms.calc
+    dftd3_atoms.info["electronic"] = {"charge": [0]}
+    energy = dftd3_atoms.get_potential_energy()
+    dftd3_atoms.info["electronic"]["charge"][0] = 1
+    assert calculator.check_state(dftd3_atoms) == ["info"]
+    assert np.isclose(energy, dftd3_atoms.get_potential_energy())
+    assert calculator.check_state(dftd3_atoms) == []

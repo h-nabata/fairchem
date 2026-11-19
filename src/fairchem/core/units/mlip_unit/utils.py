@@ -9,14 +9,18 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from copy import copy, deepcopy
-from threading import RLock
+from os import PathLike
+from pathlib import Path
+from threading import Condition, get_ident
 from typing import TYPE_CHECKING
+from zipfile import is_zipfile
 
 import hydra
 import torch
 from omegaconf import DictConfig
 
 from fairchem.core.common._model_state import MODEL_STATE_LOCK
+from fairchem.core.common.precision import onednn_matmul_policy
 from fairchem.core.common.registry import registry
 from fairchem.core.common.utils import load_state_dict, match_state_dict
 from fairchem.core.models.uma.compat import apply_uma_compat_fixups
@@ -39,6 +43,14 @@ def get_backbone_class_from_checkpoint(
     return registry.get_model_class(backbone_model_name)
 
 
+def load_inference_checkpoint(path):
+    """Map tensor storages on demand for modern zip checkpoints; support legacy files."""
+    use_mmap = (
+        isinstance(path, (str, PathLike)) and Path(path).is_file() and is_zipfile(path)
+    )
+    return torch.load(path, map_location="cpu", weights_only=False, mmap=use_mmap)
+
+
 @torch.inference_mode(False)
 def load_inference_model(
     checkpoint_location: str,
@@ -55,9 +67,7 @@ def load_inference_model(
         checkpoint = copy(preloaded_checkpoint)
         checkpoint.model_config = deepcopy(preloaded_checkpoint.model_config)
     else:
-        checkpoint = torch.load(
-            checkpoint_location, map_location="cpu", weights_only=False
-        )
+        checkpoint = load_inference_checkpoint(checkpoint_location)
 
     apply_uma_compat_fixups(checkpoint, checkpoint_location=checkpoint_location)
 
@@ -71,7 +81,11 @@ def load_inference_model(
         model = hydra.utils.instantiate(checkpoint.model_config)
     if use_ema:
         with MODEL_STATE_LOCK, torch.device("cpu"):
-            model = torch.optim.swa_utils.AveragedModel(model)
+            # The checkpoint model is already private. Only construct the EMA
+            # bookkeeping, avoiding a second full copy of its initialized tensors.
+            averaged = torch.optim.swa_utils.AveragedModel(torch.nn.Identity())
+            averaged.module = model
+            model = averaged
         model_dict = model.state_dict()
         # Preserve module-version metadata used by PyTorch's checkpoint migration
         # hooks while removing the EMA counter only from our private mapping.
@@ -102,9 +116,7 @@ def load_tasks(checkpoint_location: str) -> list[Task]:
     Returns:
         list[Task]: A list of instantiated Task objects from the checkpoint's tasks_config.
     """
-    checkpoint: MLIPInferenceCheckpoint = torch.load(
-        checkpoint_location, map_location="cpu", weights_only=False
-    )
+    checkpoint: MLIPInferenceCheckpoint = load_inference_checkpoint(checkpoint_location)
     with MODEL_STATE_LOCK, torch.device("cpu"), torch.inference_mode(False):
         return [
             hydra.utils.instantiate(task_config)
@@ -112,7 +124,54 @@ def load_tasks(checkpoint_location: str) -> list[Task]:
         ]
 
 
-_TF32_CONTEXT_LOCK = RLock()
+# Strict XPU callers only observe policy. Writers (CUDA scopes and B03) may
+# change process-wide settings, so they exclude both readers and other writers.
+_precision_condition = Condition()
+_precision_readers = {}
+_precision_writer = None
+_precision_waiters = 0
+
+
+@contextmanager
+def _precision_guard(readonly):
+    global _precision_writer, _precision_waiters
+    thread = get_ident()
+    with _precision_condition:
+        nested_writer = _precision_writer == thread
+        if not nested_writer:
+            if readonly:
+                _precision_condition.wait_for(
+                    lambda: (
+                        _precision_writer is None
+                        and (not _precision_waiters or thread in _precision_readers)
+                    )
+                )
+                _precision_readers[thread] = _precision_readers.get(thread, 0) + 1
+            else:
+                if thread in _precision_readers:
+                    raise RuntimeError(
+                        "Cannot change precision inside a strict XPU inference scope"
+                    )
+                _precision_waiters += 1
+                try:
+                    _precision_condition.wait_for(
+                        lambda: _precision_writer is None and not _precision_readers
+                    )
+                    _precision_writer = thread
+                finally:
+                    _precision_waiters -= 1
+    try:
+        yield
+    finally:
+        with _precision_condition:
+            if not nested_writer:
+                if readonly:
+                    _precision_readers[thread] -= 1
+                    if not _precision_readers[thread]:
+                        del _precision_readers[thread]
+                else:
+                    _precision_writer = None
+                _precision_condition.notify_all()
 
 
 @contextmanager
@@ -123,23 +182,35 @@ def tf32_context_manager(tf32: bool, *, device_type: str = "cuda"):
     Args:
         tf32: Whether to enable TF32 for float32 matmul and cuDNN operations.
     """
-    with _TF32_CONTEXT_LOCK:
+    with _precision_guard(readonly=device_type == "xpu" and not tf32):
         if device_type == "xpu":
-            original = getattr(torch.backends.mkldnn, "allow_tf32", None)
-            if not tf32 and original:
+            modern, legacy = onednn_matmul_policy()
+            if not tf32 and (legacy or modern in ("tf32", "bf16")):
                 raise ValueError(
                     "Strict FP32 XPU inference requires torch.backends.mkldnn.allow_tf32=False. "
-                    "The predictor does not change this process-global setting."
+                    "On newer PyTorch, set torch.backends.mkldnn.matmul.fp32_precision to ieee."
                 )
-            if tf32 and not isinstance(original, bool):
+            backend = torch.backends.mkldnn
+            if modern is not None and (
+                modern != "none" or not isinstance(legacy, bool)
+            ):
+                target, attribute, original, value = (
+                    backend.matmul,
+                    "fp32_precision",
+                    modern,
+                    "tf32",
+                )
+            else:
+                target, attribute, original, value = backend, "allow_tf32", legacy, True
+            if tf32 and original is None:
                 raise RuntimeError("This PyTorch build does not expose XPU oneDNN TF32")
             try:
-                if tf32:
-                    torch.backends.mkldnn.allow_tf32 = True
+                if tf32 and value != original:
+                    setattr(target, attribute, value)
                 yield
             finally:
-                if tf32:
-                    torch.backends.mkldnn.allow_tf32 = original
+                if tf32 and value != original:
+                    setattr(target, attribute, original)
             return
         if device_type != "cuda":
             raise ValueError("TF32 policy is only defined for CUDA or XPU")

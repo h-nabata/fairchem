@@ -159,6 +159,22 @@ def test_mixed_tasks_and_dtypes_restore_request_order_without_partial_outputs():
     assert len(predictor.calls) == 3
 
 
+@pytest.mark.parametrize("native,groups", [(False, [1, 1, 2]), (True, [4])])
+def test_server_isolates_only_reference_lookup_single_atoms(native, groups):
+    predictor = MixedTaskPredictor()
+    predictor.model = SimpleNamespace(
+        module=SimpleNamespace(supports_single_atoms=native)
+    )
+    items = [
+        AtomicData.from_ase(Atoms("He", cell=[8] * 3, pbc=pbc), task_name="omol")
+        for pbc in (False, True, False)
+    ]
+    items.append(_data(2))
+    results = _server()._run_batched_inference(items, predictor, False)
+    assert sorted(len(datasets) for datasets, _ in predictor.calls) == groups
+    assert [r["energy"].item() for r in results] == [0, 0, 0, 4]
+
+
 def test_actual_uma_hessians_are_isolated_per_server_request():
     from tests.core.calculate.test_batch_interoperability import _uma
 

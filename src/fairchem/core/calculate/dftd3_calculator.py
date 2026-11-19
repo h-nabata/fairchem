@@ -9,6 +9,7 @@ ASE calculator wrapper for nvalchemiops DFT-D3(BJ) corrections.
 
 from __future__ import annotations
 
+import copy
 import io
 import re
 import tarfile
@@ -261,7 +262,7 @@ class _NValChemiDFTD3Calculator(Calculator):
             raise ValueError(f"cutoff must be positive, got {cutoff!r}")
         if not 0.0 <= smoothing_fraction < 1.0:
             raise ValueError(
-                "smoothing_fraction must be in [0, 1), got " f"{smoothing_fraction!r}"
+                f"smoothing_fraction must be in [0, 1), got {smoothing_fraction!r}"
             )
 
         if device is None:
@@ -481,6 +482,14 @@ class DFTD3Calculator(Calculator):
             if prop in dispersion_properties
         ]
 
+    def check_state(self, atoms: Atoms, tol: float = 1e-15) -> list[str]:
+        from fairchem.core.calculate.ase_calculator import _metadata_equal
+
+        changes = super().check_state(atoms, tol)
+        if not changes and not _metadata_equal(self.atoms.info, atoms.info):
+            changes.append("info")
+        return changes
+
     def calculate(
         self,
         atoms: Atoms | None = None,
@@ -492,16 +501,19 @@ class DFTD3Calculator(Calculator):
         """
 
         self.contributions = {}
+        self.results = {}
         super().calculate(atoms, properties, system_changes)
         if self.atoms is None:
             raise ValueError("An Atoms object is required.")
+        self.atoms.info = copy.deepcopy(self.atoms.info)
         if properties is None:
             properties = self.implemented_properties
 
         self.base_calculator.calculate(self.atoms, properties, system_changes)
         self.dispersion_calculator.calculate(self.atoms, properties, system_changes)
 
-        self.results = {}
+        results = {}
+        contributions = {}
         for prop in self.implemented_properties:
             if not (
                 prop in self.base_calculator.results
@@ -517,8 +529,10 @@ class DFTD3Calculator(Calculator):
                     base_result = full_3x3_to_voigt_6_stress(base_result)
                 if np.shape(dispersion_result) == (3, 3):
                     dispersion_result = full_3x3_to_voigt_6_stress(dispersion_result)
-            self.results[prop] = base_result + dispersion_result
-            self.contributions[prop] = (base_result, dispersion_result)
+            results[prop] = base_result + dispersion_result
+            contributions[prop] = (base_result, dispersion_result)
+        self.results = results
+        self.contributions = contributions
 
     @property
     def functional(self) -> str:

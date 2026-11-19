@@ -156,7 +156,9 @@ def size_repr(key: str, item: torch.Tensor, indent=0) -> str:
 
 
 @requires(pmg_installed, message="Requires `pymatgen` to be installed")
-def get_neighbors_pymatgen(atoms: ase.Atoms, cutoff, max_neigh):
+def get_neighbors_pymatgen(
+    atoms: ase.Atoms, cutoff, max_neigh, enforce_max_neighbors_strictly=None
+):
     """Performs nearest neighbor search and returns edge index, distances,
     and cell offsets"""
     struct = AseAtomsAdaptor.get_structure(atoms)
@@ -165,13 +167,25 @@ def get_neighbors_pymatgen(atoms: ase.Atoms, cutoff, max_neigh):
     _c_index, _n_index, _offsets, n_distance = struct.get_neighbor_list(
         r=cutoff, numerical_tol=1e-8, exclude_self=True
     )
-    _nonmax_idx = []
-    for i in range(len(atoms)):
-        idx_i = (_c_index == i).nonzero()[0]
-        # sort neighbors by distance, remove edges larger than max_neighbors
-        idx_sorted = np.argsort(n_distance[idx_i])[:max_neigh]
-        _nonmax_idx.append(idx_i[idx_sorted])
-    _nonmax_idx = np.concatenate(_nonmax_idx)
+    # Group rows once rather than scanning every edge for each atom. Stable
+    # grouping preserves the original argsort tie order within each center.
+    by_center = np.argsort(_c_index, kind="stable")
+    starts = np.cumsum(np.bincount(_c_index, minlength=len(atoms)))[:-1]
+    selected = []
+    for row in np.split(by_center, starts):
+        row = row[np.argsort(n_distance[row])]
+        if enforce_max_neighbors_strictly is None:
+            row = row[:max_neigh]  # Original standalone converter semantics.
+        elif max_neigh > 0 and len(row) > max_neigh:
+            if enforce_max_neighbors_strictly:
+                row = row[:max_neigh]
+            else:
+                # UMA uses squared-distance tolerance against the (k+1)th
+                # neighbor, keeping a degenerate shell intact.
+                squared = np.square(n_distance[row])
+                row = row[squared <= squared[max_neigh] + 0.01]
+        selected.append(row)
+    _nonmax_idx = np.concatenate(selected)
 
     _c_index = _c_index[_nonmax_idx]
     _n_index = _n_index[_nonmax_idx]
@@ -348,9 +362,9 @@ class AtomicData:
             assert len(self.dataset) == self.num_graphs
 
         # dtype checks
-        assert (
-            self.pos.dtype == self.cell.dtype == self.cell_offsets.dtype
-        ), "Positions, cell, cell_offsets are all expected to be same. Check data going into AtomicData is correct dtype"
+        assert self.pos.dtype == self.cell.dtype == self.cell_offsets.dtype, (
+            "Positions, cell, cell_offsets are all expected to be same. Check data going into AtomicData is correct dtype"
+        )
         assert self.pos.dtype in (
             torch.float32,
             torch.float64,
@@ -375,9 +389,9 @@ class AtomicData:
         for name in ("natoms", "nedges", "charge", "spin"):
             value = getattr(self, name)
             assert value.dtype == torch.long, f"{name} must be an int64 tensor"
-            assert value.shape == (
-                self.num_graphs,
-            ), f"{name} must have one entry per system"
+            assert value.shape == (self.num_graphs,), (
+                f"{name} must have one entry per system"
+            )
         assert isinstance(self.num_nodes, int)
         assert isinstance(self.num_graphs, int)
 
@@ -423,6 +437,7 @@ class AtomicData:
         task_name: str | None = None,
         target_dtype: torch.dtype = torch.float32,
         external_graph_method: ExternalGraphMethod | str = ExternalGraphMethod.PYMATGEN,
+        enforce_max_neighbors_strictly: bool | None = None,
     ) -> AtomicData:
         atoms = input_atoms.copy()
         calc = input_atoms.calc
@@ -430,9 +445,9 @@ class AtomicData:
             raise ValueError("A fully periodic structure requires a nonsingular cell")
         # TODO: maybe compute a safe cell size if not provided.
         if molecule_cell_size is not None:
-            assert (
-                atoms.cell.volume == 0.0
-            ), "atoms must not have a unit cell to begin with to create a molecule cell"
+            assert atoms.cell.volume == 0.0, (
+                "atoms must not have a unit cell to begin with to create a molecule cell"
+            )
             # create a molecule box with the molecule centered on it if specified
             atoms.center(vacuum=(molecule_cell_size))
             atoms.pbc = np.array([True, True, True])
@@ -469,15 +484,17 @@ class AtomicData:
 
         # graph construction
         if r_edges:
-            assert (
-                radius is not None
-            ), "cutoff must be specified for cpu graph construction."
-            assert (
-                max_neigh is not None
-            ), "max_neigh must be specified for cpu graph construction."
+            assert radius is not None, (
+                "cutoff must be specified for cpu graph construction."
+            )
+            assert max_neigh is not None, (
+                "max_neigh must be specified for cpu graph construction."
+            )
 
             if external_graph_method == ExternalGraphMethod.PYMATGEN:
-                split_idx_dist = get_neighbors_pymatgen(atoms, radius, max_neigh)
+                split_idx_dist = get_neighbors_pymatgen(
+                    atoms, radius, max_neigh, enforce_max_neighbors_strictly
+                )
             elif external_graph_method == ExternalGraphMethod.NVIDIA:
                 from fairchem.core.graph.radius_graph_pbc_nvidia import (
                     get_neighbors_nvidia_atoms,
@@ -647,9 +664,9 @@ class AtomicData:
     @classmethod
     def from_dict(cls, dictionary):
         r"""Creates a data object from a python dictionary."""
-        assert set(_REQUIRED_KEYS).issubset(
-            dictionary.keys()
-        ), f"Missing required keys: {set(_REQUIRED_KEYS) - set(dictionary.keys())}"
+        assert set(_REQUIRED_KEYS).issubset(dictionary.keys()), (
+            f"Missing required keys: {set(_REQUIRED_KEYS) - set(dictionary.keys())}"
+        )
 
         data = cls(
             pos=dictionary["pos"],
@@ -795,7 +812,7 @@ class AtomicData:
         """
         # Only known atom indices are shifted; job IDs can also contain "index".
         assert self.num_graphs == 1
-        return self.natoms.item() if key == "edge_index" else 0
+        return self.num_nodes if key == "edge_index" else 0
 
     def __apply__(self, item, func, memo=None):
         if memo is None:
@@ -1046,18 +1063,16 @@ def atomicdata_list_to_batch(
             )
 
     batched_data_dict = {k: [] for k in keys}
-    batch = []
-
     device = data_list[0].pos.device
     slices = {key: [0] for key in keys}
     cumsum = {key: [0] for key in keys}
     cat_dims = {}
-    natoms_list, sid_list = [], []
+    natoms_list = []
 
-    for i, data in enumerate(data_list):
-        assert (
-            data.num_graphs == 1
-        ), "data list must only contain single-graph AtomicData objects."
+    for data in data_list:
+        assert data.num_graphs == 1, (
+            "data list must only contain single-graph AtomicData objects."
+        )
 
         for key in keys:
             item = data[key]
@@ -1122,12 +1137,11 @@ def atomicdata_list_to_batch(
                 inc = torch.tensor(inc)
             cumsum[key].append(inc + cumsum[key][-1])
 
-        natoms_list.append(data.natoms.item())
-        sid_list.extend(data.sid)
-        item = torch.full((data.num_nodes,), i, dtype=torch.long, device=device)
-        batch.append(item)
+        natoms_list.append(data.num_nodes)
 
     for key in keys:
+        if key == "batch":
+            continue
         items = batched_data_dict[key]
         item = items[0]
         cat_dim = cat_dims[key]
@@ -1148,8 +1162,18 @@ def atomicdata_list_to_batch(
             else:
                 batched_data_dict[key] = _clone_tensor_tree(items)
 
-    batched_data_dict["batch"] = torch.cat(batch, dim=-1)
-    batched_data_dict["sid"] = sid_list
+    if device.type == "cpu":
+        # NumPy handles these small CPU metadata arrays without a parallel
+        # PyTorch launch (which can dominate a two-structure collation).
+        batched_data_dict["batch"] = torch.from_numpy(
+            np.repeat(np.arange(len(data_list), dtype=np.int64), natoms_list)
+        )
+    else:
+        batched_data_dict["batch"] = torch.repeat_interleave(
+            torch.arange(len(data_list), dtype=torch.long, device=device),
+            torch.tensor(natoms_list, dtype=torch.long, device=device),
+            output_size=sum(natoms_list),
+        )
     atomic_data_batch = AtomicData.from_dict(batched_data_dict)
     atomic_data_batch.assign_batch_stats(slices, cumsum, cat_dims, natoms_list)
 

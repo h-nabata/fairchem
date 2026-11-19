@@ -23,7 +23,12 @@ from fairchem.core._config import CACHE_DIR
 from fairchem.core.common.distutils import resolve_xpu_device
 from fairchem.core.units.mlip_unit import MLIPPredictUnit, load_predict_unit
 from fairchem.core.units.mlip_unit.api.inference import guess_inference_settings
-from fairchem.core.units.mlip_unit.inference_runtime import probe_fp64_support
+from fairchem.core.units.mlip_unit.inference_runtime import (
+    _preflight_fp64,
+    probe_fp64_support,
+    validate_xpu_policy,
+)
+from fairchem.core.units.mlip_unit.series_b_runtime import validate_series_b
 
 if TYPE_CHECKING:
     from fairchem.core.units.mlip_unit import InferenceSettings
@@ -182,6 +187,7 @@ def get_predict_unit(
     """
     # Fail before authentication/download if an explicit Intel device cannot
     # serve the request. The predictor performs the same check on local loads.
+    evidence = None
     if device is not None and torch.device(device).type == "xpu":
         if workers != 1 or gp_config is not None:
             raise ValueError(
@@ -191,22 +197,32 @@ def get_predict_unit(
         # Validate a private settings copy before fetching weights. FP64 support
         # depends on the installed driver/operator stack, not just discovery of
         # the device. The constructor repeats this check for direct local loads.
-        settings = copy.deepcopy(guess_inference_settings(inference_settings))
+        settings = copy.deepcopy(
+            guess_inference_settings(
+                "xpu" if inference_settings == "default" else inference_settings
+            )
+        )
         settings.__post_init__()
+        validate_xpu_policy(settings)
+        validate_series_b(settings, device)
         if settings.base_precision_dtype == torch.float64:
-            probe_fp64_support(device)
+            evidence = (device, probe_fp64_support(device))
     checkpoint = resolve_checkpoint(model_name, cache_dir)
-    return load_predict_unit(
-        checkpoint.path,
-        inference_settings,
-        overrides,
-        device,
-        checkpoint.atom_refs,
-        checkpoint.form_elem_refs,
-        workers,
-        seed,
-        gp_config=gp_config,
-    )
+    token = _preflight_fp64.set(evidence)
+    try:
+        return load_predict_unit(
+            checkpoint.path,
+            inference_settings,
+            overrides,
+            device,
+            checkpoint.atom_refs,
+            checkpoint.form_elem_refs,
+            workers,
+            seed,
+            gp_config=gp_config,
+        )
+    finally:
+        _preflight_fp64.reset(token)
 
 
 def get_reference_energies(

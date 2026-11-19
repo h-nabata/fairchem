@@ -71,6 +71,9 @@ def prepare_series_b(model, settings, device):
             model.backbone,
             gemm_precision=options.gemm_precision,
             weight_bits=options.weight_bits,
+            quantize_only_if_smaller=options.quantize_only_if_smaller,
+            packed_tile_rows=options.packed_tile_rows,
+            low_rank_solver=options.low_rank_solver,
             low_rank_fraction=options.low_rank_fraction,
             low_precision_emulation=options.low_precision_emulation,
         )
@@ -89,6 +92,7 @@ def prepare_series_b(model, settings, device):
             model.backbone,
             dtype=options.saved_feature_dtype,
             min_elements=options.saved_feature_min_elements,
+            block_size=options.saved_feature_block_size,
         )
     manifest["compensated_reduction"] = options.compensated_reduction
     manifest["onednn_tf32"] = options.onednn_tf32

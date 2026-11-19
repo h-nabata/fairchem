@@ -86,14 +86,13 @@ from fairchem.core.units.mlip_unit.api.inference import (
     UMANitroNotSupportedError,
 )
 from fairchem.core.units.mlip_unit.utils import (
-    _TF32_CONTEXT_LOCK,
+    _precision_guard as _nitro_runtime_guard,
     tf32_context_manager,
 )
 
 # Kernels use process-wide tuning flags and one live capture. Share the precision
 # lock so direct model calls and MLIPPredictUnit cannot acquire these locks in
 # opposite orders. The CUDA predictor already scopes this same lock.
-_NITRO_RUNTIME_LOCK = _TF32_CONTEXT_LOCK
 
 # Constant geometry tensors need stable addresses during replay, but older
 # shapes must not accumulate over a sequence of differently sized jobs.
@@ -15008,7 +15007,7 @@ def runtime_cache_info():
     Counters include all Nitro models in this process. Take before/after snapshots
     around a benchmark; no input/output tensors or CUDA handles are exposed.
     """
-    with _NITRO_RUNTIME_LOCK:
+    with _nitro_runtime_guard(readonly=False):
         key = next(iter(_GRAPH_STATE), None)
         capacities = dict(key[3]) if isinstance(key, tuple) and len(key) > 4 else None
         return {
@@ -15100,7 +15099,7 @@ def _flush_graphs():
     """
     global _GRAPH_POOL, _GRAPH_DEVICE, _GRAPH_REFERENCES, _GRAPH_INPUTS
     global _GRAPH_OUTPUT_READY
-    with _NITRO_RUNTIME_LOCK, (
+    with _nitro_runtime_guard(readonly=False), (
         torch.cuda.device(_GRAPH_DEVICE) if _GRAPH_DEVICE is not None else nullcontext()
     ):
         torch.cuda.synchronize()
@@ -15130,7 +15129,7 @@ def _release_token_runtime(token):
     """
     Token-only finalization avoids keeping the model alive through its cleanup.
     """
-    with _NITRO_RUNTIME_LOCK:
+    with _nitro_runtime_guard(readonly=False):
         owns_graph = any(
             isinstance(key, tuple) and len(key) > 4 and key[4] == token
             for key in _GRAPH_STATE
@@ -15409,7 +15408,7 @@ def _nitro_forward(model, data, core=_forward_tensors, *, geometry_key=None):
         else nullcontext()
     )
     with (
-        _NITRO_RUNTIME_LOCK,
+        _nitro_runtime_guard(readonly=False),
         device_scope,
         torch.inference_mode(False),
         torch.enable_grad(),
@@ -15527,7 +15526,7 @@ def set_force_precision(force_fp32: bool) -> None:
         force_fp32: Whether force and stress intermediates use fp32. Captured
             graphs are flushed so a change takes effect.
     """
-    with _NITRO_RUNTIME_LOCK:
+    with _nitro_runtime_guard(readonly=False):
         g = globals()
         changed = any(g[_name] != (not force_fp32) for _name in _FORCE_PATH_FP16_FLAGS)
         if not changed:
@@ -16480,7 +16479,7 @@ class UMANitroModel(_NitroCacheState, nn.Module):
         """
         Free captured CUDA graphs before this model is discarded.
         """
-        with _NITRO_RUNTIME_LOCK:
+        with _nitro_runtime_guard(readonly=False):
             _release_runtime(self)
             self._clear_kernel_caches()
 
@@ -16495,12 +16494,12 @@ class UMANitroModel(_NitroCacheState, nn.Module):
     def _apply(self, fn, recurse=True):
         # Derived layouts are ordinary Tensor attributes, so Module.to() cannot
         # move them. Drop captured addresses and rebuild from moved weights.
-        with _NITRO_RUNTIME_LOCK:
+        with _nitro_runtime_guard(readonly=False):
             self.release_inference_resources()
             return super()._apply(fn, recurse=recurse)
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
-        with _NITRO_RUNTIME_LOCK:
+        with _nitro_runtime_guard(readonly=False):
             result = super().load_state_dict(state_dict, strict=strict, assign=assign)
             self.requires_grad_(False)
             return result
@@ -16517,7 +16516,7 @@ class UMANitroModel(_NitroCacheState, nn.Module):
     ):
         # Parent/wrapper loads recurse through this hook, bypassing the public
         # load_state_dict override. Invalidate captured addresses in both paths.
-        with _NITRO_RUNTIME_LOCK:
+        with _nitro_runtime_guard(readonly=False):
             self.release_inference_resources()
             # assign=True preserves destination requires_grad, so freezing before
             # recursion also covers parameters loaded through a parent module.

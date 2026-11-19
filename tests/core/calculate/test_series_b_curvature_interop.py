@@ -76,12 +76,19 @@ def test_retained_curvature_failure_releases_private_vectors(workflow, error_typ
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
 def test_lanczos_releases_basis_matrix_before_residual_products(monkeypatch, dtype):
     matrices = []
-    stack = torch.stack
+    empty = torch.Tensor.new_empty
+    empty_like = torch.empty_like
     calls = 0
 
-    def track_stack(values, *args, **kwargs):
-        result = stack(values, *args, **kwargs)
-        if kwargs.get("dim") == 1:
+    def track_empty(tensor, size, **kwargs):
+        result = empty(tensor, size, **kwargs)
+        if size == (4, 4):
+            matrices.append(weakref.ref(result))
+        return result
+
+    def track_like(tensor, **kwargs):
+        result = empty_like(tensor, **kwargs)
+        if tensor.shape == (4, 4):
             matrices.append(weakref.ref(result))
         return result
 
@@ -95,7 +102,8 @@ def test_lanczos_releases_basis_matrix_before_residual_products(monkeypatch, dty
             assert all(reference() is None for reference in matrices)
         return diagonal * vector
 
-    monkeypatch.setattr(torch, "stack", track_stack)
+    monkeypatch.setattr(torch.Tensor, "new_empty", track_empty)
+    monkeypatch.setattr(torch, "empty_like", track_like)
     result = lanczos_modes(
         product,
         torch.zeros_like(diagonal),

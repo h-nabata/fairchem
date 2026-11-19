@@ -313,14 +313,13 @@ class BatchPredictServerMixin:
         from fairchem.core.calculate.batched_inference import (
             _compatibility_key,
             _normalize_requested_properties,
+            _requires_single_system,
         )
 
         if not items:
             return []
         settings = getattr(predict_unit, "inference_settings", None)
-        nitro = getattr(settings, "nitro", False)
         default_requested = getattr(settings, "requested_properties", None)
-        tasks = getattr(predict_unit, "dataset_to_tasks", {})
         groups = defaultdict(list)
         for index, data in enumerate(items):
             if data.num_graphs != 1:
@@ -339,24 +338,9 @@ class BatchPredictServerMixin:
             # Dense Hessians have system-dependent square shapes, and UMA
             # computes them for one structure at a time. A batch window may
             # still contain several such requests; isolate their forward calls.
-            dense_hessian = (
-                "hessian" in requested
-                if requested is not None
-                else any(
-                    task.property == "hessian"
-                    for dataset in data.dataset
-                    for task in tasks.get(dataset, ())
-                )
-                or bool(
-                    set(data.dataset)
-                    & set(getattr(settings, "predict_untrained_hessian", ()))
-                )
-            )
             key = (
                 _compatibility_key(data),
-                # Keep explicitly selected Nitro active for independent MD
-                # requests; its ordinary composition checks still apply.
-                index if dense_hessian or nitro else None,
+                index if _requires_single_system(predict_unit, data, requested) else None,
             )
             groups[key].append(index)
         if len(groups) > 1:
@@ -388,7 +372,8 @@ class BatchPredictServerMixin:
                 {} if requested is None else {"requested_properties": requested}
             )
             try:
-                preds = predict_unit.predict(
+                predict = getattr(predict_unit, "_predict_owned_batch", predict_unit.predict)
+                preds = predict(
                     batch,
                     undo_element_references=undo_element_references,
                     **predict_kwargs,

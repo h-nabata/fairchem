@@ -36,6 +36,11 @@ class SeriesBSettings:
     radial_fast_exp: bool = False
     onednn_tf32: bool = False
 
+    quantize_only_if_smaller: bool = False
+    packed_tile_rows: int | None = None
+    saved_feature_block_size: int | None = None
+    low_rank_solver: str = "exact"
+
     def __post_init__(self):
         if self.gemm_precision not in {
             "fp32",
@@ -48,6 +53,7 @@ class SeriesBSettings:
         for name in (
             "low_precision_emulation",
             "compensated_reduction",
+            "quantize_only_if_smaller",
             "radial_fast_exp",
             "onednn_tf32",
         ):
@@ -59,6 +65,12 @@ class SeriesBSettings:
             or self.weight_bits not in (4, 8)
         ):
             raise ValueError("series_b.weight_bits must be 4, 8 or None")
+        if self.low_rank_solver not in ("exact", "randomized") or (
+            self.low_rank_solver != "exact" and self.low_rank_fraction is None
+        ):
+            raise ValueError(
+                "low_rank_solver must be exact, or randomized with low_rank_fraction"
+            )
         if self.low_rank_fraction is not None:
             value = self.low_rank_fraction
             if (
@@ -77,6 +89,8 @@ class SeriesBSettings:
         for name, minimum in (
             ("saved_feature_min_elements", 1),
             ("radial_table_points", 2),
+            ("saved_feature_block_size", 1),
+            ("packed_tile_rows", 1),
         ):
             value = getattr(self, name)
             if value is not None and (
@@ -85,6 +99,15 @@ class SeriesBSettings:
                 or value < minimum
             ):
                 raise ValueError(f"series_b.{name} must be an integer >= {minimum}")
+        if (
+            self.saved_feature_block_size is not None
+            and self.saved_feature_dtype is None
+        ):
+            raise ValueError("saved_feature_block_size requires saved_feature_dtype")
+        if (
+            self.quantize_only_if_smaller or self.packed_tile_rows is not None
+        ) and self.weight_bits is None:
+            raise ValueError("A packed weight option requires weight_bits")
         if self.saved_feature_min_elements is None:
             raise ValueError("series_b.saved_feature_min_elements cannot be None")
         if self.radial_fast_exp and self.radial_table_points is not None:
@@ -97,6 +120,8 @@ class SeriesBSettings:
             "weight_bits",
             "saved_feature_min_elements",
             "radial_table_points",
+            "saved_feature_block_size",
+            "packed_tile_rows",
         ):
             if getattr(self, name) is not None:
                 object.__setattr__(self, name, int(getattr(self, name)))

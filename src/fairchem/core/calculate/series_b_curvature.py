@@ -7,6 +7,7 @@ LICENSE file in the root directory of this source tree.
 
 from __future__ import annotations
 
+import copy
 import math
 from dataclasses import dataclass
 from numbers import Integral, Real
@@ -15,6 +16,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from fairchem.core.calculate.series_b_workflows import _release_failed_workflow
+from fairchem.core.datasets.atomic_data import _clone_tensor_tree
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -99,9 +101,18 @@ class HutchinsonOptions:
 
     samples: int = 64
     seed: int = 41
+    probe_block_size: int = 1
+    device_block_statistics: bool = False
 
     def __post_init__(self):
+        if not isinstance(self.device_block_statistics, bool):
+            raise TypeError("device_block_statistics must be boolean")
         object.__setattr__(self, "samples", _integer("samples", self.samples, 2))
+        object.__setattr__(
+            self,
+            "probe_block_size",
+            _integer("probe_block_size", self.probe_block_size, 1),
+        )
         object.__setattr__(self, "seed", _integer("seed", self.seed, 0))
         if self.seed >= 2**63:
             raise ValueError("seed must be smaller than 2**63")
@@ -112,7 +123,7 @@ class HutchinsonResult:
     """
     Trace and coordinate diagonal estimates with sample variances and SEs.
 
-    Statistics are accumulated in CPU FP64 using online updates; no collection
+    Statistics use FP64 online sample or block updates; no collection
     of all probe products is retained. Standard errors are estimates, not
     guaranteed confidence intervals or relative-error bounds. Indefinite
     Hessians and zero/negative traces are permitted. These estimates do not
@@ -150,7 +161,12 @@ def _template(hvp, template):
 def _product(hvp, vector, template):
     # An operator is allowed to retain or modify its input, or reuse an output
     # buffer. Neither action may corrupt the Krylov basis or a saved probe.
-    argument = vector.reshape(template.shape).detach().clone()
+    argument = vector.reshape(template.shape).detach()
+    if type(hvp) is PredictorHVP:
+        # The adapter already protects its argument and returns a finite owned result.
+        with torch.enable_grad(), torch.autocast(template.device.type, enabled=False):
+            return hvp(argument).flatten()
+    argument = argument.clone()
     with torch.enable_grad(), torch.autocast(template.device.type, enabled=False):
         result = hvp(argument)
     if not isinstance(result, torch.Tensor) or result.shape != template.shape:
@@ -167,7 +183,7 @@ def _orthogonalize(vector, basis):
     # especially for degenerate eigenvalues and near-breakdown in FP32.
     # Operator products are also stored in the projected subspace. Own the
     # residual once, then reuse it without overwriting those stored products.
-    if not basis:
+    if len(basis) == 0:
         return vector
     vector = vector.clone()
     for _ in range(2):
@@ -247,33 +263,30 @@ def lanczos_modes(
     if options.num_modes > iterations:
         raise ValueError("num_modes cannot exceed the dimension or max_iterations")
     generator = torch.Generator(device="cpu").manual_seed(options.seed)
-    basis, products = [], []
-    q = _random_direction(dimension, reference, generator, basis)
+    # Contiguous rows keep the repeated reorthogonalization dots contiguous.
+    basis = reference.new_empty((iterations, dimension))
+    products = torch.empty_like(basis)
+    q = _random_direction(dimension, reference, generator, ())
     with torch.no_grad(), torch.autocast(reference.device.type, enabled=False):
         for index in range(iterations):
-            basis.append(q)
+            basis[index].copy_(q)
             hq = _product(hvp, q, reference)
-            products.append(hq)
+            products[index].copy_(hq)
             if index + 1 == iterations:
                 break
-            residual = _orthogonalize(hq, basis)
+            residual = _orthogonalize(hq, basis[: index + 1])
             norm = _scaled_norm(residual)
             scale = max(torch.finfo(reference.dtype).tiny, _scaled_norm(hq).item())
             if norm.item() <= 32 * torch.finfo(reference.dtype).eps * scale:
-                q = _random_direction(dimension, reference, generator, basis)
+                q = _random_direction(
+                    dimension, reference, generator, basis[: index + 1]
+                )
             else:
                 q = residual / norm
-        q_matrix = torch.stack(basis, dim=1)
-        # Stacking copies the vectors. Release each source collection before
-        # stacking the other one, avoiding four simultaneous dimension-by-
-        # iteration buffers for large matrix-free problems.
-        del basis, q
-        hq_matrix = torch.stack(products, dim=1)
-        del products, hq
-        # Only the small projected eigensolve runs on CPU FP64. There is no
-        # requirement for an accelerator FP64 eigh kernel.
-        projected = (q_matrix.T @ hq_matrix).to(device="cpu", dtype=torch.float64)
-        del hq_matrix
+            del residual
+        del hq, q
+        projected = (basis @ products.T).to(device="cpu", dtype=torch.float64)
+        del products
         if not torch.isfinite(projected).all():
             raise ValueError(
                 "Curvature projection overflowed; rescale the HVP operator"
@@ -292,10 +305,10 @@ def lanczos_modes(
             raise ValueError("HVP is not symmetric within symmetry_tolerance")
         eigenvalues, rotations = torch.linalg.eigh((projected + projected.T) * 0.5)
         values = (eigenvalues[: options.num_modes] * projection_scale).to(reference)
-        vectors = q_matrix @ rotations[:, : options.num_modes].to(reference)
+        vectors = basis.T @ rotations[:, : options.num_modes].to(reference)
         # Ritz vectors own their matrix-product storage. The full Krylov basis
         # need not overlap the fresh model graphs used to check each residual.
-        del q_matrix
+        del basis
         vectors = vectors / _scaled_norm(vectors, dim=0, keepdim=True)
         if not torch.isfinite(values).all():
             raise ValueError(
@@ -323,6 +336,28 @@ def lanczos_modes(
     )
 
 
+def _merge_probe_block(probes, start, mean, m2, trace_mean, trace_m2):
+    """Merge device FP64 population moments into CPU Welford accumulators."""
+    count, dim = probes.shape
+    values = probes.double()
+    variance, average = torch.var_mean(values, dim=0, correction=0)
+    trace_var, trace_avg = torch.var_mean(values.sum(dim=1), correction=0)
+    moments = torch.cat((variance, average, trace_var[None], trace_avg[None])).cpu()
+    for mu, total_m2, batch_mean, batch_var in (
+        (mean, m2, moments[dim : 2 * dim], moments[:dim]),
+        (trace_mean, trace_m2, moments[-1], moments[-2]),
+    ):
+        if start == 0:
+            mu.copy_(batch_mean)
+            total_m2.copy_(batch_var * count)
+        else:
+            delta = batch_mean - mu
+            mu.add_(delta * (count / (start + count)))
+            total_m2.add_(
+                batch_var * count + delta.square() * (start * count / (start + count))
+            )
+
+
 @_release_failed_workflow
 def hutchinson_estimates(
     hvp: Callable[[torch.Tensor], torch.Tensor],
@@ -336,8 +371,10 @@ def hutchinson_estimates(
     ``z * H(z)`` estimates the diagonal and its sum estimates the trace. A
     private CPU generator makes the chosen probes reproducible across devices
     without reseeding the application's RNG. HVPs stay on the template device;
-    one O(dimension) result is copied to CPU per sample for FP64 online
-    statistics. All returned estimates and uncertainties are CPU FP64 tensors.
+    probe_block_size controls how many probes and results share each transfer.
+    The default CPU FP64 online updates retain the same sample order for every
+    block size. device_block_statistics uses device FP64 population moments and
+    merges them on CPU, changing the rounding order. It requires device FP64. All returned estimates and uncertainties are CPU FP64 tensors.
     """
     if torch.is_inference_mode_enabled():
         raise RuntimeError("Curvature workflows must run outside torch.inference_mode")
@@ -352,31 +389,48 @@ def hutchinson_estimates(
     trace_mean = torch.zeros((), dtype=torch.float64, device="cpu")
     trace_m2 = torch.zeros_like(trace_mean, device="cpu")
     with torch.no_grad():
-        for index in range(1, options.samples + 1):
-            probe = torch.randint(
-                2, (reference.numel(),), generator=generator, device="cpu"
+        for start in range(0, options.samples, options.probe_block_size):
+            count = min(options.probe_block_size, options.samples - start)
+            # Generate each row with the original shape and generator to preserve
+            # RNG consumption across block sizes and devices.
+            signs = torch.empty(
+                (count, reference.numel()), dtype=torch.long, device="cpu"
             )
-            probe = (2 * probe - 1).to(reference)
-            sample = (_product(hvp, probe, reference) * probe).to(
-                device="cpu", dtype=torch.float64
-            )
-            delta = sample - mean
-            mean += delta / index
-            m2 += delta * (sample - mean)
-            trace_sample = sample.sum()
-            trace_delta = trace_sample - trace_mean
-            trace_mean += trace_delta / index
-            trace_m2 += trace_delta * (trace_sample - trace_mean)
-            if not all(
-                torch.isfinite(statistic).all()
-                for statistic in (mean, m2, trace_mean, trace_m2)
-            ):
-                raise ValueError(
-                    "Hutchinson statistics overflowed in FP64; rescale the HVP operator"
-                )
-            # Only the online statistics carry over to the next HVP. In large
-            # systems these vectors need not overlap the next model's graph.
-            del probe, sample, delta, trace_sample, trace_delta
+            for row in signs:
+                torch.randint(2, row.shape, generator=generator, out=row, device="cpu")
+            probes = signs.mul_(2).sub_(1).to(reference)
+            del signs
+            for probe in probes:
+                probe.mul_(_product(hvp, probe, reference))
+            if options.device_block_statistics:
+                _merge_probe_block(probes, start, mean, m2, trace_mean, trace_m2)
+                del probes, probe
+                if not all(
+                    torch.isfinite(x).all() for x in (mean, m2, trace_mean, trace_m2)
+                ):
+                    raise ValueError(
+                        "Hutchinson statistics overflowed in FP64; rescale the HVP operator"
+                    )
+                continue
+            samples = probes.to(device="cpu", dtype=torch.float64)
+            del probes, probe
+            for index, sample in enumerate(samples, start=start + 1):
+                delta = sample - mean
+                mean += delta / index
+                m2 += delta * (sample - mean)
+                trace_sample = sample.sum()
+                trace_delta = trace_sample - trace_mean
+                trace_mean += trace_delta / index
+                trace_m2 += trace_delta * (trace_sample - trace_mean)
+                if not all(
+                    torch.isfinite(statistic).all()
+                    for statistic in (mean, m2, trace_mean, trace_m2)
+                ):
+                    raise ValueError(
+                        "Hutchinson statistics overflowed in FP64; rescale the HVP operator"
+                    )
+                del sample, delta, trace_sample, trace_delta
+            del samples
         variance = (m2 / (options.samples - 1)).clamp_min(0)
         trace_variance = (trace_m2 / (options.samples - 1)).clamp_min(0)
     return HutchinsonResult(
@@ -414,13 +468,18 @@ class PredictorHVP:
         dtype = settings.base_precision_dtype
         if dtype not in (torch.float32, torch.float64):
             raise ValueError("PredictorHVP requires float32 or float64 base precision")
+        from fairchem.core.units.mlip_unit.predict import MLIPPredictUnit
+
+        self._copying_predict = MLIPPredictUnit.predict
         self.predictor = predictor
-        self._data = data.clone()
+        self._data = _clone_tensor_tree(
+            data, tensor_transform=lambda tensor: tensor.detach().clone()
+        )
         for key in ("hessian_vector", "_requested_properties"):
             if key in self._data:
                 del self._data[key]
-        self._template = torch.zeros_like(
-            data.pos, dtype=dtype, device=torch.device(predictor.device)
+        self._template = torch.zeros((), dtype=dtype, device=predictor.device).expand(
+            data.pos.shape
         )
 
     @property
@@ -440,11 +499,17 @@ class PredictorHVP:
             raise ValueError("HVP vector must match the adapter template")
         if not torch.isfinite(vector).all():
             raise ValueError("HVP vector must be finite")
-        data = self._data.clone()
-        data["hessian_vector"] = vector.detach().clone()
-        output = self.predictor.predict(
-            data, requested_properties=("hessian_vector_product",)
-        )
+        predict = self.predictor.predict
+        if getattr(predict, "__func__", None) is self._copying_predict:
+            # Public predict makes its own device/dtype-adjusted tensors. Give
+            # this call a separate field set for the per-direction HVP argument.
+            data = copy.copy(self._data)
+            data.__keys__ = data.keys().copy()
+            data["hessian_vector"] = vector.detach()
+        else:
+            data = self._data.clone()
+            data["hessian_vector"] = vector.detach().clone()
+        output = predict(data, requested_properties=("hessian_vector_product",))
         result = output.get("hessian_vector_product")
         if not isinstance(result, torch.Tensor) or result.shape != vector.shape:
             raise ValueError("Predictor did not return a coordinate-shaped HVP")
