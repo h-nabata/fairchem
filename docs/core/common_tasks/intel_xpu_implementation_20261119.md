@@ -268,4 +268,6 @@ python -m fairchem.core.regression_suite fast xpu --device xpu:0 --run-on local 
 
 `full`で全対象構造を評価できる。`xpu-fp64`、`xpu-bf16`、`xpu-int4`、`xpu-int8`、`xpu-radial-table`、`xpu-fp64-saved-fp32`は別々の候補として記録する。固定組成の緩和・MDではE/Fと応力、NVEのドリフト、最大VRAMを揃える。反応経路では同じ始終構造で相対エネルギーと各像の力を比較し、振動・鞍点では同一座標でHVPを力の差分と比較する。GPUが2枚ある場合は1枚ずつの基準も採り、1系の待ち時間と複数系の総処理量を別々に評価する。
 
+2枚のB70を登録したrunnerでは、リポジトリ変数 `XE_B70_CI=true` と `XE_B70_CHECKPOINT` で実機試験を有効にする。物性回帰も実行する場合は `XE_B70_BASELINE` に検証済みの基準ファイル、`XE_B70_CHECKPOINT_ID` にそのモデルIDを指定する。strict FP32、FP64、INT8の結果を別々のJSONで保存する。
+
 [物性回帰の仕様と基準ファイルの作り方](regression_suite.md) · [Intel XPUの導入](intel_xpu.md) · [Xe実機ワークフロー](../../../.github/workflows/xe-hardware.yml)

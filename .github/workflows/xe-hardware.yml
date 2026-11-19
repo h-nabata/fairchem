@@ -60,6 +60,19 @@ jobs:
               --compare-merged "${options[@]}" --case periodic --neighbor-skin 0.5 \
               --geometry-workloads subskin rebuild strain --output "results/$mode.json"
           done
+      - name: Compare Xe profiles with the pinned physical reference
+        if: vars.XE_B70_BASELINE != ''
+        env:
+          BASELINE: ${{ vars.XE_B70_BASELINE }}
+          CHECKPOINT_ID: ${{ vars.XE_B70_CHECKPOINT_ID }}
+        run: |
+          test -f "$BASELINE"
+          test -n "$CHECKPOINT_ID"
+          for profile in xpu xpu-fp64 xpu-int8; do
+            python -m fairchem.core.regression_suite fast "$profile" --run-on local --device xpu:1 \
+              --suite prediction-fidelity --baseline "$BASELINE" --checkpoint "$MODEL" \
+              --checkpoint-id "$CHECKPOINT_ID" --no-wandb --format json > "results/reference-$profile.json"
+          done
       - name: Measure single-card and independent dual-card batch throughput
         run: |
           for count in 1 2; do
