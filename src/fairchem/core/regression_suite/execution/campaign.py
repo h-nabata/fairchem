@@ -207,6 +207,7 @@ def candidate_run_report(candidate_dir: str | Path) -> dict[str, Any]:
         manifest["baseline_dir"],
         candidate_dir,
         candidate_profile=manifest["profile_config"],
+        launch_identity={key: manifest[key] for key in ("device", "git_commit")},
         suites=selected if selected != manifest["supported_suites"] else None,
     )
 

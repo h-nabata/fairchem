@@ -13,6 +13,7 @@ import copy
 import gc
 import json
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -29,7 +30,10 @@ from fairchem.core.regression_suite.artifacts.storage import (
     write_json_atomic,
     write_reference,
 )
-from fairchem.core.regression_suite.evaluation.identity import expected_identity
+from fairchem.core.regression_suite.evaluation.identity import (
+    expected_identity,
+    validate_identity,
+)
 from fairchem.core.regression_suite.evaluation.performance import (
     build_performance_sidecar,
 )
@@ -164,10 +168,18 @@ def _performance_sidecar(
         }
     if not metric_specs:
         return None
+    protocol = dict(suite.performance_protocol)
+    if torch.device(identity["device"]).type == "cpu":
+        protocol.update(synchronization="none", memory_measurement="not-collected")
+    elif torch.device(identity["device"]).type == "xpu":
+        # Keep upstream CUDA protocol identifiers intact for pinned sidecars.
+        for key in ("synchronization", "memory_measurement"):
+            if key in protocol:
+                protocol[key] = protocol[key].replace("cuda", "xpu")
     return build_performance_sidecar(
         metric_specs,
         samples,
-        protocol=suite.performance_protocol,
+        protocol=protocol,
         identity=identity,
         environment=identity["execution_environment"],
     )
@@ -348,19 +360,37 @@ def run_suite(config: DictConfig | Mapping[str, Any]) -> dict[str, Any]:
         if identity["predictor_scope"] == "suite"
         else _predictor_groups(suite, case_specs)
     )
-    for group in groups:
-        predictor = pretrained_mlip.get_predict_unit(
-            str(cfg.checkpoint),
-            inference_settings=copy.deepcopy(settings),
-            device=identity["device"],
-            seed=identity["seed"],
-        )
-        group_records, group_samples = _records_for_cases(suite, predictor, group)
-        _validate_effective_settings(predictor, identity["inference_settings"])
-        records.extend(group_records)
-        samples.extend(group_samples)
-        del predictor
-        _release_predictor(compiled=settings.compile, device=identity["device"])
+    requested = torch.device(identity["device"])
+    backend = (
+        getattr(torch, requested.type) if requested.type in {"cuda", "xpu"} else None
+    )
+    context = backend.device(requested) if backend is not None else nullcontext()
+    with context:
+        for group in groups:
+            predictor = pretrained_mlip.get_predict_unit(
+                str(cfg.checkpoint),
+                inference_settings=copy.deepcopy(settings),
+                device=identity["device"],
+                seed=identity["seed"],
+            )
+            try:
+                actual = torch.device(predictor.device)
+                if actual.type != requested.type or (
+                    requested.index is not None and actual.index != requested.index
+                ):
+                    raise RegressionSchemaError(
+                        f"predictor device {actual} differs from requested {requested}"
+                    )
+                _validate_effective_settings(predictor, identity["inference_settings"])
+                group_records, group_samples = _records_for_cases(
+                    suite, predictor, group
+                )
+                _validate_effective_settings(predictor, identity["inference_settings"])
+                records.extend(group_records)
+                samples.extend(group_samples)
+            finally:
+                del predictor
+                _release_predictor(compiled=settings.compile, device=identity["device"])
     sidecar = None
     if identity["role"] != "reference" and not smoke and shard_index is None:
         sidecar = _performance_sidecar(suite, samples, identity=identity)
@@ -390,8 +420,30 @@ def merge_suite_shards(
     _check_output(output)
     records = []
     environments = set()
-    for index in range(shard_count):
+    if shard_count != len(plan.cases):
+        raise RegressionSchemaError("shard count differs from the suite plan")
+    shared_identity = {key: value for key, value in identity.items() if key != "run_id"}
+    for index, case in enumerate(plan.cases):
         manifest, shard_records = load_reference(Path(shard_root) / f"{index:04d}")
+        validate_identity(
+            manifest["identity"],
+            {
+                **shared_identity,
+                "case_shard_index": index,
+                "case_shard_count": shard_count,
+                "selected_cases": [
+                    {
+                        "case_id": case.case_id,
+                        "transform_id": case.transform.transform_id,
+                    }
+                ],
+            },
+            label=f"case shard {index}",
+        )
+        if {(record.case_id, record.transform_id) for record in shard_records} != {
+            (case.case_id, case.transform.transform_id)
+        }:
+            raise RegressionSchemaError(f"records differ from case shard {index}")
         environments.add(canonical_json(manifest["identity"]["execution_environment"]))
         records.extend(shard_records)
     merged_cases = {(record.case_id, record.transform_id) for record in records}

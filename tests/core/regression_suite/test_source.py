@@ -8,6 +8,7 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -103,3 +104,27 @@ def test_source_marker_takes_precedence_over_git(repository):
     (repository / SOURCE_MARKER).write_text('{"git_commit": "snapshot-commit"}\n')
 
     assert source_provenance(repository) == ("snapshot-commit", False)
+
+
+def test_xpu_packaging_is_part_of_snapshot_and_source_provenance(repository, tmp_path):
+    project = Path("packages/fairchem-core-xpu/pyproject.toml")
+    (repository / project).parent.mkdir()
+    (repository / project).write_text("[project]\n")
+    assert git_provenance(repository)[1]
+    _git(repository, "add", str(project))
+    _git(
+        repository,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "--quiet",
+        "-m",
+        "XPU package",
+    )
+    commit, dirty = git_provenance(repository)
+    assert not dirty
+    assert (
+        create_source_snapshot(repository, commit, tmp_path / "xpu") / project
+    ).read_text() == "[project]\n"

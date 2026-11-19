@@ -45,6 +45,7 @@ _SNAPSHOT_PATHS = ("src", "packages/fairchem-core/pyproject.toml")
 _PROVENANCE_PATHSPECS = (
     ":(top)src/fairchem/core",
     ":(top)packages/fairchem-core/pyproject.toml",
+    ":(top)packages/fairchem-core-xpu/pyproject.toml",
 )
 
 
@@ -101,6 +102,11 @@ def create_source_snapshot(
     output = Path(destination)
     with staged_directory(output) as temporary:
         archive = temporary / "source.tar"
+        # Upstream commits predate the fork's standalone XPU package.
+        xpu_project = "packages/fairchem-core-xpu/pyproject.toml"
+        xpu_paths = git_output(
+            repo_dir, "ls-tree", "--name-only", commit, "--", xpu_project
+        ).splitlines()
         git_output(
             repo_dir,
             "archive",
@@ -109,6 +115,7 @@ def create_source_snapshot(
             commit,
             "--",
             *_SNAPSHOT_PATHS,
+            *xpu_paths,
         )
         with tarfile.open(archive) as handle:
             handle.extractall(temporary, filter="data")
@@ -163,9 +170,12 @@ def _prepare_environment(repo_dir: str) -> None:
         entry for entry in sys.path if entry != source_directory
     ]
     prepend_pythonpath(source_directory)
-    for variable in _PROXY_VARIABLES:
-        os.environ.pop(variable, None)
-    os.environ["HF_HUB_OFFLINE"] = "1"
+    if os.environ.get("SLURM_JOB_ID") and not os.environ.get(
+        "FAIRCHEM_REGRESSION_LOCAL_WORKER"
+    ):
+        for variable in _PROXY_VARIABLES:
+            os.environ.pop(variable, None)
+        os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["WANDB_INIT_TIMEOUT"] = "300"
     prepare_compilation_cache()
 

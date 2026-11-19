@@ -205,7 +205,7 @@ def summarize_run(
         raise RegressionSchemaError(
             "a compared run must be distinct from its FP64 reference"
         )
-    for field in ("plan_hash", "suite_contract_hash"):
+    for field in ("suite", "checkpoint", "seed", "plan_hash", "suite_contract_hash"):
         if identity.get(field) != reference_identity.get(field):
             raise RegressionSchemaError(f"run {field} differs from the FP64 reference")
     if identity.get("scope") == "smoke":
@@ -217,6 +217,20 @@ def summarize_run(
             record
             for record in reference_records
             if (record.case_id, record.transform_id) in selected
+        ]
+    # CPU runs cannot produce allocator statistics for an accelerator. Only
+    # omit this report-only pair when the reference and candidate straddle
+    # that boundary. Keep completeness checks for every physical observable.
+    devices = {
+        identity.get("execution_environment", {}).get("device_type"),
+        reference_identity.get("execution_environment", {}).get("device_type"),
+    }
+    if "cpu" in devices and devices.intersection({"xpu", "cuda"}):
+        records = [r for r in records if r.observable != "performance_peak_gpu_memory"]
+        reference_records = [
+            r
+            for r in reference_records
+            if r.observable != "performance_peak_gpu_memory"
         ]
     summary = compare_records(
         reference_records,

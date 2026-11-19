@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import torch
 
 from fairchem.core.regression_suite.artifacts.baselines import (
     baseline_provenance,
@@ -58,6 +59,7 @@ from fairchem.core.regression_suite.spec.schema import (
     DECISION_STATISTICS,
     PRECISION_TIERS,
     PROFILE_TIERS,
+    RegressionSchemaError,
 )
 from fairchem.core.regression_suite.suites import SUITES, load_suite
 
@@ -152,8 +154,32 @@ def _qualify_candidate(
     baseline: Mapping[str, Any],
     expectation: Mapping[str, Any],
     role: str,
+    launch_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     baseline_suite = baseline["suites"][suite]
+    if role == "verification":
+        # A sealed upstream baseline records the profile fields available at
+        # its own commit, before this fork added settings to the dataclass.
+        archived = baseline_suite["verifications"][profile]
+        run_fields = {
+            key: archived[key]
+            for key in ("inference_settings", "predictor_scope", "run_id", "git_commit")
+        }
+        run_fields["device"] = baseline["device"]
+    else:
+        run_fields = {
+            "predictor_scope": expectation["predictor_scope"],
+            "inference_settings": expectation["inference_settings"],
+            **(launch_identity or {}),
+        }
+    recorded_device = torch.device(summary["identity"]["device"])
+    if (
+        summary["identity"]["execution_environment"]["device_type"]
+        != recorded_device.type
+    ):
+        raise RegressionSchemaError(
+            "candidate device differs from its execution environment"
+        )
     validate_identity(
         summary["identity"],
         {
@@ -165,9 +191,7 @@ def _qualify_candidate(
             "checkpoint": baseline["checkpoint"],
             "seed": baseline["seed"],
             "git_dirty": False,
-            "device": baseline["device"],
-            "predictor_scope": expectation["predictor_scope"],
-            "inference_settings": expectation["inference_settings"],
+            **run_fields,
             "case_count": baseline_suite["profiles"]["fp64-eager"]["completion"][
                 "requested_cases"
             ],
@@ -570,6 +594,7 @@ def build_candidate_report(
     candidate_profile: str,
     suites: Sequence[str] | None = None,
     role: str = "comparison",
+    launch_identity: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Build a complete, artifact-only candidate regression report.
@@ -618,14 +643,24 @@ def build_candidate_report(
                 baseline=baseline,
                 expectation=suite_expectation(suite, config),
                 role=role,
+                launch_identity=launch_identity,
             )
+            if candidate_runs and role == "comparison":
+                first = candidate_runs[0][1]
+                validate_identity(
+                    summary["identity"],
+                    {key: first[key] for key in ("git_commit", "device")},
+                    label="candidate campaign",
+                )
             candidate_runs.append((suite, summary["identity"]))
         observables = [
             _observable_report(
                 name,
                 baseline_observables[name],
-                None if summary is None else summary["observables"][name],
-                None if qualification is None else qualification["observables"][name],
+                None if summary is None else summary["observables"].get(name),
+                None
+                if qualification is None
+                else qualification["observables"].get(name),
                 definition.observable_descriptions.get(name),
             )
             for name in sorted(baseline_observables)
@@ -724,7 +759,14 @@ def build_candidate_report(
         },
         "candidate": {
             key: identity[key]
-            for key in ("profile", "checkpoint", "seed", "git_commit", "git_dirty")
+            for key in (
+                "profile",
+                "checkpoint",
+                "seed",
+                "git_commit",
+                "git_dirty",
+                "device",
+            )
         },
         "executions": _execution_environment_rows(
             baseline, selected_suites, candidate_runs, role

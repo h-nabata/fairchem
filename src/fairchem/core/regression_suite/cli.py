@@ -724,7 +724,7 @@ def _run(args: argparse.Namespace, _settings: DictConfig) -> int:
     return 0
 
 
-_DEVICE_HELP = "auto, cpu, cuda, or an explicit Intel device, for example xpu:1"
+_DEVICE_HELP = "auto, cpu, cuda[:index], or xpu[:index], for example xpu:1"
 _BASELINE_HELP = (
     "baseline reference: hf:ORG/REPO/PATH[@REVISION], "
     "wandb:[ENTITY/PROJECT/]NAME[:ALIAS], a local name or path, or current "

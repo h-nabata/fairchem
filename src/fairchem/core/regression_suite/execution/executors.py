@@ -210,6 +210,7 @@ class LocalExecutor:
                         if not key.startswith("SLURM_ARRAY_")
                     },
                     **slot,
+                    "FAIRCHEM_REGRESSION_LOCAL_WORKER": "1",
                 }
                 with log.open("w", encoding="utf-8") as output:
                     result = subprocess.run(
