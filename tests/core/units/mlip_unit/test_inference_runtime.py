@@ -624,3 +624,103 @@ def test_xpu_numeric_graph_values_gradients_and_two_submission_streams():
 def test_runtime_settings_reject_invalid_limits(kwargs):
     with pytest.raises(ValueError):
         InferenceSettings(**kwargs)
+
+
+def test_discarded_tape_releases_graph_but_downstream_tensor_keeps_it(monkeypatch):
+    runtime = NumericCoreRuntime(lambda x: x.square(), xpu_graph=True)
+
+    def arguments(args, kwargs):
+        leaves, spec = _pytree.tree_flatten((args, kwargs))
+        return leaves, spec, list(args), "same"
+
+    monkeypatch.setattr(runtime, "_graph_arguments", arguments)
+    monkeypatch.setattr(torch.xpu, "device", lambda device: nullcontext())
+    monkeypatch.setattr(torch.xpu, "make_graphed_callables", lambda fn, *a, **kw: fn)
+    x = torch.tensor(2.0, requires_grad=True)
+    downstream = runtime(x).exp()
+    assert runtime._graphs["same"].busy
+    assert runtime(x).item() == 4
+    assert runtime.replay_count == 1
+    torch.autograd.grad(downstream, x, retain_graph=True)
+    del downstream
+    gc.collect()
+    assert not runtime._graphs["same"].busy
+    runtime(x)
+    gc.collect()
+    assert not runtime._graphs["same"].busy
+    assert runtime.replay_count == 2
+
+
+def test_fp64_single_atom_owns_reference_precision_without_preparation(monkeypatch):
+    predictor = _small_predictor()
+    predictor.inference_settings.base_precision_dtype = torch.float64
+    tasks = [
+        Task(
+            name=f"omol_{prop}",
+            property=prop,
+            level=level,
+            out_spec=OutputSpec(dim=[n], dtype="float64"),
+            datasets=["omol"],
+            normalizer=Normalizer(),
+        )
+        for prop, level, n in (
+            ("energy", "system", 1),
+            ("forces", "atom", 3),
+            ("stress", "system", 9),
+        )
+    ]
+    predictor.model.module._tasks = {task.name: task for task in tasks}
+    predictor.model.module._dataset_to_tasks = {"omol": tasks}
+    predictor.atom_refs = {"omol": {1: {0: 1 + 2.0**-30}}}
+    monkeypatch.setattr(
+        predictor, "_initialize", lambda data: pytest.fail("lookup prepared model")
+    )
+    data = AtomicData.from_ase(
+        Atoms("H", info={"charge": 0, "spin": 1}), task_name="omol"
+    )
+    result = predictor.predict(data)
+    assert all(value.dtype == torch.float64 for value in result.values())
+    assert result["energy"].item() == 1 + 2.0**-30
+
+
+def test_mole_key_shares_only_batch_independent_homogeneous_routing():
+    one = _data()
+    two = atomicdata_list_to_batch([one, one])
+    options = dict(
+        device="cpu", dtype=torch.float32, model_id="model", settings_key="strict"
+    )
+    for independent in (False, True):
+        assert (
+            mole_composition_key(one, **options, batch_size_dependent=not independent)
+            == mole_composition_key(
+                two, **options, batch_size_dependent=not independent
+            )
+        ) == independent
+    two.spin[1] += 1
+    assert mole_composition_key(
+        one, **options, batch_size_dependent=False
+    ) != mole_composition_key(two, **options, batch_size_dependent=False)
+
+
+def test_ase_external_graph_uses_model_cutoff_and_degenerate_shell_policy():
+    from fairchem.core.calculate.ase_calculator import FAIRChemCalculator
+
+    predictor = _small_predictor()
+    predictor.model.module._dataset_to_tasks = {"omol": []}
+    predictor.inference_settings.external_graph_gen = True
+    backbone = predictor.model.module.backbone
+    backbone.otf_graph = False
+    backbone.cutoff = 7
+    backbone.max_neighbors = 1
+    backbone.enforce_max_neighbors_strictly = False
+    calculator = FAIRChemCalculator(predictor, task_name="omol")
+    atoms = Atoms(
+        "HHH",
+        positions=[[0, 0, 0], [6.5, 0, 0], [-6.5, 0, 0]],
+        info={"charge": 0, "spin": 1},
+    )
+    data = calculator.a2g(atoms)
+    assert data.edge_index.shape[1] == 4
+    backbone.enforce_max_neighbors_strictly = True
+    capped = FAIRChemCalculator(predictor, task_name="omol").a2g(atoms)
+    assert capped.edge_index.shape[1] == 3

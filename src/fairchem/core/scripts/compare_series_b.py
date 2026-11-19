@@ -27,7 +27,6 @@ from pathlib import Path
 
 import torch
 from ase.io import read
-from ase.stress import voigt_6_to_full_3x3_stress
 
 from fairchem.core.calculate import pretrained_mlip
 from fairchem.core.calculate.series_b_workflows import _release_failed_workflow
@@ -92,8 +91,11 @@ def _snapshot(prediction, properties, natoms):
         value = prediction.get(name)
         if not isinstance(value, torch.Tensor) or not value.is_floating_point():
             raise ValueError(f"Missing or non-floating prediction: {name}")
-        value = value.detach().cpu().double().clone()
-        if not torch.isfinite(value).all():
+        value = value.detach()
+        if not all(
+            torch.isfinite(chunk).all().item()
+            for chunk in value.reshape(-1).split(65536)
+        ):
             raise FloatingPointError(f"Nonfinite prediction: {name}")
         if name == "energy" and value.numel() == 1:
             value = value.reshape(())
@@ -102,9 +104,7 @@ def _snapshot(prediction, properties, natoms):
         elif name == "stress" and value.shape in ((3, 3), (1, 3, 3), (9,), (1, 9)):
             value = value.reshape(3, 3)
         elif name == "stress" and value.shape in ((6,), (1, 6)):
-            value = torch.from_numpy(
-                voigt_6_to_full_3x3_stress(value.reshape(6).numpy())
-            )
+            value = value.reshape(6)[[0, 5, 4, 5, 1, 3, 4, 3, 2]].reshape(3, 3)
         elif name == "hessian" and value.shape in (
             (3 * natoms, 3 * natoms),
             (1, 3 * natoms, 3 * natoms),
@@ -128,15 +128,34 @@ def _json_safe(value):
     return value
 
 
-def _measure_predictor(predictor, data, properties, warmup, repeats, measure_memory):
+def _max_deviation(value, anchor):
+    # Compare native outputs in bounded chunks, even for a dense Hessian.
+    peak = value.new_zeros(())
+    for actual, expected in zip(
+        value.reshape(-1).split(65536), anchor.reshape(-1).split(65536), strict=True
+    ):
+        difference = actual - expected.to(device=actual.device, dtype=actual.dtype)
+        peak = torch.maximum(peak, difference.abs().max())
+    magnitude = peak.item()
+    if not math.isfinite(magnitude):
+        raise FloatingPointError("Nonfinite per-call error")
+    return magnitude
+
+
+def _measure_predictor(
+    predictor, data, properties, warmup, repeats, measure_memory, anchor=None
+):
     device = torch.device(predictor.device)
     natoms = int(data.natoms.sum().item())
     if data.natoms.numel() != 1 or natoms < 1:
         raise ValueError("Comparison requires exactly one nonempty atomic system")
     timings = []
     snapshots = None
+    repeat_errors = []
+    variability = dict.fromkeys(properties, 0.0)
     first_seconds = None
     memory = None
+    data = data.clone()
     total = 1 + warmup + repeats
     for index in range(total):
         if index == 0 or index == 1 + warmup:
@@ -149,9 +168,7 @@ def _measure_predictor(predictor, data, properties, warmup, repeats, measure_mem
         _synchronize(device)
         start = time.perf_counter()
         with torch.autocast(device.type, enabled=False):
-            prediction = predictor.predict(
-                data.clone(), requested_properties=properties
-            )
+            prediction = predictor.predict(data, requested_properties=properties)
         _synchronize(device)
         elapsed = time.perf_counter() - start
         if index == 0:
@@ -164,12 +181,30 @@ def _measure_predictor(predictor, data, properties, warmup, repeats, measure_mem
                 memory[window]["after"] = _allocator(device)
         # CPU copies and validation are outside the timer. Release every GPU
         # output before the next evaluation so its buffers do not inflate peaks.
-        snapshots = _snapshot(prediction, properties, natoms)
+        values = _snapshot(prediction, properties, natoms)
+        if snapshots is None:
+            snapshots = {
+                key: value.to(device="cpu", copy=True) for key, value in values.items()
+            }
+        deviations = {
+            key: _max_deviation(values[key], snapshots[key]) for key in properties
+        }
+        for key, deviation in deviations.items():
+            variability[key] = max(variability[key], deviation)
+        if anchor is not None:
+            deviations = {
+                key: _max_deviation(values[key], anchor[key]) for key in properties
+            }
+        repeat_errors.append(deviations)
+        del values
         output_dtypes = {name: str(prediction[name].dtype) for name in properties}
         del prediction
     settings = predictor.inference_settings
     summary = {
         "device": str(device),
+        "max_deviation_from_own_first": variability,
+        "deviation_from_first_run_by_call": repeat_errors,
+        "series_b_enabled": settings.series_b.enabled,
         "settings": _json_safe(settings.to_omegaconf()),
         "output_dtypes": output_dtypes,
         "approximation_manifest": _json_safe(
@@ -184,7 +219,7 @@ def _measure_predictor(predictor, data, properties, warmup, repeats, measure_mem
             "median_seconds": statistics.median(timings),
             "mean_seconds": statistics.mean(timings),
             "min_seconds": min(timings),
-            "scope": "Private input copy, predictor call and selected-device synchronization; excludes loading, CPU output copies and validation",
+            "scope": "Predictor call and selected-device synchronization; excludes loading, CPU output copies and validation",
         },
         "allocator_memory": memory,
     }
@@ -197,17 +232,30 @@ def _error_report(reference, candidate):
         actual = candidate[name]
         if actual.shape != expected.shape:
             raise ValueError(f"Reference/candidate shape mismatch for {name}")
-        difference = actual - expected
-        reference_norm = torch.linalg.vector_norm(expected).item()
-        error_norm = torch.linalg.vector_norm(difference).item()
+        reference_norm = error_norm = maximum = 0.0
+        for chunk, reference_chunk in zip(
+            actual.reshape(-1).split(65536),
+            expected.reshape(-1).split(65536),
+            strict=True,
+        ):
+            base = reference_chunk.double()
+            difference = chunk.double() - base
+            reference_norm = math.hypot(
+                reference_norm, torch.linalg.vector_norm(base).item()
+            )
+            error_norm = math.hypot(
+                error_norm, torch.linalg.vector_norm(difference).item()
+            )
+            maximum = max(maximum, difference.abs().max().item())
+        root_count = math.sqrt(expected.numel())
         row = {
             "unit": _UNITS[name],
             "shape": list(expected.shape),
-            "max_absolute_error": difference.abs().max().item(),
-            "rms_error": difference.square().mean().sqrt().item(),
+            "max_absolute_error": maximum,
+            "rms_error": error_norm / root_count,
             "error_l2_norm": error_norm,
             "reference_l2_norm": reference_norm,
-            "reference_rms": expected.square().mean().sqrt().item(),
+            "reference_rms": reference_norm / root_count,
             "relative_l2_error": error_norm / reference_norm
             if reference_norm
             else None,
@@ -228,15 +276,48 @@ def _version(package):
         return "not installed"
 
 
-def _report(reference_values, candidate_values, reference, candidate, memory_scope):
+def _report(
+    reference_values, candidate_values, reference, candidate, memory_scope, order
+):
     device = torch.device(candidate["device"])
     name = (
         getattr(torch, device.type).get_device_name(device)
         if device.type in ("cuda", "xpu")
         else platform.processor() or platform.machine()
     )
+    manifest = candidate["approximation_manifest"]
+    linear_count = len(manifest.get("linear", {}).get("converted", []))
+    saved_count = manifest.get("saved_features", {}).get("module_count", 0)
+    configured = any(
+        (
+            linear_count,
+            saved_count,
+            manifest.get("radial"),
+            manifest.get("compensated_reduction"),
+            manifest.get("onednn_tf32"),
+        )
+    )
+    if candidate["series_b_enabled"]:
+        kind = "configured_approximation" if configured else "no_confirmed_coverage"
+    else:
+        kind = (
+            "strict_control"
+            if candidate["settings"] == reference["settings"]
+            else "alternate_baseline"
+        )
     return {
         "success": True,
+        "evaluation_order": order,
+        "comparison_kind": kind,
+        "installed_linear_layers": linear_count,
+        "installed_saved_feature_modules": saved_count,
+        "first_energy_eV": {
+            "reference": float(reference_values["energy"]),
+            "candidate": float(candidate_values["energy"]),
+        }
+        if "energy" in reference_values
+        else None,
+        "error_scope": "errors compares the first predictions. Each call, including warmup, also reports maximum absolute deviation from the first prediction of the first evaluated model.",
         "finite": True,
         "accuracy_qualified": False,
         "qualification_note": "No application-specific error thresholds, force finite differences or trajectory validation were applied; this is a single-structure comparison.",
@@ -268,6 +349,7 @@ def compare_predictors(
     warmup=2,
     repeats=5,
     measure_memory=False,
+    candidate_first=False,
 ):
     """
     Compare independently constructed predictors on an owned AtomicData snapshot.
@@ -295,19 +377,32 @@ def compare_predictors(
         raise ValueError("Reference and candidate must use the same device")
     properties = _properties(properties)
     warmup, repeats = _count("warmup", warmup, 0), _count("repeats", repeats, 1)
-    snapshot = data.clone()
-    expected, first = _measure_predictor(
-        reference, snapshot, properties, warmup, repeats, measure_memory
+    order = (
+        ["candidate", "reference"] if candidate_first else ["reference", "candidate"]
     )
-    actual, second = _measure_predictor(
-        candidate, snapshot, properties, warmup, repeats, measure_memory
-    )
+    models = {"reference": reference, "candidate": candidate}
+    measurements = {}
+    anchor = None
+    for key in order:
+        values, summary = _measure_predictor(
+            models[key],
+            data,
+            properties,
+            warmup,
+            repeats,
+            measure_memory,
+            anchor=anchor,
+        )
+        measurements[key] = values, summary
+        if anchor is None:
+            anchor = values
     return _report(
-        expected,
-        actual,
-        first,
-        second,
+        measurements["reference"][0],
+        measurements["candidate"][0],
+        measurements["reference"][1],
+        measurements["candidate"][1],
         "Preloaded predictors: both models and unrelated process allocations are included. PyTorch device allocator only; CPU and external library allocations are excluded.",
+        order,
     )
 
 
@@ -324,6 +419,7 @@ def run_comparison(
     warmup=2,
     repeats=5,
     measure_memory=False,
+    candidate_first=False,
 ):
     """
     Load one checkpoint sequentially at the requested base precision, with/without B.
@@ -350,23 +446,41 @@ def run_comparison(
         from fairchem.core.units.mlip_unit.inference_runtime import probe_fp64_support
 
         fp64_probe = probe_fp64_support(device)
-    outputs, summaries = [], []
+    ordered = [1, 0] if candidate_first else [0, 1]
+    outputs, summaries = [None, None], [None, None]
+    anchor = None
     structure = atoms.copy()
     validate_uma_atoms_data(structure, task)
     data = AtomicData.from_ase(
-        structure, task_name=task, target_dtype=baseline.base_precision_dtype
+        structure,
+        task_name=task,
+        target_dtype=baseline.base_precision_dtype,
+        r_data_keys=["spin", "charge"],
     )
-    for configuration in settings:
+    for index in ordered:
+        configuration = settings[index]
         predictor = None
         try:
+            _synchronize(device)
+            load_start = time.perf_counter()
             predictor = pretrained_mlip.get_predict_unit(
                 str(checkpoint), device=str(device), inference_settings=configuration
             )
+            _synchronize(device)
+            load_seconds = time.perf_counter() - load_start
             values, summary = _measure_predictor(
-                predictor, data, properties, warmup, repeats, measure_memory
+                predictor,
+                data,
+                properties,
+                warmup,
+                repeats,
+                measure_memory,
+                anchor=anchor,
             )
-            outputs.append(values)
-            summaries.append(summary)
+            summary["model_load_seconds"] = load_seconds
+            outputs[index], summaries[index] = values, summary
+            if anchor is None:
+                anchor = values
         finally:
             predictor = None
             gc.collect()
@@ -378,6 +492,7 @@ def run_comparison(
         *outputs,
         *summaries,
         "Sequential model loading and release. PyTorch selected-device allocator only; unrelated process allocations remain included, CPU/external allocations are excluded. First evaluation includes lazy model transfer/preparation, steady peaks are reset after warmup.",
+        [["reference", "candidate"][i] for i in ordered],
     )
     report["checkpoint"] = str(checkpoint)
     report["task"] = task
@@ -402,6 +517,16 @@ def build_parser():
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--properties", default="energy,forces")
+    parser.add_argument(
+        "--candidate-first",
+        action="store_true",
+        help="Reverse measurement order in this process",
+    )
+    parser.add_argument(
+        "--all-frames",
+        action="store_true",
+        help="Compare every structure and relative energies for matching compositions",
+    )
     parser.add_argument("--measure-memory", action="store_true")
     return parser
 
@@ -415,18 +540,48 @@ def main(argv=None):
         options = json.loads(raw)
         if not isinstance(options, dict):
             raise ValueError("--series-b must contain a JSON object")
-        atoms = read(args.structure)
-        report = run_comparison(
-            args.checkpoint,
-            atoms,
-            task=args.task,
-            device=args.device,
-            series_b=options,
-            base_precision_dtype=args.dtype,
-            properties=args.properties,
-            warmup=args.warmup,
-            repeats=args.repeats,
-            measure_memory=args.measure_memory,
+        frames = (
+            read(args.structure, index=":")
+            if args.all_frames
+            else [read(args.structure)]
+        )
+        reports = []
+        anchors = {}
+        for index, atoms in enumerate(frames):
+            record = run_comparison(
+                args.checkpoint,
+                atoms,
+                task=args.task,
+                device=args.device,
+                series_b=options,
+                base_precision_dtype=args.dtype,
+                properties=args.properties,
+                warmup=args.warmup,
+                repeats=args.repeats,
+                measure_memory=args.measure_memory,
+                candidate_first=args.candidate_first ^ bool(index % 2),
+            )
+            if args.all_frames and record["first_energy_eV"] is not None:
+                group = (
+                    atoms.get_chemical_formula(),
+                    atoms.info.get("charge", 0),
+                    atoms.info.get("spin", 1),
+                )
+                energy = record["first_energy_eV"]
+                first, base = anchors.setdefault(group, (index, energy))
+                delta = {key: energy[key] - base[key] for key in energy}
+                record["relative_energy_eV"] = {
+                    **delta,
+                    "anchor_frame": first,
+                    "error": delta["candidate"] - delta["reference"],
+                }
+            reports.append(record)
+        if not reports:
+            raise ValueError("No structures to compare")
+        report = (
+            {"success": True, "frames": reports, "accuracy_qualified": False}
+            if args.all_frames
+            else reports[0]
         )
     except Exception as error:
         report = {

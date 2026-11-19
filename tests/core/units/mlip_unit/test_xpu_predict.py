@@ -334,3 +334,43 @@ def test_xpu_derivatives_enable_grad_and_restore_callers_no_grad():
         result = predictor._run_inference(cell, False)
         assert not torch.is_grad_enabled()
     torch.testing.assert_close(result["stress"], 2 * torch.eye(3))
+
+
+def test_checkpoint_factory_reuses_single_fp64_preflight(mock_xpu, monkeypatch):
+    probe = Mock(return_value={"passed": True})
+    monkeypatch.setattr(pretrained_mlip, "probe_fp64_support", probe)
+    monkeypatch.setattr(predict_module, "probe_fp64_support", probe)
+    monkeypatch.setattr(
+        pretrained_mlip,
+        "resolve_checkpoint",
+        lambda *args: pretrained_mlip.ResolvedCheckpoint("unused.pt"),
+    )
+
+    def load_fake_model(predictor):
+        model = torch.nn.Module()
+        model.backbone = SimpleNamespace(
+            regress_config=SimpleNamespace(direct_forces=False)
+        )
+        predictor.model = _ModelWrapper(model)
+
+    monkeypatch.setattr(MLIPPredictUnit, "_load_model", load_fake_model)
+    predictor = pretrained_mlip.get_predict_unit(
+        "unused", inference_settings="fp64", device="xpu"
+    )
+    assert predictor.fp64_probe is probe.return_value
+    probe.assert_called_once_with("xpu:1")
+
+
+@pytest.mark.parametrize(
+    "settings", ["nitro", InferenceSettings(internal_graph_gen_version=3)]
+)
+def test_invalid_xpu_modes_fail_before_io(mock_xpu, monkeypatch, settings):
+    monkeypatch.setattr(
+        pretrained_mlip,
+        "resolve_checkpoint",
+        lambda *args: pytest.fail("invalid settings reached checkpoint I/O"),
+    )
+    with pytest.raises(ValueError, match="(CUDA|version 3)"):
+        pretrained_mlip.get_predict_unit(
+            "unused", inference_settings=settings, device="xpu"
+        )

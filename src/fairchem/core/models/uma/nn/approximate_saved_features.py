@@ -38,6 +38,7 @@ class _PackedFeature:
     original_dtype: torch.dtype
     source: weakref.ReferenceType
     version: int | None
+    block_size: int | None = None
 
 
 @dataclass(frozen=True)
@@ -46,7 +47,7 @@ class _UncompressedFeature:
     version: int | None
 
 
-def _pack_feature(tensor, dtype, min_elements):
+def _pack_feature(tensor, dtype, min_elements, block_size=None):
     # Frozen parameters, their views and buffers never require gradients.
     # Returning detached tensors also avoids saved-output reference cycles.
     value = tensor.detach()
@@ -69,10 +70,32 @@ def _pack_feature(tensor, dtype, min_elements):
     # abs() owns this temporary, so replacing its nonfinite values in place
     # avoids a full mask and second floating-point tensor without touching the
     # saved source. The finite maximum (and hence the packed values) is unchanged.
-    maximum = value.abs().nan_to_num_(nan=0, posinf=0, neginf=0).amax()
-    scale = (maximum / torch.finfo(dtype).max).clamp_min(1)
-    packed = (value / scale).to(dtype=dtype, memory_format=torch.contiguous_format)
-    return _PackedFeature(packed, scale, tensor.dtype, weakref.ref(tensor), version)
+    def pack_blocks(blocks):
+        maximum = blocks.abs().nan_to_num_(nan=0, posinf=0, neginf=0).amax(dim=1)
+        scale = (maximum / torch.finfo(dtype).max).clamp_min_(1)
+        return (blocks / scale[:, None]).to(dtype), scale
+
+    if block_size is None or tensor.numel() <= block_size:
+        maximum = value.abs().nan_to_num_(nan=0, posinf=0, neginf=0).amax()
+        scale = (maximum / torch.finfo(dtype).max).clamp_min_(1)
+        packed = (value / scale).to(dtype=dtype, memory_format=torch.contiguous_format)
+        return _PackedFeature(packed, scale, tensor.dtype, weakref.ref(tensor), version)
+    flat = value.reshape(-1)
+    full = flat.numel() // block_size * block_size
+    packed, scale = pack_blocks(flat[:full].view(-1, block_size))
+    packed = packed.flatten()
+    if full < flat.numel():
+        tail, tail_scale = pack_blocks(flat[full:].unsqueeze(0))
+        packed = torch.cat((packed, tail.flatten()))
+        scale = torch.cat((scale, tail_scale))
+    return _PackedFeature(
+        packed.reshape(value.shape),
+        scale,
+        tensor.dtype,
+        weakref.ref(tensor),
+        version,
+        block_size,
+    )
 
 
 def _unpack_feature(packed):
@@ -92,7 +115,17 @@ def _unpack_feature(packed):
         # This upcast owns its storage. Reuse it for scaling and saturation
         # instead of retaining several full-precision temporary activations.
         restored = packed.compressed.to(dtype=packed.original_dtype, copy=True)
-        restored.mul_(packed.scale)
+        block_size = getattr(packed, "block_size", None)
+        if block_size is None:
+            restored.mul_(packed.scale)
+        else:
+            flat = restored.view(-1)
+            blocks = flat.numel() // block_size
+            flat[: blocks * block_size].view(blocks, block_size).mul_(
+                packed.scale[:blocks, None]
+            )
+            if blocks * block_size < flat.numel():
+                flat[blocks * block_size :].mul_(packed.scale[-1])
         # Quantization can round the reconstructed largest finite source value
         # above its dtype's range. Saturate only finite packed values; pre-existing
         # NaN/Inf must remain visible to the predictor's finite-value checks.
@@ -101,8 +134,44 @@ def _unpack_feature(packed):
             torch.isfinite(packed.compressed),
             restored.clamp_(-limit, limit),
             packed.compressed,
+            out=restored,
         )
     return packed.tensor
+
+
+@torch.inference_mode(False)
+def saved_feature_roundtrip_stats(tensor, dtype="fp16", block_size=None):
+    """Measure compression error and actual packed bytes for a representative activation."""
+    if dtype not in _DTYPES:
+        raise ValueError("Unsupported storage dtype")
+    if block_size is not None and (type(block_size) is not int or block_size <= 0):
+        raise ValueError("block_size must be a positive integer")
+    source_dtype = torch.float64 if dtype == "fp32" else torch.float32
+    if tensor.dtype != source_dtype or not tensor.numel():
+        raise ValueError(
+            "Expected a nonempty activation of the compression source dtype"
+        )
+    source = tensor.detach()
+    if source.is_inference():
+        source = source.clone()
+    source.requires_grad_(True)
+    packed = _pack_feature(source, _DTYPES[dtype], 1, block_size)
+    restored = _unpack_feature(packed)
+    finite = source.isfinite()
+    nonzero = finite & (source != 0)
+    eligible, lost = torch.stack(
+        (nonzero.sum(), (nonzero & (restored == 0)).sum())
+    ).tolist()
+    return {
+        "finite_nonzero_elements": eligible,
+        "zeroed_elements": lost,
+        "zeroed_fraction": lost / eligible if eligible else 0.0,
+        "max_abs_error_finite": float(
+            torch.where(finite, (restored - source).abs(), 0).amax().detach()
+        ),
+        "original_bytes": source.nbytes,
+        "packed_bytes": packed.compressed.nbytes + packed.scale.nbytes,
+    }
 
 
 class _CompressedFeatureForward:
@@ -114,13 +183,18 @@ class _CompressedFeatureForward:
     torch.func/vmap is unsupported; vmap over an existing backward graph works.
     """
 
-    def __init__(self, function, dtype, min_elements):
+    def __init__(self, function, dtype, min_elements, block_size=None):
         self.function = function
         self.dtype = dtype
         self.min_elements = min_elements
+        self.block_size = block_size
 
     def _pack(self, tensor):
-        return _pack_feature(tensor, _DTYPES[self.dtype], self.min_elements)
+        if self.block_size is None:
+            return _pack_feature(tensor, _DTYPES[self.dtype], self.min_elements)
+        return _pack_feature(
+            tensor, _DTYPES[self.dtype], self.min_elements, self.block_size
+        )
 
     def __call__(self, *args, **kwargs):
         if getattr(torch._C, "_are_functorch_transforms_active", lambda: False)():
@@ -139,6 +213,7 @@ class _CompressedFeatureForward:
         return {
             "owner": self.function.__self__,
             "method": self.function.__func__,
+            "block_size": self.block_size,
             "dtype": self.dtype,
             "min_elements": self.min_elements,
         }
@@ -147,9 +222,12 @@ class _CompressedFeatureForward:
         self.function = MethodType(state["method"], state["owner"])
         self.dtype = state["dtype"]
         self.min_elements = state["min_elements"]
+        self.block_size = state.get("block_size")
 
 
-def apply_saved_feature_compression(backbone, dtype="bf16", min_elements=1024):
+def apply_saved_feature_compression(
+    backbone, dtype="bf16", min_elements=1024, block_size=None
+):
     """
     Compress learned activation features saved for inference derivatives.
 
@@ -173,6 +251,8 @@ def apply_saved_feature_compression(backbone, dtype="bf16", min_elements=1024):
     ):
         raise ValueError("saved-feature min_elements must be a positive integer")
     min_elements = int(min_elements)
+    if block_size is not None and (type(block_size) is not int or block_size <= 0):
+        raise ValueError("saved-feature block_size must be a positive integer")
     if backbone.training or any(p.requires_grad for p in backbone.parameters()):
         raise ValueError(
             "Saved-feature compression requires eval mode and frozen weights"
@@ -197,7 +277,11 @@ def apply_saved_feature_compression(backbone, dtype="bf16", min_elements=1024):
                 )
             current = module.forward
             if isinstance(current, _CompressedFeatureForward):
-                if (current.dtype, current.min_elements) != (dtype, min_elements):
+                if (current.dtype, current.min_elements, current.block_size) != (
+                    dtype,
+                    min_elements,
+                    block_size,
+                ):
                     raise ValueError(
                         "Saved-feature compression is already configured differently"
                     )
@@ -214,13 +298,16 @@ def apply_saved_feature_compression(backbone, dtype="bf16", min_elements=1024):
     # Validate every target before changing any module.
     for _, module, current in targets:
         if not isinstance(current, _CompressedFeatureForward):
-            module.forward = _CompressedFeatureForward(current, dtype, min_elements)
+            module.forward = _CompressedFeatureForward(
+                current, dtype, min_elements, block_size
+            )
     return {
         "dtype": dtype,
         "source_dtype": "float64" if dtype == "fp32" else "float32",
         "forward_unchanged": True,
         "derivatives_approximate": True,
         "min_elements": min_elements,
+        "block_size": block_size,
         "module_count": len(targets),
         "modules": [name for name, _, _ in targets],
     }

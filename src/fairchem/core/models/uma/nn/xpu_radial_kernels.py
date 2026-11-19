@@ -86,10 +86,12 @@ def _linear_norm_silu_kernel(
     NORM_WEIGHT,
     NORM_BIAS,
     OUTPUT,
-    M: tl.constexpr,
+    M,
     K: tl.constexpr,
     N: tl.constexpr,
     EPS: tl.constexpr,
+    M_BUCKET: tl.constexpr,
+    DEVICE_KEY: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -143,7 +145,14 @@ def _load_kernel():
         return None
     tl = triton_language
     libdevice = intel_libdevice
-    return triton, triton.jit(_linear_norm_silu_kernel)
+    kernel = triton.jit(_linear_norm_silu_kernel, do_not_specialize=["M"])
+    configs = [
+        triton.Config({"BLOCK_M": m, "BLOCK_K": k}, num_warps=warps)
+        for m, k, warps in ((16, 32, 4), (16, 16, 4), (8, 16, 4), (32, 32, 8))
+    ]
+    return triton, triton.autotune(
+        configs=configs, key=["M_BUCKET", "K", "N", "DEVICE_KEY"]
+    )(kernel)
 
 
 def _fast_math_enabled(triton):
@@ -191,7 +200,7 @@ def _launch_linear_norm_silu(x, weight, bias, norm_weight, norm_bias, eps):
     # Triton selects its launch stream from the current device, not
     # from tensor pointers. Preserve explicit xpu:1 on multi-GPU hosts.
     with torch.xpu.device(x.device):
-        kernel[(triton.cdiv(x.shape[0], 16),)](
+        kernel[lambda meta: (triton.cdiv(x.shape[0], meta["BLOCK_M"]),)](
             x,
             weight,
             bias,
@@ -202,10 +211,9 @@ def _launch_linear_norm_silu(x, weight, bias, norm_weight, norm_bias, eps):
             K=x.shape[1],
             N=weight.shape[0],
             EPS=float(eps),
-            BLOCK_M=16,
-            BLOCK_K=32,
+            M_BUCKET=triton.next_power_of_2(x.shape[0]),
+            DEVICE_KEY=str(x.device),
             BLOCK_N=triton.next_power_of_2(weight.shape[0]),
-            num_warps=4,
             enable_fp_fusion=False,
         )
     return output
@@ -240,8 +248,10 @@ def xpu_fused_linear_norm_silu(x, weight, bias, norm_weight, norm_bias, eps):
     Compilation/execution failures propagate; they are never hidden by rerunning
     a failed or potentially corrupted computation on the native path.
     """
+    from fairchem.core.models.uma.nn.portable_wigner import fused_kernel_enabled
+
     if (
-        os.environ.get("FAIRCHEM_XPU_FUSED_KERNELS") != "1"
+        not fused_kernel_enabled("RADIAL")
         or x.device.type != "xpu"
         or torch.compiler.is_compiling()
         or torch._C._are_functorch_transforms_active()

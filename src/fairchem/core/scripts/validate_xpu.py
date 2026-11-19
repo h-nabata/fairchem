@@ -17,10 +17,14 @@ for a checkpoint. No weights are downloaded unless this command is executed.
 from __future__ import annotations
 
 import argparse
+import copy
 import gc
+import hashlib
 import json
 import platform
+import subprocess
 import time
+from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
@@ -28,6 +32,7 @@ import numpy as np
 import torch
 from ase.build import bulk, molecule
 from ase.calculators.calculator import all_changes
+from ase.io import iread
 from ase.stress import full_3x3_to_voigt_6_stress
 
 
@@ -103,37 +108,97 @@ def evaluate(atoms, stress=False):
     return result
 
 
-def finite_difference_check(atoms, force, step, tolerance):
-    """
-    Check the largest force component using central energy differences.
+def _energy_only(atoms):
+    atoms.calc.reset()
+    atoms.calc.calculate(atoms, properties=["energy"], system_changes=all_changes)
+    energy = float(atoms.calc.results["energy"])
+    if not np.isfinite(energy):
+        raise ValueError("Nonfinite energy in finite difference")
+    return energy
 
-    The default 0.005 A step limits FP32 cancellation. Repeat with several
-    steps before attributing a mismatch to a backend or using Hessians.
-    """
+
+def finite_difference_check(
+    atoms, force, step, tolerance, *, directions=1, scales=(1.0,)
+):
+    """Check Cartesian and multi-atom directional derivatives at requested widths."""
     atom, axis = np.unravel_index(np.argmax(np.abs(force)), force.shape)
+    cartesian = np.zeros_like(force)
+    cartesian[atom, axis] = 1
+    vectors = [cartesian]
+    rng = np.random.default_rng(819)
+    for _ in range(directions - 1):
+        direction = rng.normal(size=force.shape)
+        vectors.append(direction / np.linalg.norm(direction))
     original = atoms.positions.copy()
-    energies = []
+    checks = []
     try:
-        for sign in (1, -1):
-            positions = original.copy()
-            positions[atom, axis] += sign * step
-            atoms.set_positions(positions, apply_constraint=False)
-            energies.append(evaluate(atoms)["energy"])
+        for index, direction in enumerate(vectors):
+            for scale in scales:
+                width = step * scale
+                energies = []
+                for sign in (1, -1):
+                    atoms.set_positions(
+                        original + sign * width * direction, apply_constraint=False
+                    )
+                    energies.append(_energy_only(atoms))
+                numeric = -(energies[0] - energies[1]) / (2 * width)
+                analytic = float(np.sum(force * direction))
+                error = abs(numeric - analytic)
+                checks.append(
+                    {
+                        "passed": bool(np.isfinite(error) and error <= tolerance),
+                        "direction": index,
+                        "step_A": width,
+                        "analytic_eV_per_A": analytic,
+                        "finite_difference_eV_per_A": numeric,
+                        "absolute_error_eV_per_A": error,
+                    }
+                )
     finally:
         atoms.set_positions(original, apply_constraint=False)
         atoms.calc.reset()
-    numeric = -(energies[0] - energies[1]) / (2 * step)
-    analytic = float(force[atom, axis])
-    error = abs(numeric - analytic)
     return {
-        "passed": bool(np.isfinite(error) and error <= tolerance),
+        **checks[0],
+        "passed": all(check["passed"] for check in checks),
         "atom": int(atom),
         "axis": int(axis),
-        "step_A": step,
-        "analytic_eV_per_A": analytic,
-        "finite_difference_eV_per_A": numeric,
-        "absolute_error_eV_per_A": error,
         "tolerance_eV_per_A": tolerance,
+        "checks": checks,
+    }
+
+
+def _hvp_check(structure, predictor, step, tolerance):
+    from fairchem.core.calculate.series_b_curvature import PredictorHVP
+
+    dtype = predictor.inference_settings.base_precision_dtype
+    data = structure.calc.a2g(structure)
+    product = PredictorHVP(predictor, data)
+    direction = np.random.default_rng(182).normal(size=structure.positions.shape)
+    direction /= np.linalg.norm(direction)
+    analytic = (
+        product(torch.as_tensor(direction, device=predictor.device, dtype=dtype))
+        .detach()
+        .cpu()
+        .numpy()
+    )
+    original = structure.positions.copy()
+    forces = []
+    try:
+        for sign in (1, -1):
+            structure.set_positions(
+                original + sign * step * direction, apply_constraint=False
+            )
+            forces.append(evaluate(structure)["forces"])
+    finally:
+        structure.set_positions(original, apply_constraint=False)
+        structure.calc.reset()
+    numeric = -(forces[0] - forces[1]) / (2 * step)
+    error = float(np.max(np.abs(numeric - analytic)))
+    return {
+        "passed": bool(np.isfinite(error) and error <= tolerance),
+        "step_A": step,
+        "maximum_error_eV_per_A2": error,
+        "tolerance_eV_per_A2": tolerance,
     }
 
 
@@ -165,7 +230,7 @@ def finite_difference_stress_check(atoms, stress, step, tolerance):
                 atoms.set_cell(
                     original_cell @ strain, scale_atoms=True, apply_constraint=False
                 )
-                energies.append(evaluate(atoms)["energy"])
+                energies.append(_energy_only(atoms))
             numeric.append((energies[0] - energies[1]) / (2 * step * volume))
     finally:
         atoms.set_cell(original_cell, scale_atoms=False, apply_constraint=False)
@@ -201,7 +266,7 @@ def _xpu_memory_snapshot(device, *, reset_peak=False):
 
 
 def synchronized_timings(
-    atoms, device, warmup, repeats, stress=False, *, measure_memory=False
+    atoms, device, warmup, repeats, stress=False, *, measure_memory=False, prepare=None
 ):
     """
     Time complete ASE energy/force calls including transfers and graph generation.
@@ -215,7 +280,9 @@ def synchronized_timings(
     memory = {}
     if measure_memory:
         memory["warmup"] = {"before": _xpu_memory_snapshot(device, reset_peak=True)}
-    for _ in range(warmup):
+    for index in range(warmup):
+        if prepare is not None:
+            prepare(index)
         evaluate(atoms, stress)
     if measure_memory:
         memory["warmup"]["after"] = _xpu_memory_snapshot(device)
@@ -225,16 +292,29 @@ def synchronized_timings(
     else:
         synchronize()
     durations = []
-    for _ in range(repeats):
+    first = None
+    variability = {}
+    for index in range(repeats):
+        if prepare is not None:
+            prepare(warmup + index)
         synchronize()
         start = time.perf_counter()
-        evaluate(atoms, stress)
+        values = evaluate(atoms, stress)
         synchronize()
         durations.append((time.perf_counter() - start) * 1000)
+        if prepare is None:
+            if first is None:
+                first = values
+            for key in values:
+                error = float(np.max(np.abs(values[key] - first[key])))
+                variability[key] = max(error, variability.get(key, 0.0))
     result = {
         "median_ms": float(np.median(durations)),
         "minimum_ms": min(durations),
+        "p95_ms": float(np.percentile(durations, 95)),
+        "maximum_ms": max(durations),
         "samples_ms": durations,
+        "maximum_fixed_geometry_variation": variability if prepare is None else None,
         "warmup_calls": warmup,
         "includes": (
             "ASE conversion, graph generation, energy/forces, transfers and output checks"
@@ -383,6 +463,124 @@ def case_settings(args, device, merge_mole, stress=False):
     )
 
 
+def _geometry_workloads(args, structure, task, device, stress, predictor, settings):
+    modes = getattr(args, "geometry_workloads", ())
+    if not modes:
+        return {}
+    original = structure.positions.copy()
+    cell = structure.cell.copy()
+    skin = getattr(args, "neighbor_skin", 0.0)
+    backbone = getattr(getattr(predictor.model, "module", None), "backbone", None)
+    workloads = {}
+    for mode in modes:
+        if mode == "strain" and not structure.pbc.any():
+            continue
+
+        def prepare(index, mode=mode):
+            structure.set_cell(cell, scale_atoms=False, apply_constraint=False)
+            structure.set_positions(original, apply_constraint=False)
+            if index % 2 == 0:
+                return
+            if mode == "strain":
+                structure.set_cell(
+                    cell * 1.002, scale_atoms=True, apply_constraint=False
+                )
+            else:
+                displacement = (skin or 0.1) * (0.1 if mode == "subskin" else 1.1)
+                structure.positions[0, 0] += displacement
+
+        cache = getattr(backbone, "_neighbor_cache", None)
+        before = dict(cache.stats) if cache is not None else None
+        timing = synchronized_timings(
+            structure,
+            device,
+            args.warmup,
+            args.repeats,
+            stress,
+            prepare=prepare,
+        )
+        timing["neighbor_cache_before"] = before
+        timing["neighbor_cache_after"] = (
+            dict(cache.stats) if cache is not None else None
+        )
+        if before is not None:
+            after = timing["neighbor_cache_after"]
+            hits = after["hits"] - before["hits"]
+            queries = hits + after["rebuilds"] - before["rebuilds"]
+            timing["cache_queries"] = queries
+            timing["hit_rate"] = hits / queries if queries else None
+        prepare(1)
+        changed = evaluate(structure, stress)
+        if backbone is not None and getattr(backbone, "otf_graph", False):
+            from fairchem.core.datasets.atomic_data import AtomicData
+            from fairchem.core.graph.compute import generate_graph
+
+            sample = AtomicData.from_ase(
+                structure,
+                task_name=task,
+                target_dtype=settings.base_precision_dtype,
+            ).to(device)
+            pbc = torch.ones_like(sample.pbc) if backbone.always_use_pbc else sample.pbc
+            graph = generate_graph(
+                sample,
+                backbone.cutoff,
+                backbone.max_neighbors,
+                backbone.enforce_max_neighbors_strictly,
+                backbone.radius_pbc_version,
+                pbc,
+                graph_search_method=getattr(backbone, "graph_search_method", "cell"),
+                geometry_only=True,
+            )
+            timing["physical_edges"] = graph["edge_index"].shape[1]
+            timing["mean_coordination"] = timing["physical_edges"] / len(structure)
+            del graph, sample
+        timing["displaced_geometry"] = {
+            key: np.asarray(v).tolist() for key, v in changed.items()
+        }
+        workloads[mode] = timing
+    structure.set_cell(cell, scale_atoms=False, apply_constraint=False)
+    structure.set_positions(original, apply_constraint=False)
+    return workloads
+
+
+def _execution_report(predictor, settings, compiled_regions):
+    runtimes = getattr(predictor, "_numeric_runtimes", ())
+    blocks = [
+        {
+            "name": runtime.function.__qualname__,
+            "calls": runtime.call_count,
+            "compiled_calls": runtime.compile_call_count,
+            "compile_failures": runtime.compile_failure_count,
+            "captures": runtime.capture_count,
+            "capture_failures": runtime.capture_failure_count,
+            "replays": runtime.replay_count,
+            "graph_bypasses": runtime.call_count - runtime.replay_count
+            if runtime.xpu_graph
+            else 0,
+        }
+        for runtime in runtimes
+    ]
+    active = [row for row in blocks if row["calls"]]
+    return {
+        "blocks": blocks,
+        "compiled_region_events": compiled_regions,
+        "passed": (
+            (
+                not settings.xpu_graph
+                or (bool(active) and all(r["replays"] for r in active))
+            )
+            and (not settings.compile or compiled_regions > 0)
+            and (
+                not (settings.compile and settings.compile_scope == "blocks")
+                or (
+                    bool(active)
+                    and all(r["compiled_calls"] or r["replays"] for r in active)
+                )
+            )
+        ),
+    }
+
+
 def run_case(args, atoms, task, device, merge_mole, stress=False, progress=None):
     """
     Load a fresh predictor so each timing retains its chosen MoLE configuration.
@@ -393,6 +591,7 @@ def run_case(args, atoms, task, device, merge_mole, stress=False, progress=None)
         if progress is not None:
             progress.update(device=str(device), merge_mole=merge_mole, stage=name)
 
+    _resolve_tolerances(args)
     settings = case_settings(args, device, merge_mole, stress)
     predictor = structure = None
     completed = False
@@ -435,7 +634,12 @@ def run_case(args, atoms, task, device, merge_mole, stress=False, progress=None)
         }
         stage("force_finite_difference")
         result["finite_difference"] = finite_difference_check(
-            structure, values["forces"], args.fd_step, args.fd_tolerance
+            structure,
+            values["forces"],
+            args.fd_step,
+            args.fd_tolerance,
+            directions=getattr(args, "fd_directions", 1),
+            scales=getattr(args, "fd_scales", (1.0,)),
         )
         if stress:
             result["stress_eV_per_A3"] = values["stress"].tolist()
@@ -446,7 +650,28 @@ def run_case(args, atoms, task, device, merge_mole, stress=False, progress=None)
                 args.stress_fd_step,
                 args.stress_fd_tolerance,
             )
+        if getattr(args, "hvp", False):
+            result["hvp_finite_difference"] = _hvp_check(
+                structure, predictor, args.fd_step, args.hvp_tolerance
+            )
+        if settings.compile:
+            # A warm region event is evidence of actual compiled execution even
+            # when Dynamo reused a cached graph instead of compiling a new one.
+            with torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU]
+            ) as profiler:
+                evaluate(structure, stress)
+            compiled_regions = sum(
+                ev.count
+                for ev in profiler.key_averages()
+                if "Torch-Compiled Region" in ev.key or ev.key == "CompiledFunction"
+            )
+        else:
+            compiled_regions = 0
         stage("timing")
+        backbone = getattr(getattr(predictor.model, "module", None), "backbone", None)
+        cache = getattr(backbone, "_neighbor_cache", None)
+        cache_before = dict(cache.stats) if cache is not None else None
         result["timing"] = synchronized_timings(
             structure,
             device,
@@ -455,6 +680,9 @@ def run_case(args, atoms, task, device, merge_mole, stress=False, progress=None)
             stress,
             measure_memory=device.type == "xpu",
         )
+        if cache_before is not None:
+            result["timing"]["neighbor_cache_before"] = cache_before
+            result["timing"]["neighbor_cache_after"] = dict(cache.stats)
         if device.type == "xpu":
             memory.update(result["timing"].pop("xpu_memory"))
             result["xpu_memory"] = {
@@ -469,6 +697,17 @@ def run_case(args, atoms, task, device, merge_mole, stress=False, progress=None)
                 ),
                 "windows": memory,
             }
+        if getattr(args, "geometry_workloads", ()):
+            result["geometry_workloads"] = _geometry_workloads(
+                args, structure, task, device, stress, predictor, settings
+            )
+        result["execution"] = _execution_report(predictor, settings, compiled_regions)
+        checkpoint = getattr(predictor, "_inference_model_path", None)
+        if isinstance(checkpoint, (str, Path)) and Path(checkpoint).is_file():
+            checkpoint = Path(checkpoint)
+            result["checkpoint_sha256"] = _checkpoint_digest(
+                checkpoint, checkpoint.stat().st_mtime_ns
+            )
         completed = True
     finally:
         # Detach the copied structure's calculator even when evaluation fails.
@@ -497,6 +736,26 @@ def run_case(args, atoms, task, device, merge_mole, stress=False, progress=None)
     return values, result
 
 
+@lru_cache(maxsize=8)
+def _checkpoint_digest(path, mtime_ns):
+    with path.open("rb") as stream:
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: stream.read(2**20), b""):
+            digest.update(chunk)
+        return digest.hexdigest()
+
+
+def _source_revision():
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(Path(__file__).parent), "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
 def _version(package):
     try:
         return version(package)
@@ -514,6 +773,22 @@ def _json_safe(value):
     return value
 
 
+def _resolve_tolerances(args):
+    fp64 = getattr(args, "dtype", "float32") == "float64"
+    for key, fp32_default, fp64_default in (
+        ("fd_step", 0.005, 1e-4),
+        ("fd_tolerance", 0.02, 1e-5),
+        ("energy_tolerance", 1e-4, 1e-8),
+        ("force_tolerance", 5e-4, 1e-7),
+        ("stress_tolerance", 5e-5, 1e-8),
+        ("stress_fd_step", 0.001, 1e-5),
+        ("stress_fd_tolerance", 5e-4, 1e-6),
+        ("hvp_tolerance", 0.05, 1e-4),
+    ):
+        if getattr(args, key, None) is None:
+            setattr(args, key, fp64_default if fp64 else fp32_default)
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default="uma-s-1p2p1")
@@ -527,6 +802,14 @@ def build_parser():
     parser.add_argument("--output", type=Path, default=Path("xpu-validation.json"))
     parser.add_argument(
         "--case", choices=("all", "molecule", "periodic"), default="all"
+    )
+    parser.add_argument(
+        "--structure",
+        type=Path,
+        help="Compare all frames in an ASE file in place of the built-in molecules/crystals",
+    )
+    parser.add_argument(
+        "--task", default="omat", help="Prediction task for --structure"
     )
     parser.add_argument("--stress", action="store_true", help="Check periodic stress")
     parser.add_argument("--compare-merged", action="store_true")
@@ -568,13 +851,32 @@ def build_parser():
     parser.add_argument("--xpu-graph-cache-size", type=int, default=1)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=10)
-    parser.add_argument("--fd-step", type=float, default=0.005)
-    parser.add_argument("--fd-tolerance", type=float, default=0.02)
-    parser.add_argument("--energy-tolerance", type=float, default=1e-4)
-    parser.add_argument("--force-tolerance", type=float, default=5e-4)
-    parser.add_argument("--stress-tolerance", type=float, default=5e-5)
-    parser.add_argument("--stress-fd-step", type=float, default=0.001)
-    parser.add_argument("--stress-fd-tolerance", type=float, default=5e-4)
+    parser.add_argument(
+        "--geometry-workloads",
+        nargs="+",
+        choices=("subskin", "rebuild", "strain"),
+        default=(),
+    )
+    parser.add_argument("--fd-directions", type=int, default=3)
+    parser.add_argument("--fd-scales", nargs="+", type=float, default=(1.0, 2.0))
+    parser.add_argument(
+        "--fp64-reference",
+        action="store_true",
+        help="Also compare FP32 outputs to an independent CPU FP64 evaluation",
+    )
+    parser.add_argument(
+        "--hvp",
+        action="store_true",
+        help="Compare HVP with the centered force difference",
+    )
+    parser.add_argument("--hvp-tolerance", type=float, default=None)
+    parser.add_argument("--fd-step", type=float, default=None)
+    parser.add_argument("--fd-tolerance", type=float, default=None)
+    parser.add_argument("--energy-tolerance", type=float, default=None)
+    parser.add_argument("--force-tolerance", type=float, default=None)
+    parser.add_argument("--stress-tolerance", type=float, default=None)
+    parser.add_argument("--stress-fd-step", type=float, default=None)
+    parser.add_argument("--stress-fd-tolerance", type=float, default=None)
     return parser
 
 
@@ -583,13 +885,26 @@ def main(argv=None):
     Return nonzero on absent XPU, exceptions, nonfinite outputs or failed checks.
     """
     args = build_parser().parse_args(argv)
+    _resolve_tolerances(args)
     report = {
         "passed": False,
+        "source_revision": _source_revision(),
+        "torch_build_config": torch.__config__.show(),
         "model": args.model,
         "requested_device": args.device,
         "probe_only": args.probe_only,
         "versions": {
-            name: _version(name) for name in ("torch", "fairchem-core", "ase", "e3nn")
+            name: _version(name)
+            for name in (
+                "torch",
+                "fairchem-core",
+                "ase",
+                "e3nn",
+                "triton",
+                "pytorch-triton-xpu",
+                "onednn",
+                "intel-sycl-rt",
+            )
         },
         "platform": platform.platform(),
         "python": platform.python_version(),
@@ -602,6 +917,10 @@ def main(argv=None):
         ),
     }
     try:
+        if args.fd_directions < 1 or any(
+            not np.isfinite(x) or x <= 0 for x in args.fd_scales
+        ):
+            raise ValueError("FD directions and scales must be positive")
         if args.warmup < 0 or args.repeats < 1:
             raise ValueError("warmup must be nonnegative and repeats positive")
         if not np.isfinite(args.neighbor_skin) or args.neighbor_skin < 0:
@@ -620,6 +939,7 @@ def main(argv=None):
             not np.isfinite(value) or value <= 0
             for value in (
                 args.fd_step,
+                args.hvp_tolerance,
                 args.fd_tolerance,
                 args.energy_tolerance,
                 args.force_tolerance,
@@ -634,12 +954,14 @@ def main(argv=None):
             raise ValueError("--device must be an XPU device, such as xpu:0")
         if not torch.xpu.is_available():
             raise RuntimeError("No XPU available; CPU fallback is not permitted")
-        device = torch.device("xpu", device.index if device.index is not None else 0)
-        if device.index >= torch.xpu.device_count():
-            raise ValueError(f"Requested {device}, but it is not an available XPU")
+        from fairchem.core.common.distutils import resolve_xpu_device
+
+        device = torch.device(resolve_xpu_device(device))
+        report["device"] = str(device)
         report["device_name"] = torch.xpu.get_device_name(device)
         properties = torch.xpu.get_device_properties(device)
         report["device_properties"] = str(properties)
+        report["driver_version"] = getattr(properties, "driver_version", None)
         report["has_fp64"] = getattr(properties, "has_fp64", "not exposed")
         report["torch_xpu_build"] = getattr(torch.version, "xpu", None)
         report["active_check"] = {
@@ -674,14 +996,28 @@ def main(argv=None):
             if not args.probe_only
             else ()
         )
+        if args.structure and not args.probe_only:
+            if args.case != "all":
+                raise ValueError(
+                    "--case selects a built-in structure; omit it with --structure"
+                )
+            cases = (
+                (f"frame_{index}", atoms, args.task)
+                for index, atoms in enumerate(iread(args.structure, index=":"))
+            )
         for name, atoms, task in cases:
             if args.case not in ("all", name):
                 continue
-            case = {"natoms": len(atoms), "task": task}
+            case = {
+                "natoms": len(atoms),
+                "task": task,
+                "chemical_formula": atoms.get_chemical_formula(),
+                "pbc": atoms.pbc.tolist(),
+            }
             report["cases"][name] = case
             progress = {"case": name}
             report["active_check"] = progress
-            stress = args.stress and name == "periodic"
+            stress = bool(args.stress and atoms.pbc.all())
             reference, case["cpu"] = run_case(
                 args, atoms, task, torch.device("cpu"), False, stress, progress
             )
@@ -712,15 +1048,62 @@ def main(argv=None):
                 case["unmerged_vs_merged"] = compare_predictions(
                     candidate, merged, len(atoms), tolerances
                 )
+                case["cpu_vs_merged"] = compare_predictions(
+                    reference, merged, len(atoms), tolerances
+                )
                 case["passed"] &= (
-                    case["unmerged_vs_merged"]["passed"]
+                    case["cpu_vs_merged"]["passed"]
+                    and case["unmerged_vs_merged"]["passed"]
                     and case["xpu_merged"]["finite_difference"]["passed"]
                 )
                 if stress:
                     case["passed"] &= case["xpu_merged"]["stress_finite_difference"][
                         "passed"
                     ]
+            for key in ("cpu", "xpu_unmerged", "xpu_merged"):
+                for check in ("execution", "hvp_finite_difference"):
+                    if check in case.get(key, {}):
+                        case["passed"] &= case[key][check]["passed"]
+            if args.fp64_reference and args.dtype == "float32":
+                fp64_args = copy.copy(args)
+                fp64_args.dtype = "float64"
+                fp64_args.fd_step = fp64_args.fd_tolerance = None
+                fp64_args.stress_fd_step = fp64_args.stress_fd_tolerance = None
+                fp64_args.geometry_workloads = ()
+                reference64, case["cpu_fp64"] = run_case(
+                    fp64_args, atoms, task, torch.device("cpu"), False, stress, progress
+                )
+                comparisons = {"cpu_fp32": reference, "xpu_unmerged_fp32": candidate}
+                if args.compare_merged:
+                    comparisons["xpu_merged_fp32"] = merged
+                case["vs_cpu_fp64"] = {
+                    key: compare_predictions(reference64, pred, len(atoms), tolerances)
+                    for key, pred in comparisons.items()
+                }
+                case["passed"] &= all(
+                    row["passed"] for row in case["vs_cpu_fp64"].values()
+                )
+            for mode, base in case["cpu"].get("geometry_workloads", {}).items():
+                for key in ("xpu_unmerged", "xpu_merged"):
+                    if key in case:
+                        measured = case[key]["geometry_workloads"][mode]
+                        parity = compare_predictions(
+                            {
+                                k: np.asarray(v)
+                                for k, v in base["displaced_geometry"].items()
+                            },
+                            {
+                                k: np.asarray(v)
+                                for k, v in measured["displaced_geometry"].items()
+                            },
+                            len(atoms),
+                            tolerances,
+                        )
+                        measured["cpu_comparison"] = parity
+                        case["passed"] &= parity["passed"]
             passed &= case["passed"]
+        if not args.probe_only and not report["cases"]:
+            raise ValueError("No structures evaluated")
         report.pop("active_check", None)
         report["passed"] = passed
     except Exception as exc:

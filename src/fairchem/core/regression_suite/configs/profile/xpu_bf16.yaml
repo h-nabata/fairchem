@@ -1,0 +1,5 @@
+label: xpu-bf16
+preset: xpu
+predictor_scope: structure
+inference_settings:
+  series_b: {gemm_precision: bf16}

@@ -522,3 +522,62 @@ def test_failed_gpu_tail_event_does_not_retain_predictor(monkeypatch):
     reference = attempt()
     gc.collect()
     assert reference() is None
+
+
+@pytest.mark.parametrize("zip_format", [False, True])
+def test_load_inference_checkpoint_legacy_and_mapped(tmp_path, zip_format, monkeypatch):
+    from fairchem.core.units.mlip_unit.utils import load_inference_checkpoint
+
+    path = tmp_path / "model.pt"
+    expected = torch.arange(4.0)
+    torch.save(expected, path, _use_new_zipfile_serialization=zip_format)
+    original_load = torch.load
+    observed = []
+
+    def track(*args, **kwargs):
+        observed.append(kwargs["mmap"])
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "load", track)
+    torch.testing.assert_close(load_inference_checkpoint(path), expected)
+    assert observed == [zip_format]
+
+
+def test_homogeneous_collation_reuses_grouped_rows_and_reorders_interleaved():
+    from types import SimpleNamespace
+
+    from fairchem.core.datasets.atomic_data import atomicdata_list_to_batch
+
+    data = atomicdata_list_to_batch([_data(), _data()])
+    unit = SimpleNamespace(
+        dataset_to_tasks={
+            "omol": [
+                SimpleNamespace(name="f", property="forces", level="atom"),
+                SimpleNamespace(name="e", property="energy", level="system"),
+            ]
+        }
+    )
+    values = {"f": torch.arange(18).view(6, 3), "e": torch.arange(2)}
+    predict = collate_predictions(lambda *args, **kwargs: values)
+    result = predict(unit, data)
+    torch.testing.assert_close(result["forces"], values["f"])
+    torch.testing.assert_close(result["energy"], values["e"])
+    assert result["forces"].data_ptr() != values["f"].data_ptr()
+    data.batch = torch.tensor([0, 1, 0, 1, 0, 1])
+    result = predict(unit, data)
+    torch.testing.assert_close(result["forces"], values["f"][[0, 2, 4, 1, 3, 5]])
+
+
+def test_owned_batch_reuses_only_forward_inputs_and_public_prediction_owns_data():
+    from fairchem.core.units.mlip_unit.predict import _owned_batch
+
+    data = _data()
+    token = _owned_batch.set(data)
+    try:
+        preparation = _copy_data_to_device(data, "cpu", torch.float32)
+        forward = _copy_data_to_device(data, "cpu", torch.float32, copy=False)
+    finally:
+        _owned_batch.reset(token)
+    assert preparation.pos.data_ptr() != data.pos.data_ptr()
+    assert forward.pos.data_ptr() == data.pos.data_ptr()
+    assert forward.dataset is not data.dataset

@@ -18,7 +18,7 @@ from ase import Atoms
 from ase.calculators.calculator import Calculator, all_changes
 from ase.constraints import FixAtoms
 from ase.md.verlet import VelocityVerlet
-from ase.optimize import BFGS
+from ase.optimize import BFGS, LBFGS
 
 from fairchem.core.calculate.series_b_workflows import (
     CoarseRefineOptions,
@@ -391,3 +391,67 @@ def test_workflow_options_are_frozen_and_normalize_numpy_scalars():
     assert type(options.inner_timestep) is float
     with pytest.raises(FrozenInstanceError):
         options.inner_steps = 4
+
+
+@pytest.mark.parametrize(
+    "stride,indices", [(3, [0, 3, 6, 8]), (0, [0, 8]), (1, list(range(9)))]
+)
+def test_strided_respa_preserves_drift_and_final_geometry(stride, indices):
+    def integrate(interval):
+        return run_respa(
+            _atom(),
+            teacher_factory=Harmonic,
+            student_factory=lambda: Harmonic(0.7),
+            options=RESPAOptions(0.02, 2, history_stride=interval),
+            outer_steps=8,
+        )
+
+    full, sampled = integrate(1), integrate(stride)
+    assert sampled.total_energies == tuple(full.total_energies[i] for i in indices)
+    assert sampled.max_energy_drift == full.max_energy_drift
+    np.testing.assert_array_equal(sampled.atoms.positions, full.atoms.positions)
+
+
+def test_limited_memory_optimizer_reaches_reference_minimum():
+    initial = _atom()
+    result = run_coarse_refine(
+        initial,
+        coarse_factory=lambda: Harmonic(0.2, 0.2),
+        reference_factory=Harmonic,
+        options=CoarseRefineOptions(reference_fmax=1e-5),
+        optimizer_cls=LBFGS,
+    )
+    assert result.converged
+    assert result.reference_force_max < 1e-5
+    np.testing.assert_allclose(result.atoms.positions, 0, atol=1e-5)
+
+
+def test_serial_dyneb_calculators_share_one_predictor_and_separate_ase_caches():
+    from fairchem.core.calculate.ase_calculator import FAIRChemCalculator
+    from tests.core.units.mlip_unit.test_predict_interoperability import (
+        _public_predictor,
+    )
+
+    predictor = _public_predictor()
+    predictor.inference_settings.merge_mole = False
+    factory = lambda: FAIRChemCalculator(predictor, task_name="omol")
+    images = [
+        Atoms("H2", positions=[[0, 0, 0], [x, 0, 0]], cell=[12] * 3)
+        for x in (0.7, 0.9, 1.1)
+    ]
+    for charge, image in enumerate(images):
+        image.info.update(charge=charge, spin=1)
+    result = run_dyneb(
+        images,
+        calculator_factory=factory,
+        options=DyNEBOptions(max_steps=0, final_refine=False),
+    )
+    assert len({id(i.calc) for i in result.images}) == 3
+    for image, energy, forces in zip(
+        result.images, result.reference_energies, result.reference_forces, strict=True
+    ):
+        assert image.calc.predictor is predictor
+        ref = image.copy()
+        ref.calc = factory()
+        assert ref.get_potential_energy() == pytest.approx(energy)
+        np.testing.assert_allclose(ref.get_forces(), forces, rtol=3e-5, atol=1e-8)

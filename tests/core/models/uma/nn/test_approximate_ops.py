@@ -239,3 +239,23 @@ def test_application_is_explicit_json_safe_and_disabled_is_unchanged():
 def test_invalid_table_resolution_is_rejected(points):
     with pytest.raises(ValueError, match="integer >= 2"):
         ApproximateGaussian(GaussianSmearing(0, 5, 8), points=points)
+
+
+def test_table_manifest_measures_center_and_derivative_error():
+    original = GaussianSmearing(0, 4, 5)
+    tables = [ApproximateGaussian(original, points=n) for n in (2, 65)]
+    coarse, fine = (table.sampled_error for table in tables)
+    assert coarse["max_abs_value"] >= 0.99
+    assert fine["max_abs_value"] < 2e-6
+    for derivative in ("max_abs_first", "max_abs_second"):
+        assert coarse[derivative] > fine[derivative]
+
+
+def test_compensated_segments_preserve_per_system_order_and_hessian():
+    values = torch.tensor([1e8, 4.0, 1.0, -1e8, 8.0, 16.0, 32.0], requires_grad=True)
+    batch = torch.tensor([2, 0, 2, 2, 0, 0, 0], dtype=torch.int32)
+    sums = compensated_node_sum(values, batch, 4)
+    torch.testing.assert_close(sums, torch.tensor([60.0, 0.0, 1.0, 0.0]))
+    grad = torch.autograd.grad(sums.square().sum(), values, create_graph=True)[0]
+    hess = torch.autograd.grad(grad.sum(), values)[0]
+    torch.testing.assert_close(hess, torch.tensor([6.0, 8.0, 6.0, 6.0, 8.0, 8.0, 8.0]))

@@ -371,3 +371,16 @@ def test_real_uma_energy_force_stress_and_hessian_with_compressed_features(
         assert torch.isfinite(actual[name]).all()
         assert torch.count_nonzero(actual[name]) > 0
         torch.testing.assert_close(actual[name], expected[name], rtol=rtol, atol=atol)
+
+
+def test_block_scale_limits_underflow_and_accounts_for_tail():
+    from fairchem.core.models.uma.nn.approximate_saved_features import (
+        saved_feature_roundtrip_stats,
+    )
+
+    value = torch.tensor([1e13, 1.0, 1.0, 0.1, 2.0])
+    original = saved_feature_roundtrip_stats(value, "fp16")
+    blocked = saved_feature_roundtrip_stats(value, "fp16", block_size=2)
+    assert original["zeroed_elements"] == 4
+    assert blocked["zeroed_elements"] == 1
+    assert blocked["packed_bytes"] == 2 * 5 + 4 * 3

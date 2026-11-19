@@ -8,8 +8,10 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
+from itertools import accumulate, pairwise
+from typing import NamedTuple
 
 import torch
 import torch.nn as nn
@@ -78,6 +80,132 @@ class MOLEGlobals:
     # the MolE interface to maintain functional equivalence to the Linear layer interface, this extra info
     # needs to be added here instead. (TODO: is there a cleaner way to do this?)
     ac_start_idx: int = 0
+
+    # Padded layouts for MOLE.forward, valid for one mole_sizes tensor
+    _padded_plans: dict = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+
+    def row_layout(self, start: int, rows: int, device):
+        sizes = self.mole_sizes
+        if not hasattr(self, "_padded_plans"):
+            self._padded_plans = {}
+        cache = self._padded_plans
+        version = None if sizes.is_inference() else sizes._version
+        if (
+            sizes is not cache.get("sizes")
+            or version is None
+            or version != cache.get("version")
+        ):
+            cache.clear()
+            counts = sizes.tolist()
+            cache.update(
+                sizes=sizes,
+                version=version,
+                counts=counts,
+                boundaries=[0, *accumulate(counts)],
+            )
+        device = torch.device(device)
+        stream = (
+            getattr(torch, device.type).current_stream(device)
+            if device.type in {"cuda", "xpu"}
+            else None
+        )
+        key = (start, rows, device, stream)
+        if key not in cache:
+            cache[key] = _build_padded_plan(cache["counts"], start, rows, device)
+        return cache["boundaries"], cache[key]
+
+    def __getstate__(self):
+        return {**self.__dict__, "_padded_plans": {}}
+
+
+class PaddedGroup(NamedTuple):
+    """
+    Systems of similar size that share one bmm.
+    """
+
+    # System index of each block in the group, used to select its mixed weights
+    systems: torch.Tensor
+    # Rows per block (the largest system in the group)
+    block_rows: int
+    # First padded row of the group
+    offset: int
+
+
+class PaddedPlan(NamedTuple):
+    """
+    Layout for running one MOLE layer on several systems with a few bmm calls.
+    """
+
+    groups: tuple[PaddedGroup, ...]
+    # Total padded rows over all groups
+    padded_rows: int
+    # Padded position of each input row, in input order
+    index: torch.Tensor
+
+
+@torch.inference_mode(False)
+@torch.no_grad()
+def _build_padded_plan(
+    sizes: list[int], start: int, num_rows: int, device: torch.device
+) -> PaddedPlan | None:
+    """
+    Build the padded layout for input rows [start, start + num_rows).
+
+    Systems are sorted by size and grouped greedily so that each group's padded
+    rows stay within twice its real rows.
+
+    Args:
+        sizes: Rows per system for the whole batch.
+        start: Global index of the first input row (activation checkpointing).
+        num_rows: Number of input rows.
+        device: Device for the index tensors.
+
+    Returns:
+        The layout, or None when the per-system loop is as good (at most one
+        system has rows, or every system needs its own group) or the sizes do
+        not cover the input.
+    """
+    end = start + num_rows
+    segments = []  # (system, first input row, rows), in input order
+    offset = 0
+    for system, size in enumerate(sizes):
+        first, last = max(offset, start), min(offset + size, end)
+        if last > first:
+            segments.append((system, first - start, last - first))
+        offset += size
+    if len(segments) < 2 or sum(seg[2] for seg in segments) != num_rows:
+        return None
+
+    grouped = []  # each group sorted by rows, largest first
+    group_rows = 0
+    for segment in sorted(segments, key=lambda seg: -seg[2]):
+        if grouped:
+            group = grouped[-1]
+            if (len(group) + 1) * group[0][2] <= 2 * (group_rows + segment[2]):
+                group_rows += segment[2]
+                group.append(segment)
+                continue
+        grouped.append([segment])
+        group_rows = segment[2]
+    if len(grouped) == len(segments):
+        return None
+
+    groups = []
+    index = torch.empty(num_rows, dtype=torch.long, device="cpu")
+    padded_rows = 0
+    for group in grouped:
+        block_rows = group[0][2]
+        for block, (_, first, rows) in enumerate(group):
+            begin = padded_rows + block * block_rows
+            index[first : first + rows] = torch.arange(
+                begin, begin + rows, device="cpu"
+            )
+        systems = torch.tensor([seg[0] for seg in group], device="cpu")
+        groups.append(PaddedGroup(systems.to(device), block_rows, padded_rows))
+        padded_rows += len(group) * block_rows
+    return PaddedPlan(tuple(groups), padded_rows, index.to(device))
 
 
 def init_linear(num_experts, use_bias, out_features, in_features):
@@ -191,11 +319,10 @@ class MOLE(torch.nn.Module):
     def forward(self, x):
         ac_start_idx = self.global_mole_tensors.ac_start_idx
         assert len(self.global_mole_tensors.mole_sizes) > 0
-        # TODO: precompute these if needed but they should be small and on cpu
-        start_idxs = [0] + torch.cumsum(
-            self.global_mole_tensors.mole_sizes, dim=0
-        ).tolist()
-        mole_intervals = zip(start_idxs, start_idxs[1:])
+        start_idxs, plan = self.global_mole_tensors.row_layout(
+            ac_start_idx, x.shape[0], x.device
+        )
+        mole_intervals = pairwise(start_idxs)
 
         # Because activation checkpointing can chunk the inputs, we need to only compute
         # the mole_size intervals that overlap with the current chunks
@@ -237,6 +364,9 @@ class MOLE(torch.nn.Module):
                 ],
             )
 
+        if plan is not None:
+            return self._padded_forward(x, weights, plan, first_system)
+
         if not segments:
             # Preserve an empty input's shape and autograd connections to the
             # parameters/routing coefficients, including all-zero edge batches.
@@ -254,3 +384,40 @@ class MOLE(torch.nn.Module):
             result.shape[0] == x.shape[0]
         ), f"result shape {result.shape}, does not match input shape {x.shape} at dim 0"
         return result
+
+    def _padded_forward(self, x, weights, plan: PaddedPlan, first_system: int):
+        """
+        Apply each system's mixed weights to its rows with one bmm per group.
+
+        Rows are scattered into zero-padded per-system blocks, each group of
+        blocks is multiplied by its weights in one batched matmul, and rows are
+        gathered back in input order. This replaces one matmul per system per
+        layer, which made batched inference bound by CPU-side kernel launches.
+
+        Args:
+            x: Input of shape (rows, ..., in_features).
+            weights: Mixed weights per system, (systems, out_features, in_features).
+            plan: Padded layout from MOLEGlobals.padded_plan.
+
+        Returns:
+            Output of shape (rows, ..., out_features).
+        """
+        rows = x.reshape(x.shape[0], -1, x.shape[-1])
+        width, in_features = rows.shape[1], rows.shape[2]
+        padded = rows.new_zeros(plan.padded_rows, width, in_features)
+        padded.index_copy_(0, plan.index, rows)
+        outputs = []
+        for group in plan.groups:
+            blocks = group.systems.shape[0]
+            chunk = padded[group.offset : group.offset + blocks * group.block_rows]
+            out = torch.bmm(
+                chunk.reshape(blocks, group.block_rows * width, in_features),
+                weights[group.systems - first_system].transpose(1, 2),
+            )
+            outputs.append(out.reshape(blocks * group.block_rows, width, -1))
+        out = (outputs[0] if len(outputs) == 1 else torch.cat(outputs)).index_select(
+            0, plan.index
+        )
+        if self.bias is not None:
+            out = out + self.bias
+        return out.reshape(*x.shape[:-1], out.shape[-1])

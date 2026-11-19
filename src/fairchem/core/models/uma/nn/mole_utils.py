@@ -51,10 +51,11 @@ def recursive_replace_so2_MOLE(model, replacement_factory):
         if isinstance(child, torch.nn.Module):
             recursive_replace_so2_MOLE(child, replacement_factory)
         if isinstance(child, SO2_Convolution):
-            target_device = child.fc_m0.weights.device
-            child.fc_m0 = replacement_factory(child.fc_m0).to(target_device)
+            if isinstance(child.fc_m0, (MOLE, MOLEDGL)):
+                child.fc_m0 = replacement_factory(child.fc_m0)
             for so2_module in child.so2_m_conv:
-                so2_module.fc = replacement_factory(so2_module.fc).to(target_device)
+                if isinstance(so2_module.fc, (MOLE, MOLEDGL)):
+                    so2_module.fc = replacement_factory(so2_module.fc)
 
 
 def recursive_replace_so2_linear(model, replacement_factory):
@@ -253,3 +254,13 @@ def convert_model_to_MOLE_model(
         )
     else:
         raise ValueError(f"Not a valid mole_type {mole_type}")
+
+    for block in model.blocks:
+        edgewise = block.edge_wise
+        edgewise._chunk_mole_states = tuple(
+            {
+                id(m.global_mole_tensors): m.global_mole_tensors
+                for m in edgewise.modules()
+                if isinstance(m, MOLE)
+            }.values()
+        )

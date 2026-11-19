@@ -133,6 +133,14 @@ model = FairChemModel(
 | B16 | `low_rank_fraction=0.25`等 | MoLE統合後の通常Linearをtruncated SVDへ置換。演算数を減らさない行列はskipしてmanifestへ記録。量子化との同時指定は拒否。fine-tuning済みとは称さない。 |
 | B17 | `hutchinson_estimates` + `HutchinsonOptions` | HVPからtrace／diagonalを推定し、標本分散・標準誤差・seedを記録。不定Hessianに対応し、負固有値数やTS認証には使わない。 |
 
+### 長時間計算でのメモリと転送の調整
+
+- B09では、`collect_teacher_labels(..., shard_directory=workdir, shard_size=32)`を指定すると、教師ラベルを指定ディレクトリ内の一時ファイルに分割する。データセットの存続中だけファイルを保持し、乱択したサンプルを読む際は所属するシャードをロードする。シャードの単位は構造数である。蒸留済みモデルを読み取り専用で配布する場合は、`export_distilled_checkpoint(..., share_ema_storage=True)`で、生の重みと同じ値を持つEMAのストレージを共有できる。
+- B11では、`RESPAOptions(..., history_stride=k)`で初期・最終ステップと外側の各`k`ステップを記録する。`0`なら初期と最終のみを残す。最大エネルギードリフトは間引きの設定によらず毎ステップ評価する。
+- B12で大規模系を緩和する際は、`optimizer_cls=ase.optimize.LBFGS`で有限個の更新履歴を使える。BFGSとは最適化経路が変わりうるため、最終構造とreferenceの力で評価する。
+- B14の直列DyNEBでは、同じ重みを使う画像に対してpredictorを一度ロードし、`calculator_factory=lambda: FAIRChemCalculator(predictor, task_name="omat")`のように画像ごとにcalculatorだけを生成する。ASEの画像ごとの結果キャッシュを保ちながらモデルを共有できる。
+- B17では、`HutchinsonOptions(..., probe_block_size=k)`で同じ乱数列のプローブをまとめて転送する。大きい`k`は転送回数を減らし、一時メモリを増やす。`device_block_statistics=True`を併用すると、各ブロックの平均と分散をデバイスのFP64で求め、CPUではその統計量だけを結合する。この指定はFP64対応デバイスが対象で、既定の逐次集計とは丸め順が異なる。
+
 B06/B16変換後のstate_dictは元のLinear構造と異なる。通常は元checkpointから起動時に
 変換する。変換済みstate_dictを保存する場合は同じ変換設定・構造へ読み込む必要があり、
 そのまま元構造の標準checkpointとして読み込めるわけではない。
@@ -148,6 +156,14 @@ FP32出力を要求しても、実機の蓄積・kernel選択までCPU試験で�
 CUDAでは対応するreduced-precision reductionが有効な場合に拒否する。
 B03の大域設定ロックはfairchem間を調整するもので、無関係な外部ライブラリの
 同時実行まで制御しない。B03は専用プロセスで利用する。
+
+### 量子化と動径補間の設定
+
+- `quantize_only_if_smaller=True`は、整数重みと行ごとのスケールの合計が元の重み以上になる層で重みをFP32のまま保持する。低精度GEMMを同時に指定した場合はその層にも適用する。
+- `packed_tile_rows`は、一度に復号する出力行数を指定する。奇数幅のINT4で奇数行を指定した場合は、バイト境界に合わせて偶数行に切り上げる。小さいタイルは作業メモリを減らす一方、GEMM回数が増え、入力勾配の丸め順も変わる。
+- `low_rank_solver="randomized"`は、指定ランクに8を加えた部分空間と2回の反復を使う。準備時の乱数は専用の生成器で固定する。マニフェストに記録した保持エネルギーと相対Frobenius残差は、FP32へ丸める前の因子についての値である。既定の`"exact"`はCPUのFP64薄型SVDを使う。
+- `saved_feature_block_size`は、平坦化した保存特徴を指定要素数ずつに分け、各区間にスケールを1個保存する。外れ値の影響とスケール分の容量を実入力で確認するには、`approximate_saved_features.saved_feature_roundtrip_stats(tensor, dtype, block_size)`で有限非ゼロ値のゼロ化率、最大絶対誤差、スケール込みの保存バイト数を測定する。
+- `radial_table_points`を指定すると、正規化座標の区間`[-8,8]`を4,097点で標本化し、補間値・一次微分・二次微分と解析式の最大絶対差を`sampled_normalized_error`へ記録する。これらの標本誤差と、対象構造の力・応力・二次微分の誤差を併せて点数を選ぶ。
 
 ## ワークフロー例
 

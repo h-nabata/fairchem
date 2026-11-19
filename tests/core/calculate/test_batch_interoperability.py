@@ -419,8 +419,10 @@ def test_staged_context_and_pool_cleanup_do_not_hide_job_error(monkeypatch):
     pool.close()
 
 
+@pytest.mark.parametrize("worker_device", ["xpu:0", "xpu:1"])
 def test_virtual_gpu_submission_waits_for_source_snapshot_before_worker_use(
     monkeypatch,
+    worker_device,
 ):
     # Dispatch/lifetime check only; these fake tensors do not execute GPU math.
     data = _structure()
@@ -444,19 +446,25 @@ def test_virtual_gpu_submission_waits_for_source_snapshot_before_worker_use(
 
     monkeypatch.setattr(batched_inference, "device_scope", lambda device: nullcontext())
     monkeypatch.setattr(torch.xpu, "Event", Completion)
-    monkeypatch.setattr(torch.xpu, "current_stream", lambda device: device)
+    stream = SimpleNamespace(
+        wait_event=lambda event: events.append(("stream-wait", event))
+    )
+    monkeypatch.setattr(torch.xpu, "current_stream", lambda device: stream)
     monkeypatch.setattr(
         torch.Tensor,
         "record_stream",
         lambda tensor, stream: events.append(("source-use", stream)),
     )
-    with IndependentDevicePool(factory, ["xpu:0"]) as pool:
+    with IndependentDevicePool(factory, [worker_device]) as pool:
         result = pool.submit([data]).result(timeout=10)
     torch.testing.assert_close(result[0]["energy"], torch.ones(1))
     assert events[0][0] == "record"
-    assert events[1] == ("wait", events[0][1])
-    assert events[2] == ("source-use", torch.device("xpu:0"))
-    assert ("factory", torch.device("xpu:0")) in events[3:]
+    assert events[1] == (
+        "stream-wait" if worker_device == "xpu:0" else "wait",
+        events[0][1],
+    )
+    assert events[2] == ("source-use", stream)
+    assert ("factory", torch.device(worker_device)) in events[3:]
     assert events[-1] == ("wait", events[-2][1])
 
 

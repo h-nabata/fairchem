@@ -123,3 +123,65 @@ class GradSaveOptimizer(torch.optim.AdamW):
             )
         self.save_step += 1
         super().step()
+
+
+def test_strict_xpu_readers_overlap_while_precision_writer_waits(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier, Event
+    from types import SimpleNamespace
+
+    backend = SimpleNamespace(allow_tf32=False)
+    monkeypatch.setattr(torch.backends, "mkldnn", backend)
+    concurrent_readers = Barrier(3)
+    finish = Event()
+    writer_entered = Event()
+
+    def read():
+        with tf32_context_manager(False, device_type="xpu"):
+            concurrent_readers.wait(timeout=10)
+            assert finish.wait(timeout=10)
+            assert not backend.allow_tf32
+
+    def write():
+        with tf32_context_manager(True, device_type="xpu"):
+            assert backend.allow_tf32
+            writer_entered.set()
+
+    with ThreadPoolExecutor(3) as pool:
+        readers = [pool.submit(read) for _ in range(2)]
+        concurrent_readers.wait(timeout=10)
+        writer = pool.submit(write)
+        try:
+            assert not writer_entered.wait(timeout=0.1)
+        finally:
+            finish.set()
+        for reader in readers:
+            reader.result()
+        writer.result()
+    assert not backend.allow_tf32
+
+
+def test_modern_onednn_precision_guard_and_key(monkeypatch):
+    from types import SimpleNamespace
+
+    from fairchem.core.common.precision import matmul_precision_key
+
+    matmul = SimpleNamespace(fp32_precision="bf16")
+    monkeypatch.setattr(torch.backends, "mkldnn", SimpleNamespace(matmul=matmul))
+
+    def incompatible_legacy_getter():
+        raise RuntimeError("legacy and modern controls cannot be mixed")
+
+    monkeypatch.setattr(
+        torch, "get_float32_matmul_precision", incompatible_legacy_getter
+    )
+    before = matmul_precision_key("xpu")
+    with (
+        pytest.raises(ValueError, match="Strict FP32"),
+        tf32_context_manager(False, device_type="xpu"),
+    ):
+        pass
+    with tf32_context_manager(True, device_type="xpu"):
+        assert matmul.fp32_precision == "tf32"
+        assert before != matmul_precision_key("xpu")
+    assert matmul.fp32_precision == "bf16"

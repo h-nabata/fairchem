@@ -106,7 +106,7 @@ GROMACS の統計的 energy-drift tolerance 方式は近傍の取りこぼしを
 2. **Windows 旧 Arc の同期**: PyTorch #197520 は #202188 による解決が報告される。
    修正は Windows の BMG より前の GPU の device-wide wait を避けるもので、
    Ubuntu B70 にそのまま当てはめない。v2.15.0 タグには当該 guard はない [S23]。
-3. **Aurora PR #2182**: open / 未マージ。対象は主に PVC / Xe-HPC。
+3. **Aurora PR #2182**: 2026年11月9日closed、未マージ。対象は主に PVC / Xe-HPC。
    `xpu:1` の index を失う正規化や、アクセラレータ存在だけで fused path を
    許可する変更を無条件に取り込まない。B70 / Xe2 の保証にはならない [S4]。
 4. **FlashUMA**: 独立 repo の headline は CUDA、TF32 有効での比較。

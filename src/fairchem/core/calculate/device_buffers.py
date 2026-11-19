@@ -168,6 +168,8 @@ class DeviceBatchStager:
         device: CPU or an explicit CUDA/XPU device ordinal.
         slots: Number of independent reusable input slots.
         max_batch_bytes: Maximum payload capacity per slot and memory side.
+        pack_small_tensors: Coalesce small integer metadata of each dtype into
+            one host-to-device copy. Enable after profiling the target device.
     """
 
     def __init__(
@@ -176,6 +178,7 @@ class DeviceBatchStager:
         *,
         slots: int = 2,
         max_batch_bytes: int = 256 * 1024 * 1024,
+        pack_small_tensors: bool = False,
     ) -> None:
         self.device = torch.device(device)
         if self.device.type not in {"cpu", "cuda", "xpu"}:
@@ -187,6 +190,9 @@ class DeviceBatchStager:
             for v in (slots, max_batch_bytes)
         ):
             raise ValueError("slots and max_batch_bytes must be positive integers")
+        if not isinstance(pack_small_tensors, bool):
+            raise TypeError("pack_small_tensors must be boolean")
+        self.pack_small_tensors = pack_small_tensors
         self.max_batch_bytes = int(max_batch_bytes)
         self._slots = [_Slot() for _ in range(int(slots))]
         self._lock = RLock()
@@ -215,6 +221,7 @@ class DeviceBatchStager:
             return {
                 "device": self.device,
                 "slots": self.slots,
+                "pack_small_tensors": self.pack_small_tensors,
                 "max_batch_bytes": self.max_batch_bytes,
             }
 
@@ -232,17 +239,43 @@ class DeviceBatchStager:
             )
 
     def _slot(self) -> _Slot:
-        for offset in range(len(self._slots)):
-            index = (self._next + offset) % len(self._slots)
+        pending = None
+        host_ready = None
+        for offset in range(self.slots):
+            index = (self._next + offset) % self.slots
             slot = self._slots[index]
-            if not slot.leased:
-                if slot.consumed is not None:
-                    slot.consumed.synchronize()
-                elif slot.ready is not None:
-                    slot.ready.synchronize()
-                self._next = (index + 1) % len(self._slots)
+            if slot.leased:
+                continue
+            event = slot.consumed if slot.consumed is not None else slot.ready
+            if event is None or event.query():
+                self._next = (index + 1) % self.slots
                 return slot
-        raise RuntimeError("All staging slots are leased; release a batch first")
+            if (
+                self._copy_stream is not None
+                and host_ready is None
+                and slot.ready is not None
+                and slot.ready.query()
+            ):
+                host_ready = index
+            if pending is None:
+                pending = index
+        if pending is None:
+            raise RuntimeError("All staging slots are leased; release a batch first")
+        index = pending if host_ready is None else host_ready
+        slot = self._slots[index]
+        if self._copy_stream is not None and slot.ready is not None:
+            if host_ready is None:
+                slot.ready.synchronize()
+            # Pinned host bytes are now reusable. Target writes stay ordered
+            # after all earlier consumers, without blocking this host thread.
+            if slot.consumed is not None:
+                with device_scope(self.device):
+                    self._copy_stream.wait_event(slot.consumed)
+        else:
+            event = slot.consumed if slot.consumed is not None else slot.ready
+            event.synchronize()
+        self._next = (index + 1) % self.slots
+        return self._slots[index]
 
     def stage(self, batch: AtomicData) -> StagedBatch:
         """
@@ -266,20 +299,28 @@ class DeviceBatchStager:
         if payload > self.max_batch_bytes:
             raise ValueError("Input exceeds max_batch_bytes; reduce the microbatch")
         slot = self._slot()
-        slot.consumed = None
         slot.ready = None
-        keys = {path for path, _ in tensors}
-        for buffers in (slot.host, slot.target):
-            for path in buffers.keys() - keys:
-                del buffers[path]
-        capacity = 0
+        groups = {}
         for path, tensor in tensors:
-            old = slot.target.get(path)
-            capacity += (
-                max(old.numel(), tensor.numel())
-                if old is not None and old.dtype == tensor.dtype
-                else tensor.numel()
-            ) * tensor.element_size()
+            pack = (
+                self.pack_small_tensors
+                and tensor.numel() <= 256
+                and not tensor.is_floating_point()
+                and not tensor.is_complex()
+            )
+            key = tensor.dtype if pack else path
+            groups.setdefault(key, []).append(tensor)
+        sizes = {key: sum(t.numel() for t in group) for key, group in groups.items()}
+        for buffers in (slot.host, slot.target):
+            for key in buffers.keys() - groups.keys():
+                del buffers[key]
+        capacity = 0
+        for key, group in groups.items():
+            old = slot.target.get(key)
+            size = sizes[key]
+            if old is not None and old.dtype == group[0].dtype:
+                size = max(size, old.numel())
+            capacity += size * group[0].element_size()
         if capacity > self.max_batch_bytes:
             slot.host.clear()
             slot.target.clear()
@@ -300,39 +341,36 @@ class DeviceBatchStager:
                 torch.inference_mode(False),
                 torch.no_grad(),
             ):
-                for path, tensor in tensors:
-                    target = slot.target.get(path)
-                    if (
-                        target is None
-                        or target.dtype != tensor.dtype
-                        or target.numel() < tensor.numel()
-                    ):
-                        target = torch.empty(
-                            tensor.numel(), dtype=tensor.dtype, device=self.device
-                        )
-                        slot.target[path] = target
-                    target_view = target[: tensor.numel()].view(tensor.shape)
-                    if self._backend is None:
-                        target_view.copy_(tensor)
-                    else:
-                        host = slot.host.get(path)
+                for key, group in groups.items():
+                    size, dtype = sizes[key], group[0].dtype
+                    target = slot.target.get(key)
+                    if target is None or target.dtype != dtype or target.numel() < size:
+                        target = torch.empty(size, dtype=dtype, device=self.device)
+                        slot.target[key] = target
+                    buffer = target
+                    if self._backend is not None:
+                        buffer = slot.host.get(key)
                         if (
-                            host is None
-                            or host.dtype != tensor.dtype
-                            or host.numel() < tensor.numel()
+                            buffer is None
+                            or buffer.dtype != dtype
+                            or buffer.numel() < size
                         ):
-                            # Explicit type matters on hosts exposing multiple backends.
-                            host = torch.empty(
-                                tensor.numel(), dtype=tensor.dtype, device="cpu"
+                            buffer = torch.empty(
+                                size, dtype=dtype, device="cpu"
                             ).pin_memory(device=self.device.type)
-                            slot.host[path] = host
-                        host_view = host[: tensor.numel()].view(tensor.shape)
-                        host_view.copy_(tensor)
-                        target_view.copy_(host_view, non_blocking=True)
-                    memo[id(tensor)] = target_view
+                            slot.host[key] = buffer
+                    offset = 0
+                    for tensor in group:
+                        end = offset + tensor.numel()
+                        buffer[offset:end].view(tensor.shape).copy_(tensor)
+                        memo[id(tensor)] = target[offset:end].view(tensor.shape)
+                        offset = end
+                    if self._backend is not None:
+                        target[:size].copy_(buffer[:size], non_blocking=True)
                 if self._backend is not None:
                     slot.ready = self._backend.Event()
                     slot.ready.record(self._copy_stream)
+                slot.consumed = None
         except BaseException:
             if self._copy_stream is not None:
                 try:

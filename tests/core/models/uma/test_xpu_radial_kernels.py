@@ -191,7 +191,9 @@ def test_launch_errors_are_not_swallowed(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.xpu.is_available(), reason="requires an Intel XPU")
-@pytest.mark.parametrize("shape", [(1, 16, 16), (17, 31, 33), (32, 128, 128)])
+@pytest.mark.parametrize(
+    "shape", [(1, 16, 16), (17, 31, 33), (32, 128, 128), (17, 37, 257)]
+)
 def test_actual_xpu_forward_force_and_hvp(monkeypatch, shape):
     pytest.importorskip("triton.language.extra.intel.libdevice")
     monkeypatch.setenv("FAIRCHEM_XPU_FUSED_KERNELS", "1")

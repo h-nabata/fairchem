@@ -22,7 +22,9 @@ import weakref
 from collections import defaultdict
 from collections.abc import Collection, Mapping
 from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from functools import cached_property, wraps
+from importlib.util import find_spec
 from typing import TYPE_CHECKING, ClassVar, Protocol
 
 import hydra
@@ -32,14 +34,6 @@ import torch.distributed as dist
 from monty.dev import requires
 from torch.distributed.elastic.utils.distributed import get_free_port
 from torchtnt.framework import PredictUnit, State
-
-try:
-    import ray
-    from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-
-    ray_installed = True
-except ImportError:
-    ray_installed = False
 
 from fairchem.core.common import gp_utils
 from fairchem.core.common._model_state import MODEL_STATE_LOCK
@@ -51,7 +45,6 @@ from fairchem.core.common.distutils import (
     setup_env_local_multi_gpu,
 )
 from fairchem.core.common.utils import get_commit_hash_for_repo
-from fairchem.core.components.serve_utils import get_app_handle_with_retry
 from fairchem.core.datasets.atomic_data import (
     AtomicData,
     _clone_tensor_tree,
@@ -74,10 +67,12 @@ from fairchem.core.units.mlip_unit.api.model_spec import ModelSpec
 from fairchem.core.units.mlip_unit.inference_runtime import (
     ModelStreamGuard,
     PreparedModelCache,
+    _preflight_fp64,
     configure_numeric_runtime,
     model_tensor_signature,
     mole_composition_key,
     probe_fp64_support,
+    validate_xpu_policy,
 )
 from fairchem.core.units.mlip_unit.mlip_unit import OutputSpec, Task
 from fairchem.core.units.mlip_unit.series_b_runtime import (
@@ -89,6 +84,7 @@ from fairchem.core.units.mlip_unit.single_atom_patch import (
 )
 from fairchem.core.units.mlip_unit.utils import (
     get_backbone_class_from_checkpoint,
+    load_inference_checkpoint,
     load_inference_model,
     tf32_context_manager,
 )
@@ -100,6 +96,8 @@ if TYPE_CHECKING:
     from fairchem.core.common.gp_utils import GraphParallelConfig
     from fairchem.core.units.mlip_unit.api.inference import MLIPInferenceCheckpoint
 
+
+ray_installed = find_spec("ray") is not None
 
 _AUXILIARY_LEVELS = {
     "forces": "atom",
@@ -270,7 +268,21 @@ def collate_predictions(predict_fn):
         preds = predict_fn(predict_unit, data, undo_element_references, **kwargs)
         collated_preds = defaultdict(list)
         batch_by_device = {}
-        provided = [set() for _ in data.dataset]
+        # A homogeneous batch with grouped atom rows already has precisely the
+        # public output order. Keep the original gather path for interleaved
+        # atoms and for heads with multiple tasks providing the same property.
+        whole_batch = False
+        if len(data.dataset) > 1 and len(set(data.dataset)) == 1:
+            tasks = predict_unit.dataset_to_tasks.get(data.dataset[0], ())
+            properties = [task.property for task in tasks]
+            indices = data.batch
+            whole_batch = len(properties) == len(set(properties)) and bool(
+                (indices[1:] >= indices[:-1]).all()
+                & (indices >= 0).all()
+                & (indices < len(data.dataset)).all()
+            )
+        datasets = data.dataset[:1] if whole_batch else data.dataset
+        provided = [set() for _ in datasets]
 
         def validate_output(name, value, level):
             if not torch.is_tensor(value) or value.ndim == 0:
@@ -283,7 +295,7 @@ def collate_predictions(predict_fn):
                     f"Prediction {name!r} has {value.shape[0]} {level} rows; expected {expected}"
                 )
 
-        for i, dataset in enumerate(data.dataset):
+        for i, dataset in enumerate(datasets):
             if dataset not in predict_unit.dataset_to_tasks:
                 raise ValueError(
                     f"Unknown prediction dataset {dataset!r} at system {i}"
@@ -294,7 +306,9 @@ def collate_predictions(predict_fn):
                 prediction = preds[task.name]
                 validate_output(task.name, prediction, task.level)
                 provided[i].add(task.property)
-                if task.level == "system":
+                if whole_batch and task.level in {"atom", "system"}:
+                    collated_preds[task.property].append(prediction)
+                elif task.level == "system":
                     collated_preds[task.property].append(prediction[i].unsqueeze(0))
                 elif task.level == "atom":
                     if len(data.dataset) == 1:
@@ -331,9 +345,9 @@ def collate_predictions(predict_fn):
                     value = preds[name]
                     validate_output(name, value, level)
                     provided[i].add(prop)
-                    if level == "system":
+                    if level == "system" and not whole_batch:
                         value = value[i].unsqueeze(0)
-                    elif len(data.dataset) > 1:
+                    elif level == "atom" and len(datasets) > 1:
                         if value.device not in batch_by_device:
                             batch_by_device[value.device] = data.batch.to(value.device)
                         value = value[batch_by_device[value.device] == i]
@@ -353,9 +367,13 @@ def collate_predictions(predict_fn):
                         f"Requested properties {sorted(missing)} are unavailable for system {i} (dataset={data.dataset[i]!r})"
                     )
 
+        if whole_batch:
+            # A predictor may reuse its output buffers. Preserve the independent
+            # lifetime formerly provided by concatenation, with one bulk copy.
+            return {prop: values[0].clone() for prop, values in collated_preds.items()}
         return {
             prop: values[0]
-            if len(data.dataset) == 1 and len(values) == 1
+            if len(datasets) == 1 and len(values) == 1
             else torch.cat(values)
             for prop, values in collated_preds.items()
         }
@@ -363,8 +381,15 @@ def collate_predictions(predict_fn):
     return collated_predict
 
 
+_owned_batch = ContextVar("owned_prediction_batch", default=None)
+
+
 def _copy_data_to_device(
-    data: AtomicData, device: str | torch.device, dtype: torch.dtype
+    data: AtomicData,
+    device: str | torch.device,
+    dtype: torch.dtype,
+    *,
+    copy: bool = True,
 ) -> AtomicData:
     """Copy a batch once per tensor, combining device and dtype conversion.
 
@@ -376,8 +401,20 @@ def _copy_data_to_device(
         tensor_transform=lambda value: value.to(
             device=device,
             dtype=dtype if value.is_floating_point() else value.dtype,
-            copy=True,
+            copy=copy or value.is_inference(),
         ),
+    )
+
+
+def _has_standard_mole_check(model) -> bool:
+    """Inspect hooks without retaining the current model across a fallback reload."""
+    from fairchem.core.models.base import HydraModel
+    from fairchem.core.models.uma.escn_moe import eSCNMDMoeBackbone
+
+    return (
+        getattr(model.on_predict_check, "__func__", None) is HydraModel.on_predict_check
+        and getattr(model.backbone.on_predict_check, "__func__", None)
+        is eSCNMDMoeBackbone.on_predict_check
     )
 
 
@@ -607,9 +644,7 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         """Load a fresh, unprepared model from the inference checkpoint."""
         # Load checkpoint first to get model type; UMA compat fixups run downstream
         # in load_inference_model.
-        checkpoint = torch.load(
-            self._inference_model_path, map_location="cpu", weights_only=False
-        )
+        checkpoint = load_inference_checkpoint(self._inference_model_path)
 
         if self.inference_settings.nitro:
             before = copy.deepcopy(self.inference_settings)
@@ -844,6 +879,18 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         return self.model.module.dataset_to_tasks
 
     @property
+    def graph_settings(self):
+        backbone = self.model.module.backbone
+        return {
+            "otf_graph": getattr(backbone, "otf_graph", None),
+            "cutoff": getattr(backbone, "cutoff", 6.0),
+            "max_neighbors": getattr(backbone, "max_neighbors", 300),
+            "enforce_max_neighbors_strictly": getattr(
+                backbone, "enforce_max_neighbors_strictly", True
+            ),
+        }
+
+    @property
     def tasks(self) -> dict:
         return self.model.module.tasks
 
@@ -915,22 +962,14 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         Reject CUDA-only paths instead of reaching unsupported kernels on XPU.
         """
         settings = self.inference_settings
-        if settings.nitro or settings.execution_mode == ExecutionMode.UMAS_FAST_GPU:
-            raise ValueError(
-                "UMA Nitro and umas_fast_gpu require CUDA. Use inference_settings='xpu' "
-                "or execution_mode='general' for Intel GPUs."
-            )
-        if settings.internal_graph_gen_version not in (1, 2):
-            raise ValueError(
-                "XPU requires internal_graph_gen_version=1 or 2; "
-                "version 3 uses NVIDIA-specific neighbor-list kernels."
-            )
-        if settings.tf32:
-            raise ValueError("XPU inference requires tf32=False.")
+        validate_xpu_policy(settings)
         if settings.base_precision_dtype == torch.float64:
-            # Verify the installed operators before loading a large checkpoint.
-            # Driver capability flags alone do not validate GEMM or derivatives.
-            self.fp64_probe = probe_fp64_support(self.device)
+            evidence = _preflight_fp64.get()
+            self.fp64_probe = (
+                evidence[1]
+                if evidence is not None and evidence[0] == self.device
+                else probe_fp64_support(self.device)
+            )
         if settings.execution_mode is None:
             settings.execution_mode = ExecutionMode.GENERAL
 
@@ -967,16 +1006,19 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
             dtype=self.inference_settings.base_precision_dtype,
             model_id=getattr(self.model.module, "model_id", None),
             settings_key=settings_key,
+            batch_size_dependent=getattr(
+                self.model.module.backbone, "_mole_batch_size_dependent", True
+            ),
         )
 
     @torch.inference_mode(False)
-    def _select_prepared_model(self, data) -> None:
+    def _select_prepared_model(self, data) -> bool:
         """
         Select or prepare an exact-composition model without disabling merging.
         """
         settings = self.inference_settings
         if not settings.mole_cache_size or not settings.merge_mole or settings.nitro:
-            return
+            return False
         if getattr(self, "_prepared_models", None) is None:
             self._prepared_models = PreparedModelCache(
                 settings.mole_cache_size, settings.mole_cache_max_bytes
@@ -990,7 +1032,7 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
             )
         key = self._mole_key(data)
         if key == getattr(self, "_active_mole_key", None):
-            return
+            return self.lazy_model_intialized
         cached = self._prepared_models.get(key)
         if cached is not None:
             self.model = cached
@@ -998,14 +1040,16 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
             self._active_mole_key = key
             self._active_model_signature = model_tensor_signature(self.model)
             self._numeric_runtimes = getattr(self.model.module, "_numeric_runtimes", [])
-            return
+            return True
         template = getattr(self, "_mole_template", None)
         if self.lazy_model_intialized and template is not None:
+            self._prepared_models.reserve_entry()
             self.model = copy.deepcopy(template)
             self.lazy_model_intialized = False
             self._numeric_runtimes = []
             self._active_model_signature = None
         self._active_mole_key = key
+        return False
 
     def _build_overrides_from_settings(
         self,
@@ -1230,6 +1274,13 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
     def predict_step(self, state: State, data: AtomicData) -> dict[str, torch.tensor]:
         return self.predict(data)
 
+    def _predict_owned_batch(self, data, **kwargs):
+        token = _owned_batch.set(data)
+        try:
+            return self.predict(data, **kwargs)
+        finally:
+            _owned_batch.reset(token)
+
     @collate_predictions
     def predict(
         self,
@@ -1301,7 +1352,34 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
                     execution_mode=ExecutionMode.GENERAL,
                     compile=False,
                 )
-        self._select_prepared_model(data)
+        # Handle single-atom systems (natoms==1 and pbc all False)
+        # Skip this check if the model natively supports single atoms
+        if not self.model.module.supports_single_atoms:
+            single_atom_result = single_atom_prediction_from_lookup(
+                data=data,
+                atom_refs=self.atom_refs,
+                tasks=self.tasks,
+                device=self.device,
+                dtype=self.inference_settings.base_precision_dtype,
+            )
+            if single_atom_result is not None:
+                if requested is not None:
+                    single_atom_result = {
+                        name: value
+                        for name, value in single_atom_result.items()
+                        if self.tasks[name].property in requested
+                    }
+                    available = {
+                        self.tasks[name].property for name in single_atom_result
+                    }
+                    if missing := set(requested) - available:
+                        raise ValueError(
+                            "Single-atom reference lookup cannot provide requested "
+                            f"properties: {sorted(missing)}"
+                        )
+                return single_atom_result
+
+        cached_routing = self._select_prepared_model(data)
         regress_config = getattr(self.model.module.backbone, "regress_config", None)
         if (
             torch.is_inference_mode_enabled()
@@ -1331,46 +1409,32 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         if not self.lazy_model_intialized:
             self._initialize(data)  # may fall back: nitro -> multigpu -> general
             revision = get_commit_hash_for_repo(os.path.dirname(__file__))
+            backend_name = type(
+                getattr(self.model.module.backbone, "backend", None)
+                or self.model.module
+            ).__name__
             logging.warning(
                 f"Running ({revision or 'unknown commit'}) with inference settings: "
-                f"{describe_inference_settings(self.inference_settings)}"
+                f"{describe_inference_settings(self.inference_settings)}\n"
+                f"execution_mode={self.inference_settings.execution_mode}, "
+                f"backend={backend_name}, nitro={self.inference_settings.nitro}"
             )
-
-        # Handle single-atom systems (natoms==1 and pbc all False)
-        # Skip this check if the model natively supports single atoms
-        if not self.model.module.supports_single_atoms:
-            single_atom_result = single_atom_prediction_from_lookup(
-                data=data,
-                atom_refs=self.atom_refs,
-                tasks=self.tasks,
-                device=self.device,
-            )
-            if single_atom_result is not None:
-                if requested is not None:
-                    single_atom_result = {
-                        name: value
-                        for name, value in single_atom_result.items()
-                        if self.tasks[name].property in requested
-                    }
-                    available = {
-                        self.tasks[name].property for name in single_atom_result
-                    }
-                    if missing := set(requested) - available:
-                        raise ValueError(
-                            "Single-atom reference lookup cannot provide requested "
-                            f"properties: {sorted(missing)}"
-                        )
-                return single_atom_result
 
         # Nitro's merged contract only reads composition/task/charge/spin.
         # Check CPU-origin metadata before uploading it: copying those fields
         # to CUDA only to read them back on every ASE MD step adds host waits.
         # The full owned input copy below is retained for model-side mutations.
-        nitro_checked = False
-        if self.inference_settings.nitro:
+        standard_mole_check = _has_standard_mole_check(self.model.module)
+        # An exact cache hit has revalidated every system's element counts,
+        # spin, charge, dataset, and (where relevant) the p-norm batch size.
+        metadata_checked = cached_routing and standard_mole_check
+        if not metadata_checked and (
+            self.inference_settings.nitro
+            or (standard_mole_check and data.atomic_numbers.device.type == "cpu")
+        ):
             try:
                 self.model.module.on_predict_check(data)
-                nitro_checked = True
+                metadata_checked = True
             except MergeMoleConsistencyError as error:
                 self._fall_back(error)
                 self._initialize(data)
@@ -1389,14 +1453,19 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
                 inference_kwargs["nitro_geometry_key"] = geometry_key
         # Keep the caller isolated from graph-parallel/MOLE mutations without
         # first retaining another full copy on the accelerator.
-        data_device = _copy_data_to_device(data, self.device, dtype)
+        data_device = (
+            _copy_data_to_device(data, self.device, dtype, copy=False)
+            if _owned_batch.get() is data
+            else _copy_data_to_device(data, self.device, dtype)
+        )
+        data_device["_present_datasets_only"] = True
         if requested is not None:
             data_device["_requested_properties"] = tuple(requested)
 
         _prepare_inference_gradients(self.model.module.backbone, data_device)
 
         # Model handles any per-prediction checks (e.g., MOLE consistency)
-        if not nitro_checked:
+        if not metadata_checked:
             try:
                 self.model.module.on_predict_check(data_device)
             except MergeMoleConsistencyError as error:
@@ -1415,6 +1484,10 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
             self._fall_back(error)
             self._initialize(data)
             return self._run_inference(data_device, undo_element_references)
+        finally:
+            cache = getattr(self, "_prepared_models", None)
+            if cache is not None:
+                cache.refresh_storage(self._active_mole_key)
 
     @torch.inference_mode(False)
     def _lazy_init(self, data: AtomicData) -> None:
@@ -1639,12 +1712,13 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
             predictions = self._process_outputs(data, output, undo_refs)
 
         if self.inference_settings.series_b.enabled:
+            by_device = defaultdict(dict)
             for name, value in predictions.items():
-                if (
-                    isinstance(value, torch.Tensor)
-                    and value.is_floating_point()
-                    and not torch.isfinite(value).all()
-                ):
+                if isinstance(value, torch.Tensor) and value.is_floating_point():
+                    by_device[value.device][name] = torch.isfinite(value).all()
+            for checks in by_device.values():
+                if not torch.stack(list(checks.values())).all():
+                    name = next(name for name, ok in checks.items() if not ok)
                     raise FloatingPointError(f"Series B produced nonfinite {name}")
 
         if self.inference_settings.nitro and not self._nitro_announced:
@@ -1783,6 +1857,8 @@ class MLIPWorkerLocal:
         master_address: str | None = None,
         gp_config: GraphParallelConfig | None = None,
     ):
+        import ray
+
         self.worker_id = worker_id
         self.world_size = world_size
         self.predictor_config = predictor_config
@@ -1813,6 +1889,8 @@ class MLIPWorkerLocal:
         return str(value)
 
     def get_cuda_placement(self):
+        import ray
+
         return {
             "node_id": ray.get_runtime_context().get_node_id(),
             "device_uuid": self._cuda_device_uuid(),
@@ -1823,6 +1901,8 @@ class MLIPWorkerLocal:
     ):
         # initialize distributed environment
         # TODO, this won't work for multi-node, need to fix master addr
+        import ray
+
         logging.info(f"Initializing worker {self.worker_id}...")
         setup_env_local_multi_gpu(self.worker_id, self.master_port, self.master_address)
 
@@ -1911,16 +1991,28 @@ class MLIPWorkerLocal:
         return move_tensors_to_cpu(out) if self.worker_id == 0 else None
 
 
-class MLIPWorker(MLIPWorkerLocal):
-    pass
+def __getattr__(name):
+    if name == "ray":
+        import ray
+
+        return ray
+    if name == "MLIPWorker":
+        if not ray_installed:
+            raise ImportError("MLIPWorker requires ray[serve]")
+        import ray
+
+        worker = ray.remote(MLIPWorkerLocal)
+        globals()[name] = worker
+        return worker
+    raise AttributeError(name)
 
 
-if ray_installed:
-    MLIPWorker = ray.remote(MLIPWorker)
-else:
-    MLIPWorker = requires(
-        ray_installed, message="Requires `ray[serve]` to be installed"
-    )(MLIPWorker)
+def get_app_handle_with_retry(*args, **kwargs):
+    from fairchem.core.components.serve_utils import (
+        get_app_handle_with_retry as get_handle,
+    )
+
+    return get_handle(*args, **kwargs)
 
 
 class ParallelMLIPPredictUnit(MLIPPredictUnitProtocol):
@@ -1949,6 +2041,8 @@ class ParallelMLIPPredictUnit(MLIPPredictUnitProtocol):
         log_level: int = logging.INFO,
         gp_config: GraphParallelConfig | None = None,
     ):
+        import ray
+
         super().__init__()
 
         device_type = torch.device(device).type
@@ -1991,6 +2085,10 @@ class ParallelMLIPPredictUnit(MLIPPredictUnitProtocol):
             inference_settings = InferenceSettings()
         self.inference_settings = inference_settings
         self._dataset_to_tasks = copy.deepcopy(_mlip_pred_unit.dataset_to_tasks)
+        self.supports_single_atoms = bool(
+            getattr(_mlip_pred_unit.model.module, "supports_single_atoms", True)
+        )
+        self.graph_settings = getattr(_mlip_pred_unit, "graph_settings", {})
         self._validate_atoms_data_fn = self._capture_validator(
             _mlip_pred_unit.model.module
         )
@@ -2066,6 +2164,11 @@ class ParallelMLIPPredictUnit(MLIPPredictUnitProtocol):
     def _start_workers(
         self, num_workers, num_workers_per_node, predict_unit_config, device, gp_config
     ):
+        import ray
+        from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
+        worker_type = sys.modules[__name__].MLIPWorker
+
         num_nodes = math.ceil(num_workers / num_workers_per_node)
         num_workers_on_node_array = [num_workers_per_node] * num_nodes
         if num_workers % num_workers_per_node > 0:
@@ -2087,7 +2190,7 @@ class ParallelMLIPPredictUnit(MLIPPredictUnitProtocol):
         self._placement_groups = placement_groups
 
         # Need to still place worker to occupy space, otherwise ray double books this GPU
-        rank0_worker = MLIPWorker.options(
+        rank0_worker = worker_type.options(
             num_gpus=num_gpu_per_worker,
             scheduling_strategy=PlacementGroupSchedulingStrategy(
                 placement_group=placement_groups[0],
@@ -2138,7 +2241,7 @@ class ParallelMLIPPredictUnit(MLIPPredictUnitProtocol):
                     worker_id += 1
                     continue
                 # Each actor requests 1 worker worth of resources and uses the specific placement group
-                actor = MLIPWorker.options(
+                actor = worker_type.options(
                     num_gpus=num_gpu_per_worker,
                     scheduling_strategy=PlacementGroupSchedulingStrategy(
                         placement_group=pg,
@@ -2227,6 +2330,8 @@ class ParallelMLIPPredictUnit(MLIPPredictUnitProtocol):
         )
 
     def _check_stream_workers(self):
+        import ray
+
         if not self._worker_futures:
             return
         ready, _ = ray.wait(self._worker_futures, num_returns=1, timeout=0)
@@ -2239,6 +2344,8 @@ class ParallelMLIPPredictUnit(MLIPPredictUnitProtocol):
             return self._predict(data)
 
     def _predict(self, data: AtomicData) -> dict[str, torch.tensor]:
+        import ray
+
         if self._closed:
             raise RuntimeError(
                 "Parallel predictor is closed; construct a new predictor"
@@ -2336,6 +2443,8 @@ class ParallelMLIPPredictUnit(MLIPPredictUnitProtocol):
         """
         Stop streaming workers and release this predictor's distributed resources.
         """
+        import ray
+
         with self._prediction_lock:
             if self._resources_released:
                 return
@@ -2480,6 +2589,8 @@ class BatchServerPredictUnit(MLIPPredictUnitProtocol):
     disable the timeout entirely.
     """
 
+    # Ray Serve batches independent single-system requests on the server.
+    requires_single_system = True
     _handle_cache: ClassVar[dict[str, DeploymentHandle]] = {}
 
     @requires(ray_installed, message="Requires `ray[serve]` to be installed")
@@ -2559,6 +2670,8 @@ class BatchServerPredictUnit(MLIPPredictUnitProtocol):
         Returns:
             A ``BatchServerPredictUnit`` connected to the remote deployment.
         """
+        import ray
+
         if ray_address is None:
             ray_address = os.environ.get("RAY_ADDRESS")
         if namespace is None:
@@ -2624,6 +2737,12 @@ class BatchServerPredictUnit(MLIPPredictUnitProtocol):
         self._validated_info = (
             (atoms.info, task_name, snapshot) if snapshot is not None else None
         )
+
+    @cached_property
+    def graph_settings(self):
+        return self.server_handle.get_predict_unit_attribute.remote(
+            "graph_settings", spec=self._model_spec
+        ).result(timeout_s=self._request_timeout_s)
 
     @cached_property
     def dataset_to_tasks(self) -> dict:

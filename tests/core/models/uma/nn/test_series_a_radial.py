@@ -477,3 +477,42 @@ def test_lazy_radial_conv1_matches_materialized_with_second_derivatives(edges):
         hb = torch.autograd.grad(sum(v.square().sum() for v in gb), (x, edge))
         for a, b in zip(ha, hb):
             torch.testing.assert_close(a, b)
+
+
+def test_frozen_compact_so2_and_radial_groups_match_packed_execution():
+    radial = UnifiedRadialMLP([RadialMLP([11, 6, 8, 12]).double() for _ in range(3)])
+    distance = torch.randn(9, 3, dtype=torch.float64, requires_grad=True)
+    table = torch.randn(6, 4, dtype=torch.float64)
+    src = torch.arange(9) % 6
+    args = (distance, src, src.flip(0), table, table)
+    full = radial.forward_decomposed(*args, lazy=True)
+    groups = radial.forward_decomposed(*args, lazy=True, end_layer=2)
+    groups += radial.forward_decomposed(*args, lazy=True, first_layer=2)
+    for packed, grouped in zip(full, groups, strict=True):
+        torch.testing.assert_close(packed.materialize(), grouped.materialize())
+    block = SO2_m_Conv_Block(1, 3, 2, 2, 2).double().requires_grad_(False)
+    x = torch.randn(9, 2, 6, dtype=torch.float64, requires_grad=True)
+    compact = copy.deepcopy(block)
+    compact.compact_weights = True
+    for out, ref in zip(compact(x), block(x), strict=True):
+        torch.testing.assert_close(out, ref)
+        torch.testing.assert_close(
+            torch.autograd.grad(out.square().sum(), x, retain_graph=True)[0],
+            torch.autograd.grad(ref.square().sum(), x, retain_graph=True)[0],
+        )
+    assert compact._w_block is None
+
+
+def test_first_force_norm_silu_matches_native_with_large_common_offset():
+    torch.manual_seed(77)
+    x = (torch.randn(5, 32) * 0.04 + 10000).requires_grad_()
+    w, b = torch.randn(32), torch.randn(32)
+    upstream = torch.randn_like(x)
+    actual = layer_norm_silu(x, w, b, 1e-5)
+    expected = F.silu(F.layer_norm(x, (32,), w, b, 1e-5))
+    torch.testing.assert_close(
+        torch.autograd.grad(actual, x, upstream)[0],
+        torch.autograd.grad(expected, x, upstream)[0],
+        rtol=0,
+        atol=0,
+    )

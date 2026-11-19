@@ -12,6 +12,7 @@ import os
 import subprocess
 import time
 from datetime import timedelta
+from importlib.util import find_spec
 from typing import Any, TypeVar
 
 import torch
@@ -20,15 +21,10 @@ from monty.dev import requires
 from torch.distributed.elastic.utils.distributed import get_free_port
 from torchtnt.utils.distributed import get_file_init_method, get_tcp_init_method
 
-try:
-    import ray
-
-    ray_installed = True
-except ImportError:
-    ray_installed = False
-
 from fairchem.core.common import gp_utils
 from fairchem.core.common.typing import none_throws
+
+ray_installed = find_spec("ray") is not None
 
 T = TypeVar("T")
 DISTRIBUTED_PORT = 13356
@@ -185,6 +181,8 @@ def cleanup() -> None:
 @requires(ray_installed, message="Requires `ray[serve]` to be installed")
 def cleanup_gp_ray():
     """Useful for cleaning up GP with ray"""
+    import ray
+
     if ray.is_initialized():
         ray.shutdown()
     cleanup()

@@ -332,7 +332,10 @@ def test_training_and_predictor_construction_serialize_global_rng_scopes():
     torch.testing.assert_close(torch.get_rng_state(), rng, rtol=0, atol=0)
 
 
-def test_export_preserves_extra_state_versions_and_cpu_ema_under_default_meta(tmp_path):
+@pytest.mark.parametrize("shared", [False, True])
+def test_export_preserves_extra_state_versions_and_cpu_ema_under_default_meta(
+    tmp_path, shared
+):
     model = VersionedStudent()
     values = torch.tensor([[1.0, -2.0, 3.0]])
     expected = model(values).detach()
@@ -342,7 +345,12 @@ def test_export_preserves_extra_state_versions_and_cpu_ema_under_default_meta(tm
     rng = torch.get_rng_state().clone()
     with torch.device("meta"):
         export_distilled_checkpoint(
-            result, path, model_config=config, tasks_config=[], architecture_note="test"
+            result,
+            path,
+            model_config=config,
+            tasks_config=[],
+            architecture_note="test",
+            share_ema_storage=shared,
         )
         assert torch.empty(0).device.type == "meta"
     torch.testing.assert_close(torch.get_rng_state(), rng, rtol=0, atol=0)
@@ -355,6 +363,7 @@ def test_export_preserves_extra_state_versions_and_cpu_ema_under_default_meta(tm
     assert state["cycle"] is state
     assert ema_state["cycle"] is ema_state
     assert state is not ema_state
+    assert (state["scale"].data_ptr() == ema_state["scale"].data_ptr()) is shared
     model.extra["scale"].zero_()
     for use_ema in (False, True):
         loaded, _ = load_inference_model(str(path), use_ema=use_ema, strict=True)
@@ -574,4 +583,37 @@ def test_training_callback_and_predictor_reload_fail_fast_and_recover(tmp_path):
     torch.testing.assert_close(torch.get_rng_state(), rng, rtol=0, atol=0)
     torch.testing.assert_close(
         predictor.predict(data, requested_properties=("energy",))["energy"], expected
+    )
+
+
+class TiedStudent(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.a = torch.nn.Linear(64, 64)
+        self.b = torch.nn.Linear(64, 64)
+        self.b.weight = self.a.weight
+
+
+def test_checkpoint_storage_sharing_preserves_tied_weights_and_reduces_file_size(
+    tmp_path,
+):
+    result = DistillationResult(TiedStudent(), (), {})
+    common = dict(
+        model_config={"_target_": f"{__name__}.TiedStudent"},
+        tasks_config=[],
+        architecture_note="tied",
+    )
+    separate = export_distilled_checkpoint(result, tmp_path / "separate.pt", **common)
+    shared = export_distilled_checkpoint(
+        result, tmp_path / "shared.pt", share_ema_storage=True, **common
+    )
+    assert shared.stat().st_size < separate.stat().st_size
+    checkpoint = torch.load(shared, weights_only=False)
+    assert (
+        checkpoint.model_state_dict["a.weight"].data_ptr()
+        == checkpoint.model_state_dict["b.weight"].data_ptr()
+    )
+    assert (
+        checkpoint.model_state_dict["a.weight"].data_ptr()
+        == checkpoint.ema_state_dict["module.a.weight"].data_ptr()
     )

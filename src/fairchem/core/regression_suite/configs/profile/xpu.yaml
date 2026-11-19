@@ -1,0 +1,3 @@
+label: xpu
+preset: xpu
+predictor_scope: structure

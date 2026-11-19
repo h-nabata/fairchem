@@ -201,6 +201,11 @@ class InferenceSettings:
     # physical cutoff filtering and neighbor limits are evaluated every call.
     neighbor_skin: float = 0.0
     neighbor_cache_entries: int = 1
+    neighbor_cache_max_bytes: int | None = None
+
+    # Trade packed GEMM throughput for a smaller frozen weight/activation set.
+    compact_angular_weights: bool = False
+    radial_layer_group_size: int | None = None
     graph_search_method: str = "cell"
     graph_edge_order: str = "original"
 
@@ -312,6 +317,7 @@ class InferenceSettings:
             "merge_mole",
             "compile",
             "compile_dynamic",
+            "compact_angular_weights",
             "xpu_graph",
             "external_graph_gen",
             "use_quaternion_wigner",
@@ -341,6 +347,8 @@ class InferenceSettings:
         self.mole_cache_size = int(self.mole_cache_size)
         for name in (
             "mole_cache_max_bytes",
+            "neighbor_cache_max_bytes",
+            "radial_layer_group_size",
             "edge_chunk_size",
             "torch_num_threads",
             "max_atoms",
@@ -556,11 +564,16 @@ def describe_inference_settings(settings: InferenceSettings) -> str:
     "default" aliases "nitro" and "xpu-fp64" aliases the portable "fp64" preset,
     so aliases report their canonical mode. Presets
     leave execution_mode to automatic backend selection, which fills it in when
-    the model loads, so the comparison ignores it.
+    the model loads, so the comparison accepts a resolved mode for those presets. Explicit
+    backend choices on presets such as xpu must still match.
     """
     auto_backend = replace(settings, execution_mode=None)
     for name, preset in NAME_TO_INFERENCE_SETTING.items():
-        if name != "default" and auto_backend == replace(preset, execution_mode=None):
+        if name != "default" and (
+            settings == preset
+            if preset.execution_mode is not None
+            else auto_backend == preset
+        ):
             return name
     return repr(settings)
 

@@ -13,8 +13,6 @@ Forward kernels have not been hardware-validated by the CPU test suite.
 
 from __future__ import annotations
 
-import os
-
 import torch
 
 try:
@@ -29,12 +27,15 @@ except ImportError as exc:
 from fairchem.core.models.uma.nn.portable_wigner import (
     consumer_adjoint,
     consumer_reference,
+    csr_chunk_edges,
     producer_adjoint,
     producer_projected_adjoint,
     producer_projected_reference,
     producer_reference,
+    split_csr_rows,
 )
 from fairchem.core.models.uma.nn.unified_radial import RadialProjection
+from fairchem.core.models.uma.nn.xpu_radial_kernels import _fast_math_enabled
 
 
 def _device_key(device):
@@ -60,13 +61,7 @@ def _wide_offsets(*tensors):
 
 def strict_math_available():
     """Respect the effective Intel compiler knob, including its environment fallback."""
-    intel_knobs = getattr(getattr(triton, "knobs", None), "intel", None)
-    if intel_knobs is not None and hasattr(intel_knobs, "fast_math"):
-        return not bool(intel_knobs.fast_math)
-    value = os.environ.get(
-        "TRITON_INTEL_FAST_MATH", os.environ.get("TORCHINDUCTOR_USE_FAST_MATH", "0")
-    )
-    return value.lower() not in {"1", "true", "on", "yes"}
+    return not _fast_math_enabled(triton)
 
 
 def _require_strict_math():
@@ -80,43 +75,10 @@ _CONFIGS = [
 ]
 
 
-@triton.autotune(
-    configs=_CONFIGS, key=["E", "C", "H", "PROJECTED", "WIDE", "DEVICE_KEY"]
-)
 @triton.jit
-def _producer_kernel(
-    X,
-    INDEX,
-    W,
-    RADIAL,
-    WEIGHT,
-    BIAS,
-    M0,
-    M1,
-    M2,
-    E: tl.constexpr,
-    C: tl.constexpr,
-    H: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-    PROJECTED: tl.constexpr,
-    WIDE: tl.constexpr,
-    DEVICE_KEY: tl.constexpr,
-    BLOCK_C: tl.constexpr,
+def _rotate_row(
+    X, W, atom, edge, m, channel, valid, C: tl.constexpr, BLOCK_C: tl.constexpr
 ):
-    edge = tl.program_id(0)
-    m = tl.program_id(1)
-    channel = tl.program_id(2) * BLOCK_C + tl.arange(0, BLOCK_C)
-    side = channel // C
-    valid = channel < 2 * C
-    if WIDE:
-        edge = edge.to(tl.int64)
-        channel = channel.to(tl.int64)
-        side = side.to(tl.int64)
-    atom = tl.load(INDEX + side * E + edge, mask=valid, other=0)
-    if WIDE:
-        atom = atom.to(tl.int64)
-    else:
-        atom = atom.to(tl.int32)
     # M-major coefficient -> L-major coefficient.
     row = tl.where(
         m == 0,
@@ -147,15 +109,60 @@ def _producer_kernel(
     value = tl.full((BLOCK_C,), 0, tl.float32)
     for j in tl.static_range(5):
         weight = tl.load(
-            W + edge * 35 + offset + (row - start) * width + j, mask=j < width, other=0
+            W + edge * 35 + offset + (row - start) * width + j, mask=width > j, other=0
         )
         feature = tl.load(
             X + (atom * 9 + start + j) * C + channel % C,
-            mask=valid & (j < width),
+            mask=valid & (width > j),
             other=0,
         )
         value = value + weight * feature
-    radial_slot = tl.where(m < 3, m, tl.where(m < 7, 3 + (m - 3) % 2, 5))
+    return value
+
+
+@triton.autotune(
+    configs=_CONFIGS, key=["E_BUCKET", "C", "H", "PROJECTED", "WIDE", "DEVICE_KEY"]
+)
+@triton.jit(do_not_specialize=["E"])
+def _producer_kernel(
+    X,
+    INDEX,
+    W,
+    RADIAL,
+    WEIGHT,
+    BIAS,
+    M0,
+    M1,
+    M2,
+    E,
+    E_BUCKET: tl.constexpr,
+    C: tl.constexpr,
+    H: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    PROJECTED: tl.constexpr,
+    WIDE: tl.constexpr,
+    DEVICE_KEY: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    edge = tl.program_id(0)
+    m = tl.program_id(1)
+    channel = tl.program_id(2) * BLOCK_C + tl.arange(0, BLOCK_C)
+    side = channel // C
+    valid = channel < 2 * C
+    if WIDE:
+        edge = edge.to(tl.int64)
+        channel = channel.to(tl.int64)
+        side = side.to(tl.int64)
+    atom = tl.load(INDEX + side * E + edge, mask=valid, other=0)
+    if WIDE:
+        atom = atom.to(tl.int64)
+    else:
+        atom = atom.to(tl.int32)
+    if PROJECTED:
+        radial_slot = m
+        m = tl.where(radial_slot == 5, 7, radial_slot)
+    else:
+        radial_slot = tl.where(m < 3, m, tl.where(m < 7, 3 + (m - 3) % 2, 5))
     radial_row = radial_slot * (2 * C) + channel
     if PROJECTED:
         # The last radial MLP layer is evaluated where its result is consumed.
@@ -174,7 +181,7 @@ def _producer_kernel(
         )
     else:
         scale = tl.load(RADIAL + edge * (12 * C) + radial_row, mask=valid, other=0)
-    value = value * scale
+    value = _rotate_row(X, W, atom, edge, m, channel, valid, C, BLOCK_C) * scale
     tl.store(M0 + edge * (6 * C) + m * (2 * C) + channel, value, mask=valid & (m < 3))
     tl.store(
         M1 + edge * (8 * C) + (m - 3) * (2 * C) + channel,
@@ -185,9 +192,28 @@ def _producer_kernel(
         M2 + edge * (4 * C) + (m - 7) * (2 * C) + channel, value, mask=valid & (m >= 7)
     )
 
+    if PROJECTED:  # noqa: SIM102 - compile away the entire branch for a dense radial input
+        if radial_slot >= 3:
+            paired_m = tl.where(radial_slot == 5, 8, m + 2)
+            paired = (
+                _rotate_row(X, W, atom, edge, paired_m, channel, valid, C, BLOCK_C)
+                * scale
+            )
+            tl.store(
+                M1 + edge * (8 * C) + (paired_m - 3) * (2 * C) + channel,
+                paired,
+                mask=valid & (radial_slot < 5),
+            )
+            tl.store(
+                M2 + edge * (4 * C) + (2 * C) + channel,
+                paired,
+                mask=valid & (radial_slot == 5),
+            )
+
 
 @triton.autotune(
-    configs=_CONFIGS, key=["N", "E", "C", "WIDE", "DEVICE_KEY", "HAS_RESIDUAL"]
+    configs=_CONFIGS,
+    key=["N_BUCKET", "E_BUCKET", "C", "WIDE", "DEVICE_KEY", "HAS_RESIDUAL"],
 )
 @triton.jit
 def _consumer_kernel(
@@ -199,8 +225,8 @@ def _consumer_kernel(
     OFFSETS,
     RESIDUAL,
     OUTPUT,
-    N: tl.constexpr,
-    E: tl.constexpr,
+    N_BUCKET: tl.constexpr,
+    E_BUCKET: tl.constexpr,
     C: tl.constexpr,
     WIDE: tl.constexpr,
     HAS_RESIDUAL: tl.constexpr,
@@ -217,10 +243,7 @@ def _consumer_kernel(
     start = tl.where(row == 0, 0, tl.where(row < 4, 1, 4))
     width = tl.where(row == 0, 1, tl.where(row < 4, 3, 5))
     offset = tl.where(row == 0, 0, tl.where(row < 4, 1, 10))
-    if HAS_RESIDUAL:
-        value = tl.load(RESIDUAL + (atom * 9 + row) * C + channel, mask=mask, other=0)
-    else:
-        value = tl.full((BLOCK_C,), 0, tl.float32)
+    value = tl.full((BLOCK_C,), 0, tl.float32)
     begin = tl.load(OFFSETS + atom)
     end = tl.load(OFFSETS + atom + 1)
     for cursor in range(begin, end):
@@ -232,7 +255,7 @@ def _consumer_kernel(
             coefficient = start + j
             weight = tl.load(
                 W + edge * 35 + offset + (row - start) * width + j,
-                mask=j < width,
+                mask=width > j,
                 other=0,
             )
             is0 = (coefficient == 0) | (coefficient == 2) | (coefficient == 6)
@@ -252,23 +275,55 @@ def _consumer_kernel(
             p2 = tl.where(coefficient == 8, 0, 1)
             feature = tl.load(
                 G0 + edge * (3 * C) + p0 * C + channel,
-                mask=mask & (j < width) & is0,
+                mask=mask & (width > j) & is0,
                 other=0,
             )
             feature += tl.load(
                 G1 + edge * (4 * C) + p1 * C + channel,
-                mask=mask & (j < width) & is1,
+                mask=mask & (width > j) & is1,
                 other=0,
             )
             feature += tl.load(
                 G2 + edge * (2 * C) + p2 * C + channel,
-                mask=mask & (j < width) & is2,
+                mask=mask & (width > j) & is2,
                 other=0,
             )
             rotated += weight * feature
         value += rotated
+    if HAS_RESIDUAL:
+        value += tl.load(RESIDUAL + (atom * 9 + row) * C + channel, mask=mask, other=0)
     # Every output element has one writer; autotune may safely rerun candidates.
     tl.store(OUTPUT + (atom * 9 + row) * C + channel, value, mask=mask)
+
+
+@triton.jit
+def _finish_csr_partials(
+    PARTIALS,
+    OFFSETS,
+    RESIDUAL,
+    OUTPUT,
+    WIDTH: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
+    WIDE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    node = tl.program_id(0)
+    channel = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    if WIDE:
+        node = node.to(tl.int64)
+        channel = channel.to(tl.int64)
+    mask = channel < WIDTH
+    begin = tl.load(OFFSETS + node)
+    end = tl.load(OFFSETS + node + 1)
+    total = tl.full((BLOCK,), 0, tl.float32)
+    for cursor in range(begin, end):
+        row = cursor
+        if WIDE:
+            row = row.to(tl.int64)
+        total += tl.load(PARTIALS + row * WIDTH + channel, mask=mask, other=0)
+    if HAS_RESIDUAL:
+        total += tl.load(RESIDUAL + node * WIDTH + channel, mask=mask, other=0)
+    tl.store(OUTPUT + node * WIDTH + channel, total, mask=mask)
 
 
 class FusedProducer(torch.autograd.Function):
@@ -307,6 +362,7 @@ class FusedProducer(torch.autograd.Function):
                 radial,
                 *outputs,
                 edges,
+                triton.next_power_of_2(edges),
                 channels,
                 1,
                 1,
@@ -332,7 +388,13 @@ class FusedProducer(torch.autograd.Function):
             for g, n in zip((g0, g1, g2), shapes)
         ]
         dx, dw, dr = producer_adjoint(
-            *gradients, x, index, wigner, radial, ctx.channels
+            *gradients,
+            x,
+            index,
+            wigner,
+            radial,
+            ctx.channels,
+            needs=(ctx.needs_input_grad[0], *ctx.needs_input_grad[2:4]),
         )
         return dx, None, dw, dr, None
 
@@ -381,7 +443,7 @@ class FusedProjectedProducer(torch.autograd.Function):
         outputs = [x.new_empty((edges, width * channels)) for width in (6, 8, 4)]
 
         def grid(meta):
-            return (edges, 9, triton.cdiv(2 * channels, meta["BLOCK_C"]))
+            return (edges, 6, triton.cdiv(2 * channels, meta["BLOCK_C"]))
 
         # Triton selects its launch stream from the current device, not
         # from tensor pointers. Preserve explicit xpu:1 on multi-GPU hosts.
@@ -395,6 +457,7 @@ class FusedProjectedProducer(torch.autograd.Function):
                 bias,
                 *outputs,
                 edges,
+                triton.next_power_of_2(edges),
                 channels,
                 hidden.shape[1],
                 triton.next_power_of_2(hidden.shape[1]),
@@ -419,7 +482,15 @@ class FusedProjectedProducer(torch.autograd.Function):
             for g, n in zip((g0, g1, g2), (6, 8, 4))
         ]
         dx, dw, dh, dweight, dbias = producer_projected_adjoint(
-            *gradients, x, index, wigner, hidden, weight, bias, ctx.channels
+            *gradients,
+            x,
+            index,
+            wigner,
+            hidden,
+            weight,
+            bias,
+            ctx.channels,
+            needs=(ctx.needs_input_grad[0], *ctx.needs_input_grad[2:6]),
         )
         return dx, None, dw, dh, dweight, dbias, None
 
@@ -476,11 +547,25 @@ class FusedConsumer(torch.autograd.Function):
             residual = residual.contiguous()
         output = g0.new_empty((num_nodes, 9, channels))
 
-        def grid(meta):
-            return (num_nodes, 9, triton.cdiv(channels, meta["BLOCK_C"]))
+        # The stable CSR permutation still addresses the original edge tensors.
+        # Only the row boundaries change in the first stage.
+        chunk = csr_chunk_edges()
+        plan = (
+            split_csr_rows(offsets, chunk, 9 * channels * g0.element_size())
+            if chunk
+            else None
+        )
+        if plan is None:
+            first_offsets, first_output, first_residual = offsets, output, residual
+        else:
+            first_offsets, node_offsets = plan
+            first_output = g0.new_empty((first_offsets.numel() - 1, 9, channels))
+            first_residual = None
+        first_rows = first_output.shape[0]
 
-        # Triton selects its launch stream from the current device, not
-        # from tensor pointers. Preserve explicit xpu:1 on multi-GPU hosts.
+        def grid(meta):
+            return (first_rows, 9, triton.cdiv(channels, meta["BLOCK_C"]))
+
         with torch.xpu.device(g0.device):
             _consumer_kernel[grid](
                 g0,
@@ -488,17 +573,30 @@ class FusedConsumer(torch.autograd.Function):
                 g2,
                 wigner,
                 order,
-                offsets,
-                output if residual is None else residual,
-                output,
-                num_nodes,
-                target.numel(),
+                first_offsets,
+                first_output if first_residual is None else first_residual,
+                first_output,
+                triton.next_power_of_2(first_rows),
+                triton.next_power_of_2(target.numel()),
                 channels,
-                _wide_offsets(g0, g1, g2, wigner, output),
-                residual is not None,
+                _wide_offsets(g0, g1, g2, wigner, first_output),
+                first_residual is not None,
                 _device_key(g0.device),
                 enable_fp_fusion=False,
             )
+            if plan is not None:
+                width = 9 * channels
+                _finish_csr_partials[(num_nodes, triton.cdiv(width, 128))](
+                    first_output,
+                    node_offsets,
+                    output if residual is None else residual,
+                    output,
+                    width,
+                    residual is not None,
+                    _wide_offsets(first_output, output),
+                    BLOCK=128,
+                    enable_fp_fusion=False,
+                )
         return output
 
     @staticmethod

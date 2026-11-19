@@ -14,8 +14,10 @@ import copy
 import json
 import math
 import os
+import random
 import sys
 import time
+from contextlib import nullcontext
 from dataclasses import replace
 from numbers import Integral
 from pathlib import Path
@@ -48,6 +50,19 @@ def _memory(device):
         "peak_allocated_bytes": backend.max_memory_allocated(device),
         "peak_reserved_bytes": backend.max_memory_reserved(device),
     }
+
+
+def _host_memory():
+    # Linux reports process-local RSS/PSS in KiB. Other hosts leave them unset.
+    try:
+        fields = {}
+        for line in Path("/proc/self/smaps_rollup").read_text().splitlines():
+            name, _, value = line.partition(":")
+            if name in ("Rss", "Pss"):
+                fields[name.lower() + "_bytes"] = int(value.split()[0]) * 1024
+        return fields
+    except (OSError, ValueError):
+        return None
 
 
 def _nitro_runtime():
@@ -122,6 +137,10 @@ def run_md(
     seed=41,
     sample_interval=10,
     require_nitro=False,
+    max_samples=4096,
+    timing_block=1,
+    sample_stream=None,
+    aggregate_only=False,
 ):
     """
     Run a private structure without retaining trajectories or prediction tensors.
@@ -135,10 +154,17 @@ def run_md(
     _validate_configuration(
         steps, warmup, sample_interval, seed, timestep_fs, temperature_K
     )
+    if (
+        type(max_samples) is not int
+        or max_samples < 2
+        or type(timing_block) is not int
+        or timing_block < 1
+    ):
+        raise ValueError("max_samples must be at least two and timing_block positive")
     if not len(atoms):
         raise ValueError("MD benchmark requires at least one atom")
     device, backend = _resolve_device(calculator, device)
-    _effective_settings(calculator, require_nitro)
+    initial_settings = _effective_settings(calculator, require_nitro)
     structure = atoms.copy()
     structure.info = copy.deepcopy(atoms.info)
     structure.calc = calculator
@@ -164,46 +190,98 @@ def run_md(
             or not math.isfinite(total)
         ):
             raise FloatingPointError("Nonfinite or malformed MD state/output")
-        _effective_settings(calculator, require_nitro)
+        if require_nitro and not getattr(
+            getattr(calculator.predictor, "inference_settings", None), "nitro", False
+        ):
+            raise RuntimeError("Nitro was requested but is not active")
         return total
 
     samples, durations = [], []
     runtime_before = _nitro_runtime()
     memory_before = _memory(device)
-    try:
-        synchronize()
-        start = time.perf_counter()
-        energy()
-        synchronize()
-        first_evaluation_seconds = time.perf_counter() - start
-        for _ in range(warmup):
-            dynamics.run(1)
-            energy()
+    host_before = _host_memory()
+    windows = {}
+    timing_rng = random.Random(seed)
+    retain_interval = sample_interval * max(
+        1, math.ceil(math.ceil(steps / sample_interval) / (max_samples - 1))
+    )
+
+    def start_window():
         synchronize()
         if backend is not None:
             backend.reset_peak_memory_stats(device)
-        reference_energy = energy()
-        max_drift = 0.0
-        samples.append(
-            {"step": 0, "energy_eV": reference_energy, "memory": _memory(device)}
-        )
-        for step in range(1, steps + 1):
-            synchronize()
-            start = time.perf_counter()
+        return _memory(device)
+
+    def sample(step, total, stream):
+        entry = {
+            "step": step,
+            "time_ps": step * timestep_fs / 1000,
+            "energy_eV": total,
+            "energy_eV_per_atom": total / len(structure),
+            "memory": _memory(device),
+        }
+        if stream is not None:
+            stream.write(json.dumps(entry, allow_nan=False) + "\n")
+        if not aggregate_only and (step % retain_interval == 0 or step == steps):
+            samples.append(entry)
+
+    try:
+        windows["first"] = {"before": start_window()}
+        start = time.perf_counter()
+        initial_energy = energy()
+        synchronize()
+        first_evaluation_seconds = time.perf_counter() - start
+        windows["first"]["after"] = _memory(device)
+        windows["warmup"] = {"before": start_window()}
+        warmup_drift = 0.0
+        for _ in range(warmup):
             dynamics.run(1)
-            current_energy = energy()
-            synchronize()
-            durations.append((time.perf_counter() - start) * 1000)
-            max_drift = max(max_drift, abs(current_energy - reference_energy))
-            if step % sample_interval == 0 or step == steps:
-                samples.append(
-                    {
-                        "step": step,
-                        "energy_eV": current_energy,
-                        "memory": _memory(device),
-                    }
-                )
-        mean_ms = float(np.mean(durations))
+            warmup_drift = max(warmup_drift, abs(energy() - initial_energy))
+        synchronize()
+        windows["warmup"]["after"] = _memory(device)
+        reference_energy = energy()
+        windows["steady"] = {"before": start_window()}
+        max_drift = total_ms = integrator_seconds = 0.0
+        # Center the trajectory time and subtract its initial energy before
+        # accumulating the least-squares slope, to limit cancellation.
+        covariance = 0.0
+        blocks = 0
+        if sample_stream is not None:
+            Path(sample_stream).parent.mkdir(parents=True, exist_ok=True)
+        with (
+            Path(sample_stream).open("w")
+            if sample_stream is not None
+            else nullcontext(None)
+        ) as stream:
+            sample(0, reference_energy, stream)
+            for first_step in range(1, steps + 1, timing_block):
+                last_step = min(first_step + timing_block - 1, steps)
+                elapsed = 0.0
+                for step in range(first_step, last_step + 1):
+                    start = time.perf_counter()
+                    dynamics.run(1)
+                    integrator_seconds += time.perf_counter() - start
+                    current_energy = energy()
+                    if step == last_step:
+                        synchronize()
+                    elapsed += time.perf_counter() - start
+                    difference = current_energy - reference_energy
+                    max_drift = max(max_drift, abs(difference))
+                    covariance += (step - steps / 2) * difference
+                    if step % sample_interval == 0 or step == steps:
+                        sample(step, current_energy, stream)
+                blocks += 1
+                total_ms += elapsed * 1000
+                per_step_ms = elapsed * 1000 / (last_step - first_step + 1)
+                if len(durations) < max_samples:
+                    durations.append(per_step_ms)
+                else:
+                    slot = timing_rng.randrange(blocks)
+                    if slot < max_samples:
+                        durations[slot] = per_step_ms
+        mean_ms = total_ms / steps
+        windows["steady"]["after"] = _memory(device)
+        time_variance = steps * (steps + 1) * (steps + 2) / 12
         return {
             "status": "completed",
             "device": str(device),
@@ -218,6 +296,24 @@ def run_md(
             "effective_settings": _effective_settings(calculator, require_nitro),
             "first_evaluation_seconds": first_evaluation_seconds,
             "step_mean_ms": mean_ms,
+            "integrator_host_mean_ms": integrator_seconds * 1000 / steps,
+            "timing_block": timing_block,
+            "quantile_scope": "Reservoir sample of synchronized block means; timing includes state checks and excludes trajectory sample serialization",
+            "quantile_sample_size": len(durations),
+            "initial_settings": initial_settings,
+            "allocator_windows": windows,
+            "host_memory_before": host_before,
+            "host_memory_after": _host_memory(),
+            "warmup_max_drift_eV_per_atom": warmup_drift / len(structure),
+            "energy_slope_eV_per_atom_ps": covariance
+            / time_variance
+            * 1000
+            / timestep_fs
+            / len(structure),
+            "elapsed_ps": steps * timestep_fs / 1000,
+            "endpoint_drift_eV_per_atom": (current_energy - reference_energy)
+            / len(structure),
+            "retained_sample_interval": retain_interval,
             "step_median_ms": float(np.median(durations)),
             "step_p95_ms": float(np.percentile(durations, 95)),
             "ns_per_day_at_timestep": 86.4 * timestep_fs / mean_ms,
@@ -251,6 +347,28 @@ def main(argv=None):
     parser.add_argument("--task", default="omat")
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--warmup", type=int, default=20)
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=4096,
+        help="Maximum retained trajectory samples and timing observations",
+    )
+    parser.add_argument(
+        "--timing-block",
+        type=int,
+        default=1,
+        help="MD steps per synchronized timing interval",
+    )
+    parser.add_argument(
+        "--sample-stream",
+        type=Path,
+        help="Stream all sample-interval observations to JSONL",
+    )
+    parser.add_argument(
+        "--aggregate-only",
+        action="store_true",
+        help="Omit trajectory samples from the report; optional JSONL streaming is independent",
+    )
     parser.add_argument("--sample-interval", type=int, default=25)
     parser.add_argument("--timestep-fs", type=float, default=0.1)
     parser.add_argument("--temperature-K", type=float, default=300.0)
@@ -278,6 +396,10 @@ def main(argv=None):
             args.timestep_fs,
             args.temperature_K,
         )
+        if args.max_samples < 2 or args.timing_block < 1:
+            raise ValueError(
+                "max-samples must be at least two and timing-block positive"
+            )
         _backend(torch.device(args.device))
         if args.edge_margin is not None:
             if not math.isfinite(args.edge_margin) or args.edge_margin < 1:
@@ -318,12 +440,23 @@ def main(argv=None):
             if args.input
             else bulk("Si", cubic=True).repeat(args.repeat)
         )
+        load_device = torch.device(args.device)
+        load_backend = _backend(load_device)
+        if load_backend is not None:
+            load_backend.synchronize(load_device)
+            load_backend.reset_peak_memory_stats(load_device)
+        load_start = time.perf_counter()
+        report["load_memory"] = {"before": _memory(load_device)}
         predictor = pretrained_mlip.get_predict_unit(
             args.model,
             device=args.device,
             inference_settings=settings,
             seed=args.seed,
         )
+        if load_backend is not None:
+            load_backend.synchronize(load_device)
+        report["load_seconds"] = time.perf_counter() - load_start
+        report["load_memory"]["after"] = _memory(load_device)
         calculator = FAIRChemCalculator(predictor, task_name=args.task)
         report.update(
             run_md(
@@ -336,6 +469,10 @@ def main(argv=None):
                 temperature_K=args.temperature_K,
                 seed=args.seed,
                 sample_interval=args.sample_interval,
+                max_samples=args.max_samples,
+                timing_block=args.timing_block,
+                sample_stream=args.sample_stream,
+                aggregate_only=args.aggregate_only,
                 require_nitro=args.inference_settings == "nitro",
             )
         )

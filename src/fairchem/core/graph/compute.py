@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     from fairchem.core.graph.neighbor_cache import VerletNeighborCache
 
 
-def edge_cell_offsets(cell, cell_offsets, neighbors):
+def edge_cell_offsets(cell, cell_offsets, neighbors, *, segmented=None):
     """
     Apply each system's cell without materializing one 3x3 matrix per edge.
 
@@ -32,6 +32,26 @@ def edge_cell_offsets(cell, cell_offsets, neighbors):
     coefficients = cell_offsets.to(dtype=cell.dtype, device=cell.device)
     if len(cell) == 1:
         return coefficients @ cell[0]
+    if segmented is None:
+        # Host count access is cheap on CPU. A large contiguous run per
+        # system amortizes Python dispatch. Compiled calls retain tensor ops.
+        segmented = (
+            cell.device.type == "cpu"
+            and neighbors.device.type == "cpu"
+            and not torch.compiler.is_compiling()
+            and len(cell_offsets) >= 128 * len(cell)
+        )
+    if segmented and len(cell):
+        # One matmul per contiguous system. Callers can trade device launches
+        # and a count transfer for avoiding all edge-sized cell-row gathers.
+        return torch.cat(
+            [
+                tile @ system_cell
+                for tile, system_cell in zip(
+                    coefficients.split(neighbors.tolist()), cell, strict=True
+                )
+            ]
+        )
     systems = torch.repeat_interleave(
         torch.arange(len(cell), device=cell.device),
         neighbors.to(cell.device),
@@ -76,9 +96,12 @@ def spatially_order_graph(data, graph):
         spread = (spread | (spread << 4)) & 0x030C30C3
         spread = (spread | (spread << 2)) & 0x09249249
         morton = spread[:, 0] | (spread[:, 1] << 1) | (spread[:, 2] << 2)
-        order = torch.argsort(morton[edges[0]], stable=True)
-        order = order[torch.argsort(morton[edges[1, order]], stable=True)]
-        order = order[torch.argsort(systems[edges[1, order]], stable=True)]
+        # Morton codes use only 30 bits. Packing target and source gives
+        # the same stable lexicographic order in a signed int64.
+        pair_key = (morton[edges[1]] << 30) | morton[edges[0]]
+        order = torch.argsort(pair_key, stable=True)
+        if len(data.natoms) > 1:
+            order = order[torch.argsort(systems[edges[1, order]], stable=True)]
     result = dict(graph)
     result["edge_index"] = edges[:, order]
     for key in (
@@ -156,6 +179,8 @@ def get_pbc_distances(
     neighbors,
     return_offsets: bool = False,
     return_distance_vec: bool = False,
+    *,
+    _owned_topology: bool = False,
 ):
     row, col = edge_index
 
@@ -178,7 +203,8 @@ def get_pbc_distances(
         # accelerator the previous boolean indexing also synchronized to learn
         # the selected count; this replaces that with one scalar reduction.
         # Topology may be caller-owned, so preserve its independent output copy.
-        edge_index = edge_index.clone()
+        if not _owned_topology:
+            edge_index = edge_index.clone()
     else:
         nonzero_idx = torch.nonzero(nonzero_mask).flatten()
         edge_index = edge_index[:, nonzero_idx]
@@ -225,6 +251,8 @@ def generate_graph(
     node_partition: torch.Tensor | None = None,
     neighbor_cache: VerletNeighborCache | None = None,
     graph_search_method: str = "cell",
+    *,
+    geometry_only: bool = False,
 ) -> dict:
     """Generate a graph representation from atomic structure data.
 
@@ -335,20 +363,20 @@ def generate_graph(
         data.cell,
         cell_offsets,
         neighbors,
-        return_offsets=True,
+        return_offsets=not geometry_only,
         return_distance_vec=True,
+        _owned_topology=geometry_only,
     )
 
-    edge_index = out["edge_index"]
-    edge_dist = out["distances"]
-    cell_offset_distances = out["offsets"]
-    distance_vec = out["distance_vec"]
-
-    return {
-        "edge_index": edge_index,
-        "edge_distance": edge_dist,
-        "edge_distance_vec": distance_vec,
-        "cell_offsets": out["cell_offsets"],
-        "offset_distances": cell_offset_distances,
-        "neighbors": out["neighbors"],
+    graph = {
+        "edge_index": out["edge_index"],
+        "edge_distance": out["distances"],
+        "edge_distance_vec": out["distance_vec"],
     }
+    if not geometry_only:
+        graph.update(
+            cell_offsets=out["cell_offsets"],
+            offset_distances=out["offsets"],
+            neighbors=out["neighbors"],
+        )
+    return graph

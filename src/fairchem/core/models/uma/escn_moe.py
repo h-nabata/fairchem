@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import functools
 import logging
-import types
 import warnings
 from typing import TYPE_CHECKING
 
@@ -24,6 +23,7 @@ from fairchem.core.models.uma.escn_md import eSCNMDBackbone, resolve_dataset_map
 from fairchem.core.models.uma.nn.mole import (
     MOLE,
     MOLEGlobals,
+    _pnorm,
 )
 from fairchem.core.models.uma.nn.mole_utils import (
     MOLEInterface,
@@ -63,11 +63,16 @@ def _route_head_outputs(head_output, data, dataset_names, wrap_property):
     for dataset_name in dataset_names:
         selected_systems = [name == dataset_name for name in data.dataset]
         has_systems = any(selected_systems)
+        present_only = getattr(data, "_present_datasets_only", False)
+        if present_only and not has_systems:
+            continue
         system_masks = {}
         atom_masks = {}
         for key, value in head_output.items():
             if not has_systems:
                 output = value.new_zeros(value.shape)
+            elif all(selected_systems):
+                output = value if present_only else value.clone()
             else:
                 device = value.device
                 if device not in system_masks:
@@ -139,6 +144,10 @@ class eSCNMDMoeBackbone(eSCNMDBackbone, MOLEInterface):
                 mole_type=moe_type,
             )
 
+    @property
+    def _mole_batch_size_dependent(self):
+        return getattr(self, "mole_expert_coefficient_norm", None) is _pnorm
+
     def merge_MOLE_model(self, data):
         if self.num_experts == 0:
             return self
@@ -160,47 +169,17 @@ class eSCNMDMoeBackbone(eSCNMDBackbone, MOLEInterface):
         )
 
         # drop moe parameters from merged model
+        for block in self.blocks:
+            block.edge_wise._chunk_mole_states = ()
         self.routing_mlp = None
         self.composition_embedding = None
         self.num_experts = 0
 
-        # create a new non moe model and load weights into there
-        # Match each loaded tensor before copying the state. A blanket cast to
-        # the parameter dtype would also downcast intentional FP64 buffers in
-        # an FP32 model; the process default dtype can instead round FP64
-        # parameters. Neither should change as a side effect of merging.
-        new_model = eSCNMDBackbone(**self.parent_kwargs)
-        # The plain backbone must retain the routing semantics used to merge
-        # it: subsequent inputs are checked by the bound consistency methods.
-        new_model.model_id = self.model_id
-        new_model.use_composition_embedding = self.use_composition_embedding
-        source_tensors = dict(self.named_parameters()) | dict(self.named_buffers())
-        tensor_specs = {
-            id(tensor): (source_tensors[name].device, source_tensors[name].dtype)
-            for name, tensor in (
-                dict(new_model.named_parameters()) | dict(new_model.named_buffers())
-            ).items()
-        }
-
-        def match_tensor(tensor):
-            device, dtype = tensor_specs[id(tensor)]
-            converted = tensor.to(device=device, dtype=dtype)
-            # Modules such as CoefficientMapping are shared by multiple
-            # layers, so _apply may revisit an already converted buffer.
-            tensor_specs[id(converted)] = (device, dtype)
-            return converted
-
-        new_model._apply(match_tensor)
-        state = self.state_dict()
-        new_model.load_state_dict(state)
-        # Derived buffers are not in state_dict. Preserve their values too:
-        # rebuilding at another default dtype can round them before the cast.
-        with torch.no_grad():
-            for name, buffer in new_model.named_buffers():
-                if name not in state:
-                    buffer.copy_(source_tensors[name])
-        new_model.eval()
-        return new_model
+        # All expert linears have already been replaced in this instance.
+        # Keeping the backbone also preserves non-tensor radial constants,
+        # shared buffers and initialization precision without reseeding a model.
+        self.global_mole_tensors = None
+        return self.eval()
 
     def set_MOLE_coefficients(self, atomic_numbers_full, batch_full, csd_mixed_emb):
         if self.num_experts == 0:
@@ -253,7 +232,10 @@ class eSCNMDMoeBackbone(eSCNMDBackbone, MOLEInterface):
     def set_MOLE_sizes(self, nsystems, batch_full, edge_index):
         if self.num_experts == 0:
             return
-        with torch.autocast(device_type=batch_full.device.type, enabled=False):
+        with (
+            torch.inference_mode(False),
+            torch.autocast(device_type=batch_full.device.type, enabled=False),
+        ):
             # Generate edge mix_size routing each edge in this instance (GP or not)
             # using its local edge and batch routing
 
@@ -263,7 +245,7 @@ class eSCNMDMoeBackbone(eSCNMDBackbone, MOLEInterface):
             mole_sizes = torch.zeros(
                 nsystems,  # data.natoms.shape[0],
                 dtype=torch.int,
-                device=batch_full[edge_index[1]].device,
+                device=batch_full.device,
             ).scatter_(0, batch_full[edge_index[1]], 1, reduce="add")
 
             self.global_mole_tensors.mole_sizes = mole_sizes.cpu()
@@ -317,7 +299,7 @@ class eSCNMDMoeBackbone(eSCNMDBackbone, MOLEInterface):
 
         # Per-system compositions: [num_systems, max_num_elements]
         compositions = data.atomic_numbers.new_zeros(
-            num_systems, self.max_num_elements, dtype=torch.float
+            num_systems, self.max_num_elements, dtype=torch.int64
         )
         compositions.index_put_(
             (data.batch, data.atomic_numbers.long()),
@@ -338,9 +320,8 @@ class eSCNMDMoeBackbone(eSCNMDBackbone, MOLEInterface):
                 "when using merge_mole"
             )
 
-        # Normalize to reduced compositions
-        reduced = compositions / compositions.sum(dim=1, keepdim=True)
-        if not reduced.isclose(reduced[0:1].expand_as(reduced), rtol=1e-5).all():
+        sizes = compositions.sum(dim=1, keepdim=True)
+        if not torch.equal(compositions * sizes[:1], compositions[:1] * sizes):
             raise MergeMoleConsistencyError(
                 "All systems in batch must have the same reduced composition "
                 "when using merge_mole"
@@ -350,8 +331,7 @@ class eSCNMDMoeBackbone(eSCNMDBackbone, MOLEInterface):
         charge = data.charge
         if isinstance(charge, torch.Tensor) and not (charge == charge[0]).all():
             raise MergeMoleConsistencyError(
-                f"All systems must have the same charge for merge_mole, "
-                f"got {charge}"
+                f"All systems must have the same charge for merge_mole, got {charge}"
             )
 
         spin = data.spin
@@ -373,8 +353,7 @@ class eSCNMDMoeBackbone(eSCNMDBackbone, MOLEInterface):
             and any(item != dataset[0] for item in dataset[1:])
         ):
             raise MergeMoleConsistencyError(
-                f"All systems must have the same dataset for merge_mole, "
-                f"got {dataset}"
+                f"All systems must have the same dataset for merge_mole, got {dataset}"
             )
 
     def _get_merged_mole_consistency_info(self, data) -> tuple:
@@ -405,7 +384,10 @@ class eSCNMDMoeBackbone(eSCNMDBackbone, MOLEInterface):
             composition,
             charge[0:1] if isinstance(charge, torch.Tensor) else charge,
             spin[0:1] if isinstance(spin, torch.Tensor) else spin,
-            dataset[0:1] if isinstance(dataset, (list, torch.Tensor)) else dataset,
+            dataset[0:1]
+            if isinstance(dataset, (list, tuple, torch.Tensor))
+            else dataset,
+            data.natoms.numel(),
         )
 
     def _assert_merged_mole_consistency(self, current: tuple) -> None:
@@ -423,10 +405,16 @@ class eSCNMDMoeBackbone(eSCNMDBackbone, MOLEInterface):
                 "UMA-S-1.2 absolute composition differs from merged model"
             )
 
-        merged_norm = merged[0].float() / merged[0].sum()
-        curr_norm = current[0].float().to(device) / current[0].sum().to(device)
+        if getattr(self, "_mole_batch_size_dependent", False) and (
+            len(merged) < 5 or merged[4] != current[4]
+        ):
+            raise MergeMoleConsistencyError(
+                "Batch size differs from pnorm merged model"
+            )
 
-        if not merged_norm.isclose(curr_norm, rtol=1e-5).all():
+        old = merged[0].to(dtype=torch.int64)
+        new = current[0].to(device=device, dtype=torch.int64)
+        if not torch.equal(old * new.sum(), new * old.sum()):
             raise MergeMoleConsistencyError("Compositions differ from merged model")
 
         # Charge and spin are tensors that need device alignment
@@ -486,34 +474,22 @@ class eSCNMDMoeBackbone(eSCNMDBackbone, MOLEInterface):
         the initial composition for consistency checking on subsequent calls.
 
         Returns:
-            self or a new merged backbone if MOLE merging was performed. We return
-            because type could have changed due to merging MOLE.
+            The backbone with all enabled inference transforms applied.
         """
+        if (
+            getattr(self, "_merged_composition", None) is not None
+            and self.num_experts == 0
+        ):
+            current = self._get_merged_mole_consistency_info(data)
+            self._assert_merged_mole_consistency(current)
+            return self
         self._inference_settings = settings
         self._merged_composition = None
         self.backend.validate(self.lmax, self.mmax, settings)
 
         if settings.merge_mole:
             self._merged_composition = self._get_merged_mole_consistency_info(data)
-            new_backbone = self.merge_MOLE_model(data)
-            new_backbone._inference_settings = settings
-            new_backbone._merged_composition = self._merged_composition
-            # Bind MOLE consistency methods to the merged plain backbone so that
-            # on_predict_check continues to enforce consistency after merging.
-            new_backbone._assert_all_mole_info_consistent = types.MethodType(
-                eSCNMDMoeBackbone._assert_all_mole_info_consistent, new_backbone
-            )
-            new_backbone._get_merged_mole_consistency_info = types.MethodType(
-                eSCNMDMoeBackbone._get_merged_mole_consistency_info, new_backbone
-            )
-            new_backbone._assert_merged_mole_consistency = types.MethodType(
-                eSCNMDMoeBackbone._assert_merged_mole_consistency, new_backbone
-            )
-            new_backbone.on_predict_check = types.MethodType(
-                eSCNMDMoeBackbone.on_predict_check, new_backbone
-            )
-            self.backend.prepare_model_for_inference(new_backbone)
-            return new_backbone
+            self.merge_MOLE_model(data)
 
         self.backend.prepare_model_for_inference(self)
         return self
@@ -648,6 +624,10 @@ class DatasetSpecificMoEWrapper(nn.Module, HeadInterface):
                 full_output[f"{self.merged_on_dataset}_{key}"] = (
                     {key: head_output[key]} if self.wrap_property else head_output[key]
                 )
+                if not self.non_merged_dataset_names or getattr(
+                    data, "_present_datasets_only", False
+                ):
+                    continue
                 nan_tensor = head_output[key].new_full(
                     head_output[key].shape, float("nan")
                 )
@@ -657,9 +637,10 @@ class DatasetSpecificMoEWrapper(nn.Module, HeadInterface):
                     )
             return full_output
 
-        self.global_mole_tensors.mole_sizes = torch.zeros(
-            data.natoms.shape[0], dtype=torch.int, device=emb["batch"].device
-        ).scatter(0, emb["batch"], 1, reduce="add")  # data.natoms.cpu()
+        with torch.inference_mode(False):
+            self.global_mole_tensors.mole_sizes = torch.zeros(
+                data.natoms.shape[0], dtype=torch.int, device=emb["batch"].device
+            ).scatter_(0, emb["batch"], 1, reduce="add")
         self.global_mole_tensors.natoms = emb["batch"].shape[0]
 
         # generate a one hot mask based on dataset , one for each system
@@ -734,6 +715,10 @@ class DatasetSpecificSingleHeadWrapper(nn.Module, HeadInterface):
                 full_output[f"{self.merged_on_dataset}_{key}"] = (
                     {key: head_output[key]} if self.wrap_property else head_output[key]
                 )
+                if not self.non_merged_dataset_names or getattr(
+                    data, "_present_datasets_only", False
+                ):
+                    continue
                 nan_tensor = head_output[key].new_full(
                     head_output[key].shape, float("nan")
                 )

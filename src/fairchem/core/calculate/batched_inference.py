@@ -7,12 +7,15 @@ LICENSE file in the root directory of this source tree.
 
 from __future__ import annotations
 
+import copy
 import sys
+from collections import OrderedDict
 from collections.abc import Collection, Mapping
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from numbers import Integral
 from threading import Lock
+from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -116,7 +119,9 @@ def plan_microbatches(
         if atoms < 1:
             raise ValueError("Empty structures are not supported by UMA batching")
         edges = (
-            edge_counts[index] if edge_counts is not None else data.edge_index.shape[1]
+            int(edge_counts[index])
+            if edge_counts is not None
+            else data.edge_index.shape[1]
         )
         if limits.max_edges is not None and edge_counts is None and edges == 0:
             raise ValueError(
@@ -129,25 +134,36 @@ def plan_microbatches(
         costs.append((atoms, edges))
 
     bins = []
+    open_bins = {}
     for index in sorted(
         range(len(structures)), key=lambda i: (-costs[i][1], -costs[i][0], i)
     ):
         atoms, edges = costs[index]
-        compatibility = _compatibility_key(structures[index])
-        for entry in bins:
-            if (
-                entry[3] == compatibility
-                and len(entry[0]) < limits.max_systems
-                and entry[1] + atoms <= limits.max_atoms
-                and (limits.max_edges is None or entry[2] + edges <= limits.max_edges)
+        if limits.max_systems == 1:
+            _normalize_requested_properties(
+                structures[index].get("_requested_properties", None)
+            )
+            bins.append([index])
+            continue
+        compatible = open_bins.setdefault(_compatibility_key(structures[index]), {})
+        for bin_index, entry in compatible.items():
+            members, used_atoms, used_edges = entry
+            if used_atoms + atoms <= limits.max_atoms and (
+                limits.max_edges is None or used_edges + edges <= limits.max_edges
             ):
-                entry[0].append(index)
-                entry[1] += atoms
-                entry[2] += edges
+                key = bin_index
                 break
         else:
-            bins.append([[index], atoms, edges, compatibility])
-    return [entry[0] for entry in bins]
+            key = len(bins)
+            members, used_atoms, used_edges = [], 0, 0
+            bins.append(members)
+        members.append(index)
+        used_atoms += atoms
+        if len(members) == limits.max_systems or used_atoms == limits.max_atoms:
+            compatible.pop(key, None)
+        else:
+            compatible[key] = members, used_atoms, used_edges + edges
+    return bins
 
 
 _PROPERTY_LEVELS = {
@@ -161,6 +177,39 @@ _PROPERTY_LEVELS = {
     "hessian": "system",
     "embeddings": "atom",
 }
+
+
+def _requires_single_system(predictor, data, requested):
+    """Resolve forward constraints after a worker has loaded its predictor."""
+    if getattr(predictor, "requires_single_system", False) is True:
+        return True
+    settings = getattr(predictor, "inference_settings", None)
+    if getattr(settings, "nitro", False):
+        return True
+    module = getattr(getattr(predictor, "model", None), "module", None)
+    if (
+        not getattr(
+            module,
+            "supports_single_atoms",
+            getattr(predictor, "supports_single_atoms", True),
+        )
+        and data.num_nodes == 1
+        and not data.pbc.any()
+    ):
+        return True
+    if requested is not None:
+        return "hessian" in requested
+    datasets = data.get("dataset", ())
+    if tasks := getattr(predictor, "dataset_to_tasks", {}):
+        selected = (task for dataset in datasets for task in tasks.get(dataset, ()))
+    else:
+        tasks = getattr(predictor, "tasks", {})
+        selected = tasks.values() if isinstance(tasks, Mapping) else ()
+    return any(
+        getattr(task, "property", None) == "hessian" for task in selected
+    ) or bool(
+        set(datasets).intersection(getattr(settings, "predict_untrained_hessian", ()))
+    )
 
 
 class MicrobatchPredictor:
@@ -218,18 +267,6 @@ class MicrobatchPredictor:
             )
         return _normalize_requested_properties(request)
 
-    def _dense_hessian(self, data):
-        requested = self._requests(data)
-        if requested is not None:
-            return "hessian" in requested
-        tasks = getattr(self.predictor, "tasks", {})
-        if hasattr(tasks, "values") and any(
-            getattr(task, "property", None) == "hessian" for task in tasks.values()
-        ):
-            return True
-        settings = getattr(self.predictor, "inference_settings", None)
-        return bool(getattr(settings, "predict_untrained_hessian", ()))
-
     def __getstate__(self):
         with self._lock:
             return {key: value for key, value in vars(self).items() if key != "_lock"}
@@ -244,7 +281,10 @@ class MicrobatchPredictor:
         ):
             raise ValueError("The predictor does not support requested_properties")
         kwargs = {} if requested is None else {"requested_properties": requested}
-        return self.predictor.predict(batch, **kwargs)
+        predict = getattr(
+            self.predictor, "_predict_owned_batch", self.predictor.predict
+        )
+        return predict(batch, **kwargs)
 
     def _split(self, predictions, structures):
         sizes = [data.pos.shape[0] for data in structures]
@@ -274,36 +314,44 @@ class MicrobatchPredictor:
         # Predictor state and reusable staging slots belong to this runner.
         # Separate calling threads must not run their jobs through it at once.
         with self._lock:
-            return self._predict_many(structures, edge_counts=edge_counts)
+            plan = plan_microbatches(structures, self.limits, edge_counts=edge_counts)
+            return self._predict_plan(structures, plan)
 
-    def _predict_many(self, structures, *, edge_counts=None):
-        plan = plan_microbatches(structures, self.limits, edge_counts=edge_counts)
-        nitro = getattr(
-            getattr(self.predictor, "inference_settings", None), "nitro", False
-        )
-        # Nitro is a single-system engine. Coalescing independent MD frames
-        # would permanently disable it before any useful fused work can run.
-        plan = [
-            group
-            for indices in plan
-            for group in (
-                [[i] for i in indices]
-                if nitro or any(self._dense_hessian(structures[i]) for i in indices)
-                else [indices]
-            )
-        ]
+    def _predict_plan(self, structures, plan, *, owned=False):
+        groups = []
+        for indices in plan:
+            if len(indices) == 1:
+                groups.append(indices)
+                continue
+            regular = []
+            for i in indices:
+                data = structures[i]
+                if _requires_single_system(self.predictor, data, self._requests(data)):
+                    groups.append([i])
+                else:
+                    regular.append(i)
+            if regular:
+                groups.append(regular)
+        plan = groups
         results = [None] * len(structures)
         current = None
         next_lease = None
 
         def assemble(indices):
-            # The singleton and multi-structure paths have the same ownership
-            # boundary, including extra fields and differentiable coordinates.
-            data = [structures[i].clone() for i in indices]
-            for item in data:
-                if "_requested_properties" in item:
-                    del item["_requested_properties"]
-            return data[0] if len(data) == 1 else atomicdata_list_to_batch(data)
+            selected = [structures[i] for i in indices]
+            if len(selected) > 1:
+                return atomicdata_list_to_batch(
+                    selected, exclude_keys=["_requested_properties"]
+                )
+            item = selected[0]
+            if not owned and self.stager is None:
+                item = item.clone()
+            if "_requested_properties" in item:
+                # Staging takes its own snapshot. Keep the caller's field set intact.
+                item = copy.copy(item)
+                item.__keys__ = item.keys().copy()
+                del item["_requested_properties"]
+            return item
 
         try:
             if self.stager is not None and plan:
@@ -393,16 +441,19 @@ class IndependentDevicePool:
             for device in self.devices
         ]
         self._pending = [0] * len(self.devices)
+        self._rates = OrderedDict()
+        self._default_rate = None
         self._lock = Lock()
         self._closed = False
 
-    def _run(self, worker, structures, edge_counts, ready_events):
-        for event in ready_events:
-            # Submission copies may originate from a different device/stream.
-            # Their tensors are held by this queued job until its result is ready.
-            event.synchronize()
+    def _run(self, worker, structures, plan, ready_events, profile, units):
         device = self.devices[worker]
         with device_scope(device):
+            for source, event in ready_events:
+                if device == source:
+                    getattr(torch, source.type).current_stream(source).wait_event(event)
+                else:
+                    event.synchronize()
             recorded = set()
             for data in structures:
                 for _, tensor in _tensors(vars(data)):
@@ -442,9 +493,8 @@ class IndependentDevicePool:
                         except Exception as cleanup_error:
                             error.add_note(f"Staging cleanup failed: {cleanup_error}")
                     raise
-            results = self._workers[worker].predict_many(
-                structures, edge_counts=edge_counts
-            )
+            start = perf_counter()
+            results = self._workers[worker]._predict_plan(structures, plan, owned=True)
             if device.type != "cpu":
                 # Future completion promises usable outputs even when the
                 # caller subsequently selects a different stream. Wait only
@@ -453,6 +503,15 @@ class IndependentDevicePool:
                 completed = backend.Event()
                 completed.record(backend.current_stream(device))
                 completed.synchronize()
+            rate = max(1e-9, perf_counter() - start) / units
+            with self._lock:
+                previous_rate = self._rates.get(profile, rate)
+                self._rates[profile] = 0.75 * previous_rate + 0.25 * rate
+                self._rates.move_to_end(profile)
+                if len(self._rates) > 128:
+                    self._rates.popitem(last=False)
+                if self._default_rate is None:
+                    self._default_rate = rate
             return results
 
     def submit(
@@ -469,7 +528,10 @@ class IndependentDevicePool:
                 raise RuntimeError("The device pool is closed")
         inputs = list(structures)
         counts = list(edge_counts) if edge_counts is not None else None
-        plan_microbatches(inputs, self.limits, edge_counts=counts)
+        plan = plan_microbatches(inputs, self.limits, edge_counts=counts)
+        return self._submit_plan(inputs, counts, plan)
+
+    def _submit_plan(self, inputs, counts, plan):
         inputs = [data.clone() for data in inputs]
         devices = {
             tensor.device
@@ -483,18 +545,46 @@ class IndependentDevicePool:
                 backend = getattr(torch, device.type)
                 ready = backend.Event()
                 ready.record(backend.current_stream(device))
-                ready_events.append(ready)
+                ready_events.append((device, ready))
         with self._lock:
             if self._closed:
                 raise RuntimeError("The device pool is closed")
-            worker = min(range(len(self.devices)), key=self._pending.__getitem__)
-            cost = sum(data.pos.shape[0] for data in inputs) + (
-                sum(counts) if counts is not None else 0
+            worker = min(
+                range(len(self.devices)),
+                key=lambda index: (
+                    self._pending[index],
+                    self.devices[index] not in devices,
+                ),
             )
+            # Learn a wall-time-per-work-unit estimate for each property mix.
+            # Include actual external edges or the caller's conservative graph counts.
+            profile = frozenset(
+                self._requested_properties
+                or _normalize_requested_properties(
+                    data.get("_requested_properties", None)
+                )
+                for data in inputs
+            )
+            units = max(
+                1,
+                sum(
+                    data.num_nodes
+                    + (data.num_edges if counts is None else int(counts[index]))
+                    for index, data in enumerate(inputs)
+                ),
+            )
+            # User estimates are arbitrary Python integers. Bound scheduling
+            # arithmetic independently of admission (which retains exact counts).
+            units = min(units, 2**53)
+            rate = self._rates.get(profile, self._default_rate)
+            relative_rate = (
+                1 if self._default_rate is None else rate / self._default_rate
+            )
+            cost = max(1, round(units * relative_rate))
             self._pending[worker] += cost
             try:
                 future = self._executors[worker].submit(
-                    self._run, worker, inputs, counts, ready_events
+                    self._run, worker, inputs, plan, ready_events, profile, units
                 )
             except Exception:
                 self._pending[worker] -= cost
@@ -516,27 +606,33 @@ class IndependentDevicePool:
         edge_counts: Sequence[int] | None = None,
     ) -> list[dict[str, torch.Tensor]]:
         plan = plan_microbatches(structures, self.limits, edge_counts=edge_counts)
-        jobs = []
+        jobs = {}
         results = [None] * len(structures)
+        batches = iter(plan)
         try:
-            for indices in plan:
-                # Keep submitted futures available if a later submission fails.
-                jobs.append(  # noqa: PERF401
-                    (
-                        indices,
-                        self.submit(
-                            [structures[i] for i in indices],
-                            edge_counts=None
-                            if edge_counts is None
-                            else [edge_counts[i] for i in indices],
-                        ),
+            while True:
+                for indices in batches:
+                    inputs = [structures[i] for i in indices]
+                    counts = (
+                        None
+                        if edge_counts is None
+                        else [edge_counts[i] for i in indices]
                     )
-                )
-            for indices, future in jobs:
-                for index, prediction in zip(indices, future.result()):
-                    results[index] = prediction
-        except Exception:
-            for _, future in jobs:
+                    future = self._submit_plan(
+                        inputs, counts, [list(range(len(inputs)))]
+                    )
+                    jobs[future] = indices
+                    if len(jobs) >= 2 * len(self.devices):
+                        break
+                if not jobs:
+                    break
+                done, _ = wait(jobs, return_when=FIRST_COMPLETED)
+                for future in done:
+                    indices = jobs.pop(future)
+                    for index, prediction in zip(indices, future.result(), strict=True):
+                        results[index] = prediction
+        except BaseException:
+            for future in jobs:
                 future.cancel()
             raise
         return results

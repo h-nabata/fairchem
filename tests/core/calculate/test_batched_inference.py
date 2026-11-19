@@ -12,6 +12,7 @@ from contextlib import nullcontext
 from threading import Event, Lock, RLock
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from ase.build import molecule
@@ -426,3 +427,101 @@ def test_xpu_staging_copy_and_consumer_order():
     stager.close()
     for result, expected in saved:
         torch.testing.assert_close(result.cpu(), expected)
+
+
+@pytest.mark.parametrize("native,expected_sizes", [(False, [1, 1, 2]), (True, [4])])
+@pytest.mark.parametrize("worker_wrapper", [False, True])
+def test_microbatch_routes_only_lookup_single_atoms(
+    native, expected_sizes, worker_wrapper
+):
+    predictor = HarmonicPredictor()
+    if worker_wrapper:
+        predictor.supports_single_atoms = native
+    else:
+        predictor.model = SimpleNamespace(
+            module=SimpleNamespace(supports_single_atoms=native)
+        )
+    single = _structure("H")
+    periodic = single.clone()
+    periodic.pbc[:] = True
+    inputs = [single, _structure("H2"), periodic, single]
+    results = MicrobatchPredictor(predictor).predict_many(inputs)
+    assert sorted(call[0] for call in predictor.calls) == expected_sizes
+    for data, result in zip(inputs, results, strict=True):
+        torch.testing.assert_close(result["forces"], -2 * data.pos)
+
+
+def test_small_integer_staging_uses_disjoint_views_of_one_buffer_and_preserves_aliases():
+    data = _structure()
+    data.meta_pair = [data.atomic_numbers, data.tags]
+    with DeviceBatchStager("cpu", slots=1, pack_small_tensors=True).stage(
+        data
+    ) as staged:
+        x, y = staged.meta_pair
+        assert x is staged.atomic_numbers
+        assert y is staged.tags
+        assert x.untyped_storage().data_ptr() == y.untyped_storage().data_ptr()
+        y.fill_(37)
+        torch.testing.assert_close(x, data.atomic_numbers)
+        assert (data.tags != 37).all()
+
+
+def test_stager_prefers_completed_slot_before_waiting_for_another():
+    stager = DeviceBatchStager("cpu")
+    calls = []
+    first, second = stager._slots
+    first.consumed = SimpleNamespace(
+        query=lambda: False, synchronize=lambda: calls.append("wait")
+    )
+    second.ready = SimpleNamespace(query=lambda: True)
+    assert stager._slot() is second
+    assert calls == []
+    second.leased = True
+    assert stager._slot() is first
+    assert calls == ["wait"]
+
+
+def test_bulk_pool_plans_once_and_limits_pending_snapshots(monkeypatch):
+    planner, wait = batched_inference.plan_microbatches, batched_inference.wait
+    plans, pending = [], []
+
+    def count_plan(*args, **kwargs):
+        plans.append(len(args[0]))
+        return planner(*args, **kwargs)
+
+    def count_pending(jobs, **kwargs):
+        pending.append(len(jobs))
+        return wait(jobs, **kwargs)
+
+    monkeypatch.setattr(batched_inference, "plan_microbatches", count_plan)
+    monkeypatch.setattr(batched_inference, "wait", count_pending)
+    structs = [_structure(offset=i) for i in range(9)]
+    with IndependentDevicePool(
+        HarmonicPredictor, ["cpu"], limits=InferenceBatchLimits(max_systems=1)
+    ) as pool:
+        results = pool.predict_many(structs)
+    assert plans == [9]
+    assert max(pending) == 2
+    for result, data in zip(results, structs, strict=True):
+        torch.testing.assert_close(result["forces"], -2 * data.pos)
+
+
+def test_staging_host_and_device_reuse_wait_on_different_events(monkeypatch):
+    stager = DeviceBatchStager("cpu", slots=1)
+    events = []
+    slot = stager._slots[0]
+    slot.consumed = SimpleNamespace(query=lambda: False)
+    slot.ready = SimpleNamespace(
+        query=lambda: False, synchronize=lambda: events.append("transfer")
+    )
+    stager._copy_stream = SimpleNamespace(wait_event=lambda event: events.append(event))
+    monkeypatch.setattr(device_buffers, "device_scope", lambda device: nullcontext())
+    assert stager._slot() is slot
+    assert events == ["transfer", slot.consumed]
+
+
+def test_numpy_edge_estimates_cannot_overflow_batch_limit():
+    structures = [_structure(), _structure()]
+    costs = np.array([2**62, 2**62], dtype=np.int64)
+    limits = InferenceBatchLimits(max_edges=2**63 - 1)
+    assert plan_microbatches(structures, limits, edge_counts=costs) == [[0], [1]]

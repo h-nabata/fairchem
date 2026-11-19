@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import fnmatch
 import math
+from contextvars import ContextVar
 from numbers import Real
 
 import torch
@@ -31,8 +32,15 @@ from torch.nn import functional as F
 GEMM_PRECISIONS = frozenset({"fp32", "bf16", "fp16", "bf16_split2", "bf16_split3"})
 
 
+_FORWARD_CHECKS = ContextVar("fairchem_approximate_linear_finite_checks", default=None)
+
+
 def _require_finite(tensor: torch.Tensor, name: str) -> None:
-    if not bool(torch.isfinite(tensor).all()):
+    finite = torch.isfinite(tensor).all()
+    checks = _FORWARD_CHECKS.get()
+    if checks is not None:
+        checks.append((name, finite))
+    elif not bool(finite):
         raise FloatingPointError(f"ApproximateLinear: non-finite {name}")
 
 
@@ -412,12 +420,15 @@ class ApproximateLinear(nn.Module):
         weight_bits: int | None,
         low_rank: int | None,
         low_precision_emulation: bool,
+        packed_tile_rows: int | None = None,
+        low_rank_solver: str = "exact",
     ) -> None:
         super().__init__()
         self.in_features = source.in_features
         self.out_features = source.out_features
         self.gemm_precision = gemm_precision
         self.low_precision_emulation = low_precision_emulation
+        self.packed_tile_rows = packed_tile_rows
         self.low_rank = low_rank
         self.retained_singular_energy = None
         weight = source.weight.detach()
@@ -425,8 +436,30 @@ class ApproximateLinear(nn.Module):
             factors = [weight]
         else:
             # Offline preparation only. FP64 SVD is on CPU even for GPU callers.
-            u, s, vh = torch.linalg.svd(weight.cpu().double(), full_matrices=False)
-            total = s.square().sum()
+            matrix = weight.to(device="cpu", dtype=torch.float64)
+            if low_rank_solver == "randomized":
+                # A private generator makes preparation reproducible without
+                # changing the user's RNG state on any device.
+                width = min(low_rank + 8, *matrix.shape)
+                omega = torch.randn(
+                    matrix.shape[1],
+                    width,
+                    generator=torch.Generator(device="cpu").manual_seed(0),
+                    dtype=matrix.dtype,
+                    device="cpu",
+                )
+                basis = torch.linalg.qr(matrix @ omega, mode="reduced").Q
+                for _ in range(2):
+                    dual = torch.linalg.qr(matrix.T @ basis, mode="reduced").Q
+                    basis = torch.linalg.qr(matrix @ dual, mode="reduced").Q
+                u_small, s, vh = torch.linalg.svd(basis.T @ matrix, full_matrices=False)
+                u = basis @ u_small
+                total = torch.linalg.vector_norm(matrix).square()
+                del basis, dual, omega, u_small
+            else:
+                u, s, vh = torch.linalg.svd(matrix, full_matrices=False)
+                total = s.square().sum()
+            del matrix
             self.retained_singular_energy = (
                 float(s[:low_rank].square().sum() / total) if total > 0 else 1.0
             )
@@ -436,6 +469,7 @@ class ApproximateLinear(nn.Module):
                     device=weight.device, dtype=torch.float32
                 ),
             ]
+            del u, s, vh
         self.factors = nn.ModuleList(
             [_StoredWeight(factor, weight_bits) for factor in factors]
         )
@@ -495,8 +529,20 @@ class ApproximateLinear(nn.Module):
         super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        with torch.autocast(device_type=x.device.type, enabled=False):
-            return self._forward_fp32(x)
+        checks = []
+        token = _FORWARD_CHECKS.set(checks)
+        try:
+            with torch.autocast(device_type=x.device.type, enabled=False):
+                output = self._forward_fp32(x)
+            flags = torch.stack([flag for _, flag in checks])
+            if not bool(flags.all()):
+                name = next(
+                    name for (name, _), ok in zip(checks, flags.tolist()) if not ok
+                )
+                raise FloatingPointError(f"ApproximateLinear: non-finite {name}")
+            return output
+        finally:
+            _FORWARD_CHECKS.reset(token)
 
     def _forward_fp32(self, x: torch.Tensor) -> torch.Tensor:
         if self.training:
@@ -516,16 +562,34 @@ class ApproximateLinear(nn.Module):
                     raise ValueError(
                         "ApproximateLinear input and weights must share a device"
                     )
-                value = _PackedGEMM.apply(
-                    value,
-                    factor.packed,
-                    factor.scale,
-                    factor.rows,
-                    factor.columns,
-                    factor.bits,
-                    self.gemm_precision,
-                    self.low_precision_emulation,
-                )
+                tile_rows = getattr(self, "packed_tile_rows", None) or factor.rows
+                # Avoid splitting a byte between INT4 tiles with odd row widths.
+                if factor.bits == 4 and factor.columns % 2 and tile_rows % 2:
+                    tile_rows += 1
+                outputs = []
+                for start in range(0, factor.rows, tile_rows):
+                    end = min(start + tile_rows, factor.rows)
+                    packed = (
+                        factor.packed[
+                            start * factor.columns // 2 : (end * factor.columns + 1)
+                            // 2
+                        ]
+                        if factor.bits == 4
+                        else factor.packed[start:end]
+                    )
+                    outputs.append(
+                        _PackedGEMM.apply(
+                            value,
+                            packed,
+                            factor.scale[start:end],
+                            end - start,
+                            factor.columns,
+                            factor.bits,
+                            self.gemm_precision,
+                            self.low_precision_emulation,
+                        )
+                    )
+                value = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=1)
                 _require_finite(value, "GEMM output")
                 continue
             weight = factor.dense()
@@ -549,7 +613,7 @@ class ApproximateLinear(nn.Module):
                 raise TypeError("ApproximateLinear bias storage must remain FP32")
             _require_finite(self.bias, "bias")
             value = value + self.bias
-        _require_finite(value, "output")
+            _require_finite(value, "output")
         return value.reshape(*leading, self.out_features)
 
 
@@ -562,6 +626,9 @@ def apply_linear_approximations(
     low_rank_fraction: float | None = None,
     low_precision_emulation: bool = False,
     exclude_patterns: tuple[str, ...] = (),
+    quantize_only_if_smaller: bool = False,
+    packed_tile_rows: int | None = None,
+    low_rank_solver: str = "exact",
 ) -> dict:
     """
     Replace ordinary frozen FP32 ``nn.Linear`` children; return a manifest.
@@ -583,6 +650,22 @@ def apply_linear_approximations(
         or weight_bits not in (4, 8)
     ):
         raise ValueError("weight_bits must be None, 4, or 8")
+    if low_rank_solver not in ("exact", "randomized") or (
+        low_rank_solver != "exact" and low_rank_fraction is None
+    ):
+        raise ValueError(
+            "low_rank_solver must be exact, or randomized with low_rank_fraction"
+        )
+    if not isinstance(quantize_only_if_smaller, bool):
+        raise ValueError("quantize_only_if_smaller must be a boolean")
+    if packed_tile_rows is not None and (
+        type(packed_tile_rows) is not int or packed_tile_rows <= 0
+    ):
+        raise ValueError("packed_tile_rows must be a positive integer")
+    if (
+        quantize_only_if_smaller or packed_tile_rows is not None
+    ) and weight_bits is None:
+        raise ValueError("A packed weight option requires weight_bits")
     if low_rank_fraction is not None and (
         isinstance(low_rank_fraction, bool)
         or not isinstance(low_rank_fraction, Real)
@@ -610,6 +693,9 @@ def apply_linear_approximations(
         "effective": False,
         "gemm_precision": gemm_precision,
         "weight_bits": weight_bits,
+        "quantize_only_if_smaller": quantize_only_if_smaller,
+        "packed_tile_rows": packed_tile_rows,
+        "low_rank_solver": low_rank_solver,
         "low_rank_fraction": (
             None if low_rank_fraction is None else float(low_rank_fraction)
         ),
@@ -692,6 +778,14 @@ def apply_linear_approximations(
                 rank = None
                 if gemm_precision == "fp32":
                     reason = "requested rank does not reduce weight or GEMM size"
+        effective_bits = weight_bits
+        if quantize_only_if_smaller and reason is None:
+            elements = source.weight.numel()
+            stored = (elements * weight_bits + 7) // 8 + source.out_features * 4
+            if stored >= elements * source.weight.element_size():
+                effective_bits = None
+                if gemm_precision == "fp32":
+                    reason = "packed weights and scales do not reduce storage"
         if reason is not None:
             manifest["skipped"].append({"names": paths, "reason": reason})
             continue
@@ -706,7 +800,9 @@ def apply_linear_approximations(
         replacement = ApproximateLinear(
             source,
             gemm_precision=gemm_precision,
-            weight_bits=weight_bits,
+            weight_bits=effective_bits,
+            packed_tile_rows=packed_tile_rows,
+            low_rank_solver=low_rank_solver,
             low_rank=rank,
             low_precision_emulation=low_precision_emulation,
         )
@@ -720,7 +816,13 @@ def apply_linear_approximations(
                 "names": paths,
                 "shape": [source.out_features, source.in_features],
                 "rank": rank,
+                "weight_bits": effective_bits,
                 "retained_singular_energy": replacement.retained_singular_energy,
+                "relative_frobenius_residual": (
+                    None
+                    if rank is None
+                    else math.sqrt(max(0.0, 1.0 - replacement.retained_singular_energy))
+                ),
                 "original_weight_bytes": original_bytes,
                 "stored_weight_bytes": stored_bytes,
             }

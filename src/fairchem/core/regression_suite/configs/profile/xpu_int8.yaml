@@ -1,0 +1,5 @@
+label: xpu-int8
+preset: xpu
+predictor_scope: structure
+inference_settings:
+  series_b: {weight_bits: 8, quantize_only_if_smaller: true}

@@ -137,6 +137,7 @@ class SO2_m_Conv_Block(torch.nn.Module):
         )
         self.fc.weight.data.mul_(1 / math.sqrt(2))
 
+        self.compact_weights = False
         self.register_buffer("_w_block", None, persistent=False)
         self._w_block_key = None
         self._w_block_owner = ()
@@ -164,6 +165,9 @@ class SO2_m_Conv_Block(torch.nn.Module):
             (torch.cat((W1, -W2), dim=1), torch.cat((W2, W1), dim=1)), dim=0
         ).contiguous()
 
+    _derived_inference_buffers = frozenset({"_w_block"})
+
+    @torch.inference_mode(False)
     @torch.no_grad()
     def _build_w_block(self) -> None:
         """
@@ -197,6 +201,16 @@ class SO2_m_Conv_Block(torch.nn.Module):
         _wait_cache_event(self._w_block_event, self._w_block)
         return self._w_block
 
+    def packed_linear(self, x):
+        if not getattr(self, "compact_weights", False):
+            return x @ self.block_weight().T
+        # Apply the original real and imaginary weights to both halves,
+        # without expanding [W1, -W2; W2, W1] in device memory.
+        real, imag = self.fc(x.reshape(x.shape[0], 2, self.in_size)).unbind(1)
+        rr, ri = real.chunk(2, dim=-1)
+        ir, ii = imag.chunk(2, dim=-1)
+        return torch.cat((rr - ii, ri + ir), dim=-1)
+
     def forward(self, x_m: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass using block matrix GEMM.
@@ -208,7 +222,7 @@ class SO2_m_Conv_Block(torch.nn.Module):
             (out_real, out_imag): each [E, num_l, m_output_channels]
         """
         x_cat = x_m.flatten(1)
-        out_cat = x_cat @ self.block_weight().T
+        out_cat = self.packed_linear(x_cat)
 
         return out_cat.view(-1, 2, self.num_l, self.m_output_channels).unbind(1)
 
@@ -274,12 +288,22 @@ class SO2_Conv1_WithRadialBlock(torch.nn.Module):
         edge_channels_list.append(int(num_channels_rad))
         self.rad_func = RadialMLP(edge_channels_list)
 
-        self.m_split_sizes = [mappingReduced.m_size[0]] + (
-            torch.tensor(mappingReduced.m_size[1:]) * 2
-        ).tolist()
+        self.m_split_sizes = [mappingReduced.m_size[0]] + [
+            2 * size for size in mappingReduced.m_size[1:]
+        ]
         self.edge_split_sizes = [self.fc_m0.in_features] + [
             mod.fc.in_features for mod in self.so2_m_conv
         ]
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        if self.rad_func is None:
+            # Older prepared state_dicts included the unused per-block radial
+            # copy in addition to the packed buffers used by forward.
+            source_prefix = prefix + "rad_func."
+            for name in tuple(state_dict):
+                if name.startswith(source_prefix):
+                    del state_dict[name]
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def forward(
         self,
@@ -358,8 +382,8 @@ class SO2_Conv1_WithRadialBlock(torch.nn.Module):
         conv_m1, conv_m2 = self.so2_m_conv
         return (
             self.fc_m0(m0_buf),
-            m1_buf @ conv_m1.block_weight().T,
-            m2_buf @ conv_m2.block_weight().T,
+            conv_m1.packed_linear(m1_buf),
+            conv_m2.packed_linear(m2_buf),
         )
 
     def gemm_blocks_from_packed(
@@ -441,9 +465,9 @@ class SO2_Conv2_InternalBlock(torch.nn.Module):
                 )
             )
 
-        self.m_split_sizes = [mappingReduced.m_size[0]] + (
-            torch.tensor(mappingReduced.m_size[1:]) * 2
-        ).tolist()
+        self.m_split_sizes = [mappingReduced.m_size[0]] + [
+            2 * size for size in mappingReduced.m_size[1:]
+        ]
 
     def forward(
         self,
@@ -500,11 +524,11 @@ class SO2_Conv2_InternalBlock(torch.nn.Module):
 
         # m=1: block GEMM
         conv_m1 = self.so2_m_conv[0]
-        g1 = input_blocks[1] @ conv_m1.block_weight().T  # [E, 4C]
+        g1 = conv_m1.packed_linear(input_blocks[1])  # [E, 4C]
 
         # m=2: block GEMM
         conv_m2 = self.so2_m_conv[1]
-        g2 = input_blocks[2] @ conv_m2.block_weight().T  # [E, 2C]
+        g2 = conv_m2.packed_linear(input_blocks[2])  # [E, 2C]
 
         return g0, g1, g2
 
@@ -520,6 +544,8 @@ class SO2_Conv2_InternalBlock(torch.nn.Module):
 
 def convert_so2_conv1(
     old: SO2_Convolution,
+    *,
+    for_inference: bool = False,
 ) -> SO2_Conv1_WithRadialBlock:
     """
     Convert an SO2_Convolution (conv1) to SO2_Conv1_WithRadialBlock.
@@ -540,35 +566,34 @@ def convert_so2_conv1(
         "(internal_weights=False). Got an SO2_Convolution without rad_func, "
         "which means it was created with internal_weights=True."
     )
-    new = SO2_Conv1_WithRadialBlock(
-        sphere_channels=old.sphere_channels,
-        m_output_channels=old.m_output_channels,
-        lmax=old.lmax,
-        mmax=old.mmax,
-        mappingReduced=copy.deepcopy(old.mappingReduced),
-        extra_m0_output_channels=old.extra_m0_output_channels,
-        edge_channels_list=old.edge_channels_list,
-    )
-    # assign=True preserves each loaded tensor's dtype/device, including FP64
-    # weights and mixed-dtype buffers. Clone so conversion never aliases old.
-    new.load_state_dict(
-        {name: value.detach().clone() for name, value in old.state_dict().items()},
-        assign=True,
-    )
-    if getattr(old, "rad_func", None) is not None:
-        # State dictionaries do not carry LayerNorm eps or activation options.
-        new.rad_func = copy.deepcopy(old.rad_func)
-    source_parameters = dict(old.named_parameters())
-    for name, parameter in new.named_parameters():
-        parameter.requires_grad_(source_parameters[name].requires_grad)
+    # The constructor only describes the target shapes. All live tensors
+    # come from the initialized source, preserving RNG and mixed precision.
+    with torch.device("meta"):
+        new = SO2_Conv1_WithRadialBlock(
+            sphere_channels=old.sphere_channels,
+            m_output_channels=old.m_output_channels,
+            lmax=old.lmax,
+            mmax=old.mmax,
+            mappingReduced=old.mappingReduced
+            if for_inference
+            else copy.deepcopy(old.mappingReduced),
+            extra_m0_output_channels=old.extra_m0_output_channels,
+            edge_channels_list=old.edge_channels_list,
+        )
+    new.fc_m0 = old.fc_m0 if for_inference else copy.deepcopy(old.fc_m0)
+    for target, source in zip(new.so2_m_conv, old.so2_m_conv, strict=True):
+        target.fc = source.fc if for_inference else copy.deepcopy(source.fc)
+        if not for_inference:
+            target._build_w_block()
+    new.rad_func = old.rad_func if for_inference else copy.deepcopy(old.rad_func)
     new.train(old.training)
-    for m_conv in new.so2_m_conv:
-        m_conv._build_w_block()
     return new
 
 
 def convert_so2_conv2(
     old: SO2_Convolution,
+    *,
+    for_inference: bool = False,
 ) -> SO2_Conv2_InternalBlock:
     """
     Convert an SO2_Convolution (conv2) to SO2_Conv2_InternalBlock.
@@ -584,28 +609,24 @@ def convert_so2_conv2(
     Returns:
         SO2_Conv2_InternalBlock with identical weights.
     """
-    new = SO2_Conv2_InternalBlock(
-        sphere_channels=old.sphere_channels,
-        m_output_channels=old.m_output_channels,
-        lmax=old.lmax,
-        mmax=old.mmax,
-        mappingReduced=copy.deepcopy(old.mappingReduced),
-    )
-    # assign=True preserves each loaded tensor's dtype/device, including FP64
-    # weights and mixed-dtype buffers. Clone so conversion never aliases old.
-    new.load_state_dict(
-        {name: value.detach().clone() for name, value in old.state_dict().items()},
-        assign=True,
-    )
-    if getattr(old, "rad_func", None) is not None:
-        # State dictionaries do not carry LayerNorm eps or activation options.
-        new.rad_func = copy.deepcopy(old.rad_func)
-    source_parameters = dict(old.named_parameters())
-    for name, parameter in new.named_parameters():
-        parameter.requires_grad_(source_parameters[name].requires_grad)
+    # The constructor only describes the target shapes. All live tensors
+    # come from the initialized source, preserving RNG and mixed precision.
+    with torch.device("meta"):
+        new = SO2_Conv2_InternalBlock(
+            sphere_channels=old.sphere_channels,
+            m_output_channels=old.m_output_channels,
+            lmax=old.lmax,
+            mmax=old.mmax,
+            mappingReduced=old.mappingReduced
+            if for_inference
+            else copy.deepcopy(old.mappingReduced),
+        )
+    new.fc_m0 = old.fc_m0 if for_inference else copy.deepcopy(old.fc_m0)
+    for target, source in zip(new.so2_m_conv, old.so2_m_conv, strict=True):
+        target.fc = source.fc if for_inference else copy.deepcopy(source.fc)
+        if not for_inference:
+            target._build_w_block()
     new.train(old.training)
-    for m_conv in new.so2_m_conv:
-        m_conv._build_w_block()
     return new
 
 

@@ -66,16 +66,24 @@ class RESPAOptions:
     For example, use ``0.2 * ase.units.fs`` for a 0.2 fs inner step. A larger
     outer step can introduce resonance and energy drift; validate against a
     teacher-only small-step trajectory for the intended material and temperature.
+    history_stride controls energy retention. Zero keeps just initial and final
+    energy. Maximum drift is evaluated at every outer step for all strides.
     """
 
     inner_timestep: float
     inner_steps: int = 2
+    history_stride: int = 1
 
     def __post_init__(self):
         object.__setattr__(
             self, "inner_timestep", _positive(self.inner_timestep, "inner_timestep")
         )
         object.__setattr__(self, "inner_steps", _count(self.inner_steps, "inner_steps"))
+        object.__setattr__(
+            self,
+            "history_stride",
+            _count(self.history_stride, "history_stride", zero=True),
+        )
         _positive(self.inner_timestep * self.inner_steps, "outer_timestep")
 
 
@@ -338,11 +346,13 @@ def run_respa(
     teacher_force = _forces(teacher)
     reference_energy = _energy(teacher)
     student_force = _forces(student)
-    energies = [reference_energy + float((momentum**2 / (2 * masses)).sum())]
-    _checked_real_array(energies, "total energy")
+    initial_energy = reference_energy + float((momentum**2 / (2 * masses)).sum())
+    _checked_real_array(initial_energy, "total energy")
+    energies = [initial_energy]
+    max_energy_drift = 0.0
     inner_dt = options.inner_timestep
     outer_dt = inner_dt * options.inner_steps
-    for _ in range(outer_steps):
+    for step in range(1, outer_steps + 1):
         momentum += 0.5 * outer_dt * (teacher_force - student_force)
         for _ in range(options.inner_steps):
             momentum += 0.5 * inner_dt * student_force
@@ -363,7 +373,11 @@ def run_respa(
         momentum = _finite(momentum, "momenta")
         total = reference_energy + float((momentum**2 / (2 * masses)).sum())
         _checked_real_array(total, "total energy")
-        energies.append(total)
+        max_energy_drift = max(max_energy_drift, abs(total - initial_energy))
+        if step == outer_steps or (
+            options.history_stride and step % options.history_stride == 0
+        ):
+            energies.append(total)
     working.set_momenta(momentum)
     # The result owns only copied numerical values, never the private models.
     # Drop bound-callable cycles before another job allocates its calculators.
@@ -379,7 +393,7 @@ def run_respa(
         reference_energy=reference_energy,
         reference_forces=teacher_force.copy(),
         total_energies=tuple(energies),
-        max_energy_drift=float(np.max(np.abs(np.asarray(energies) - energies[0]))),
+        max_energy_drift=max_energy_drift,
         teacher_force_evaluations=outer_steps + 1,
         student_force_evaluations=outer_steps * options.inner_steps + 1,
     )
@@ -399,6 +413,8 @@ def run_coarse_refine(
     Constraints on ASE Atoms are preserved; cell-filter and stress optimization
     are outside this helper. The final force array is unprojected, while the
     reported convergence residual includes ASE constraints, like the optimizer.
+    Pass optimizer_cls=ase.optimize.LBFGS for a limited-memory inverse Hessian
+    approximation in both stages. The default is ASE BFGS.
     A zero reference step budget performs a reference recheck without refinement.
     The result never asserts that the final basin matches reference-only search.
     """
@@ -452,8 +468,11 @@ def run_dyneb(
 ) -> DyNEBResult:
     """Run serial scaled DyNEB on owned images and recheck unmasked NEB forces.
 
-    Each image receives a fresh calculator. If provided, the reference factory
-    replaces all calculators after dynamic optimization, before either final
+    Each image receives a fresh calculator. On serial runs with one model,
+    construct the predictor once and return a fresh FAIRChemCalculator around it
+    from each factory call. Each image then has its own ASE result cache.
+    When supplied, the reference factory replaces all calculators after dynamic
+    optimization, before either final
     refinement or rechecking. Otherwise the same private calculators are reused.
     Reference calculators should be configured for the user's strict accuracy.
     No calculator precision or inference setting is changed by this function.

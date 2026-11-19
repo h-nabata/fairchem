@@ -1,0 +1,5 @@
+label: xpu-radial-table
+preset: xpu
+predictor_scope: structure
+inference_settings:
+  series_b: {radial_table_points: 1024}

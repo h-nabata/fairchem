@@ -278,3 +278,23 @@ def test_real_uma_student_force_training_step():
         not torch.equal(before, after)
         for before, after in zip(student.parameters(), result.model.parameters())
     )
+
+
+def test_sharded_training_keeps_file_samples_independent_and_matches_resident(tmp_path):
+    teacher = Teacher(HarmonicStudent(2))
+    structures = [_data(i + 1) for i in range(5)]
+    dataset = collect_teacher_labels(
+        teacher,
+        structures,
+        teacher_id="harmonic",
+        shard_directory=tmp_path,
+        shard_size=2,
+    )
+    resident = collect_teacher_labels(teacher, structures, teacher_id="harmonic")
+    assert len(list(tmp_path.glob("*/*.pt"))) == 3
+    dataset.samples[-1].targets["energy"].zero_()
+    assert dataset.samples[-1].targets["energy"].item() > 0
+    assert (
+        distill_student(HarmonicStudent(), dataset, steps=6).loss_history
+        == distill_student(HarmonicStudent(), resident, steps=6).loss_history
+    )

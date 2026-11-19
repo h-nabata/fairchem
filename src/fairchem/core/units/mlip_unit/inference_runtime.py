@@ -9,13 +9,34 @@ from __future__ import annotations
 
 import logging
 import threading
+import weakref
 from collections import OrderedDict
+from contextvars import ContextVar
 from dataclasses import dataclass
 from numbers import Integral
 from types import MethodType
 
 import torch
 from torch.utils import _pytree
+
+# Valid only for the single public load that performed the operator probe.
+_preflight_fp64 = ContextVar("fairchem_preflight_fp64", default=None)
+_capture_lock = threading.Lock()
+
+
+def validate_xpu_policy(settings):
+    if settings.nitro or settings.execution_mode == "umas_fast_gpu":
+        raise ValueError(
+            "UMA Nitro and umas_fast_gpu require CUDA. Use inference_settings='xpu' "
+            "or execution_mode='general' for Intel GPUs."
+        )
+    if settings.internal_graph_gen_version not in (1, 2):
+        raise ValueError(
+            "XPU requires internal_graph_gen_version=1 or 2; "
+            "version 3 uses NVIDIA-specific neighbor-list kernels."
+        )
+    if settings.tf32:
+        raise ValueError("XPU inference requires tf32=False.")
 
 
 def probe_fp64_support(device: str | torch.device) -> dict:
@@ -124,15 +145,22 @@ def _positive_integer(value, name):
     return int(value)
 
 
-def model_tensor_signature(model):
+def model_tensor_signature(model, *, include_derived=False):
     """
     Track in-place edits and replacement of parameters or buffers.
 
     References are owned by the cache entry. Pointer reuse cannot impersonate a
     previously cached model, and each new model receives its own signature.
     """
+    derived = set()
+    if not include_derived:
+        for prefix, module in model.named_modules():
+            for key in getattr(module, "_derived_inference_buffers", ()):
+                derived.add(f"{prefix}.{key}" if prefix else key)
     signature = []
     for name, value in list(model.named_parameters()) + list(model.named_buffers()):
+        if name in derived:
+            continue
         if value.is_inference():
             raise ValueError(
                 "Cached/compiled models require parameter mutation counters. "
@@ -221,7 +249,9 @@ class ModelStreamGuard:
         self._restore = True
 
 
-def mole_composition_key(data, *, device, dtype, model_id, settings_key):
+def mole_composition_key(
+    data, *, device, dtype, model_id, settings_key, batch_size_dependent=True
+):
     """
     Build a collision-free routing key including absolute elemental counts.
 
@@ -229,21 +259,47 @@ def mole_composition_key(data, *, device, dtype, model_id, settings_key):
     Counts are exact integers, including for the size-dependent UMA-S-1.2
     composition embedding. Each batch member is checked, not only the first.
     """
-    numbers = data.atomic_numbers.detach().to(device="cpu", dtype=torch.int64)
-    batch = data.batch.detach().to(device="cpu", dtype=torch.int64)
-    charges = data.charge.detach().cpu().reshape(-1).tolist()
-    spins = data.spin.detach().cpu().reshape(-1).tolist()
-    systems = []
-    for index, dataset in enumerate(data.dataset):
-        elements, counts = numbers[batch == index].unique(return_counts=True)
-        systems.append(
-            (
-                tuple(zip(elements.tolist(), counts.tolist())),
-                charges[index],
-                spins[index],
-                dataset,
-            )
-        )
+    # Count all (system, element) pairs in one pass. Absolute counts prevent
+    # collisions for size-dependent composition embeddings. Keep the histogram
+    # compact for GPU-resident coordinates and validate IDs before indexing.
+    num_systems = len(data.dataset)
+    if (
+        num_systems != data.natoms.numel()
+        or data.atomic_numbers.shape != data.batch.shape
+    ):
+        raise ValueError("Inconsistent system or atom metadata in MoLE composition")
+    numbers = data.atomic_numbers.detach().long()
+    batch = data.batch.detach().long()
+    width = 119  # atomic numbers 0..118 (zero may be used by padded inputs)
+    invalid = (batch < 0) | (batch >= num_systems) | (numbers < 0) | (numbers >= width)
+    sentinel = num_systems * width
+    indices = torch.where(invalid, sentinel, batch * width + numbers)
+    counts = numbers.new_zeros(sentinel + 1)
+    counts.scatter_add_(0, indices, torch.ones_like(indices))
+    charge, spin = data.charge.reshape(-1), data.spin.reshape(-1)
+    if charge.numel() != num_systems or spin.numel() != num_systems:
+        raise ValueError("MoLE requires one charge and spin per system")
+    if charge.is_floating_point() or spin.is_floating_point():
+        # Preserve exact numeric metadata accepted by legacy AtomicData callers.
+        histogram = counts.tolist()
+        charges, spins = charge.tolist(), spin.tolist()
+    else:
+        packed = torch.cat((counts, charge.to(counts), spin.to(counts))).tolist()
+        histogram = packed[: sentinel + 1]
+        charges = packed[sentinel + 1 : sentinel + 1 + num_systems]
+        spins = packed[sentinel + 1 + num_systems :]
+    if histogram[-1]:
+        raise ValueError("Invalid atomic number or system index in MoLE composition")
+    systems = tuple(
+        (tuple(histogram[i * width : (i + 1) * width]), charges[i], spins[i], dataset)
+        for i, dataset in enumerate(data.dataset)
+    )
+    if (
+        not batch_size_dependent
+        and systems
+        and all(system == systems[0] for system in systems)
+    ):
+        systems = systems[:1]
     return (
         model_id,
         str(torch.device(device)),
@@ -251,6 +307,24 @@ def mole_composition_key(data, *, device, dtype, model_id, settings_key):
         settings_key,
         tuple(systems),
     )
+
+
+@dataclass
+class _PreparedEntry:
+    model: torch.nn.Module
+    signature: tuple
+    size: int
+    derived_buffers: tuple
+    derived_storage: tuple = ()
+
+    def storage_layout(self):
+        layout = []
+        for module, name in self.derived_buffers:
+            value = getattr(module, name)
+            if value is not None:
+                storage = value.untyped_storage()
+                layout.append((value.device, storage.data_ptr(), storage.nbytes()))
+        return tuple(layout)
 
 
 class PreparedModelCache:
@@ -281,33 +355,73 @@ class PreparedModelCache:
         if entry is None:
             self.misses += 1
             return None
-        model, signature, size = entry
-        if signature != model_tensor_signature(model):
+        if entry.signature != model_tensor_signature(entry.model):
             del self._entries[key]
-            self.bytes -= size
+            self.bytes -= entry.size
             self.misses += 1
             return None
         self._entries.move_to_end(key)
         self.hits += 1
-        return model
+        return entry.model
 
     def put(self, key, model):
         previous = self._entries.pop(key, None)
         if previous is not None:
-            self.bytes -= previous[2]
+            self.bytes -= previous.size
         size = model_storage_bytes(model)
         if self.max_bytes is not None and size > self.max_bytes:
             return
-        self._entries[key] = (model, model_tensor_signature(model), size)
+        slots = tuple(
+            (module, name)
+            for module in model.modules()
+            for name in getattr(module, "_derived_inference_buffers", ())
+        )
+        entry = _PreparedEntry(model, model_tensor_signature(model), size, slots)
+        entry.derived_storage = entry.storage_layout()
+        self._entries[key] = entry
         self.bytes += size
-        while len(self._entries) > self.max_entries or (
-            self.max_bytes is not None and self.bytes > self.max_bytes
+        self._trim()
+
+    def _trim(self, extra_entries=0, extra_bytes=0):
+        while self._entries and (
+            len(self._entries) + extra_entries > self.max_entries
+            or (
+                self.max_bytes is not None and self.bytes + extra_bytes > self.max_bytes
+            )
         ):
-            _, (_, _, evicted_size) = self._entries.popitem(last=False)
-            self.bytes -= evicted_size
+            _, entry = self._entries.popitem(last=False)
+            self.bytes -= entry.size
+
+    def reserve_entry(self):
+        # Equal-architecture merged models generally have equal storage.
+        # Use the last resident size as a pre-allocation estimate. put() and
+        # refresh_storage() still enforce the budget using exact live storage.
+        recent = next(reversed(self._entries.values()), None)
+        self._trim(extra_entries=1, extra_bytes=recent.size if recent else 0)
+
+    def refresh_storage(self, key):
+        entry = self._entries.get(key)
+        if entry is None:
+            return
+        layout = entry.storage_layout()
+        if layout == entry.derived_storage:
+            return
+        entry.derived_storage = layout
+        size = model_storage_bytes(entry.model)
+        if self.max_bytes is not None and size > self.max_bytes:
+            del self._entries[key]
+            self.bytes -= entry.size
+            return
+        self.bytes += size - entry.size
+        entry.size = size
+        self._trim()
 
     def __len__(self):
         return len(self._entries)
+
+
+class _TapeLease:
+    """Lives with the autograd graph, even when only downstream results survive."""
 
 
 class _OwnedGraphInput(torch.autograd.Function):
@@ -316,12 +430,13 @@ class _OwnedGraphInput(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, value):
+    def forward(ctx, value, lease):
+        ctx.lease = lease
         return value
 
     @staticmethod
     def backward(ctx, gradient):
-        return None if gradient is None else gradient.clone()
+        return (None if gradient is None else gradient.clone()), None
 
 
 class NumericCoreRuntime:
@@ -357,6 +472,10 @@ class NumericCoreRuntime:
         self.owner = owner if isinstance(owner, torch.nn.Module) else None
         self._owner_signature = self._execution_signature()
         self._lock = threading.RLock()
+        self.call_count = 0
+        self.compile_call_count = 0
+        self.compile_failure_count = 0
+        self.capture_failure_count = 0
         self.capture_count = 0
         self.replay_count = 0
 
@@ -366,10 +485,10 @@ class NumericCoreRuntime:
             self._failed_captures.clear()
 
     def _execution_signature(self):
-        if self.owner is None:
+        if self.owner is None or not self.xpu_graph:
             return None
         return (
-            model_tensor_signature(self.owner),
+            model_tensor_signature(self.owner, include_derived=True),
             tuple(
                 (name, module.training) for name, module in self.owner.named_modules()
             ),
@@ -384,6 +503,10 @@ class NumericCoreRuntime:
             _graphs=OrderedDict(),
             _failed_captures=OrderedDict(),
             _owner_signature=None,
+            call_count=0,
+            compile_call_count=0,
+            compile_failure_count=0,
+            capture_failure_count=0,
             capture_count=0,
             replay_count=0,
             higher_order=False,
@@ -398,6 +521,13 @@ class NumericCoreRuntime:
 
     def __setstate__(self, state):
         method_function = state.pop("_method_function", None)
+        for counter in (
+            "call_count",
+            "compile_call_count",
+            "compile_failure_count",
+            "capture_failure_count",
+        ):
+            state.setdefault(counter, 0)
         self.__dict__.update(state)
         if method_function is not None:
             self.function = MethodType(method_function, self.owner)
@@ -446,13 +576,16 @@ class NumericCoreRuntime:
         # Replay bypasses operator dispatch: a capture made under another
         # autocast/TF32 policy keeps those kernels even after the policy changes.
         # no_grad and inference_mode also have different tensor/autograd rules.
+        from fairchem.core.common.precision import matmul_precision_key
+        from fairchem.core.models.uma.nn.portable_wigner import fused_policy_key
+
         policy = (
             torch.is_inference_mode_enabled(),
             torch.get_autocast_dtype("xpu")
             if torch.is_autocast_enabled("xpu")
             else None,
-            torch.get_float32_matmul_precision(),
-            getattr(torch.backends.mkldnn, "allow_tf32", None),
+            matmul_precision_key("xpu"),
+            fused_policy_key(),
         )
         return (
             leaves,
@@ -465,10 +598,11 @@ class NumericCoreRuntime:
         # The Python submission and output clone must form one transaction:
         # otherwise another thread can replay into a shared output in between.
         with self._lock:
+            self.call_count += 1
             return self._call_locked(*args, **kwargs)
 
     def _call_locked(self, *args, **kwargs):
-        if self.owner is not None:
+        if self.xpu_graph and self.owner is not None:
             signature = self._execution_signature()
             if signature != self._owner_signature:
                 self.clear()
@@ -518,7 +652,31 @@ class NumericCoreRuntime:
                     t.detach().clone().requires_grad_(t.requires_grad) for t in tensors
                 )
                 try:
-                    with torch.xpu.device(tensors[0].device):
+                    from fairchem.core.models.uma.nn.portable_wigner import (
+                        capture_safe_kernels,
+                    )
+
+                    target = tensors[0].device
+                    with (
+                        _capture_lock,
+                        torch.xpu.device(target),
+                        capture_safe_kernels(),
+                    ):
+                        # PyTorch keeps one implicit capture stream for the entire
+                        # process. Never launch captures on another GPU's stream.
+                        default_stream = getattr(
+                            getattr(torch.xpu, "graph", None),
+                            "default_capture_stream",
+                            None,
+                        )
+                        if (
+                            default_stream is not None
+                            and default_stream.device != target
+                        ):
+                            raise ValueError(
+                                "PyTorch's default XPU capture stream belongs to a different device"
+                            )
+
                         graphed = torch.xpu.make_graphed_callables(
                             tensor_function, samples, allow_unused_input=True
                         )
@@ -540,6 +698,7 @@ class NumericCoreRuntime:
                         for term in ("out of memory", "device_lost", "device lost")
                     ):
                         raise
+                    self.capture_failure_count += 1
                     self._failed_captures[key] = None
                     while len(self._failed_captures) > 2 * self.graph_cache_size:
                         self._failed_captures.popitem(last=False)
@@ -558,8 +717,20 @@ class NumericCoreRuntime:
                     # gradient buffers. Clone at the input's backward boundary
                     # so a subsequent replay cannot overwrite autograd.grad's
                     # previously returned tensors.
+                    lease = _TapeLease()
+
+                    def release_entry():
+                        with self._lock:
+                            entry.busy = False
+                            for handle in entry.hooks or ():
+                                handle.remove()
+                            entry.hooks = []
+
+                    release = (
+                        weakref.finalize(lease, release_entry) if entry.busy else None
+                    )
                     owned_inputs = tuple(
-                        _OwnedGraphInput.apply(value)
+                        _OwnedGraphInput.apply(value, lease)
                         if value.requires_grad and torch.is_grad_enabled()
                         else value
                         for value in tensors
@@ -568,6 +739,8 @@ class NumericCoreRuntime:
                         lambda value: value.clone(), entry.function(*owned_inputs)
                     )
                 except Exception:
+                    if release is not None:
+                        release()
                     entry.busy = False
                     raise
                 output_leaves, _ = _pytree.tree_flatten(output)
@@ -582,17 +755,10 @@ class NumericCoreRuntime:
                             torch._C._autograd._get_current_graph_task_keep_graph()
                         )
 
-                        def release():
-                            if not retained:
-                                with self._lock:
-                                    entry.busy = False
-                                    for handle in entry.hooks:
-                                        handle.remove()
-                                    entry.hooks.clear()
-
-                        torch.autograd.Variable._execution_engine.queue_callback(
-                            release
-                        )
+                        if not retained:
+                            torch.autograd.Variable._execution_engine.queue_callback(
+                                release
+                            )
                         return gradient
 
                     entry.hooks = [
@@ -600,15 +766,18 @@ class NumericCoreRuntime:
                         for value in output_leaves
                         if value.requires_grad
                     ]
-                else:
-                    entry.busy = False
+                elif release is not None:
+                    release()
                 return output
         return self._run_uncaptured(*args, **kwargs)
 
     def _run_uncaptured(self, *args, **kwargs):
         function = self.compiled if self.compiled is not None else self.function
         try:
-            return function(*args, **kwargs)
+            result = function(*args, **kwargs)
+            if self.compiled is not None:
+                self.compile_call_count += 1
+            return result
         except (
             torch._dynamo.exc.BackendCompilerFailed,
             torch._dynamo.exc.Unsupported,
@@ -619,6 +788,7 @@ class NumericCoreRuntime:
                 "Numeric block compilation unavailable; using eager execution: %s",
                 error,
             )
+            self.compile_failure_count += 1
             self.compiled = None
             self._compile_enabled = False
             self.clear()

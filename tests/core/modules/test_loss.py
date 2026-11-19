@@ -241,3 +241,43 @@ def test_ddp_mse(forces, natoms, world_size):
     ddp_loss = torch.sum(torch.tensor(output)) / float(world_size)
     ref_loss = nn.MSELoss(reduction="mean")
     assert torch.allclose(ddp_loss, ref_loss(pred, target))
+
+
+@pytest.mark.parametrize("mode", ["sum", "mean", "per_structure"])
+def test_masked_loss_device_counts_and_gradients(mode):
+    from fairchem.core.modules.loss import DDPMTLoss
+
+    loss_fn = DDPMTLoss(MSELoss(), reduction=mode)
+    pred = torch.tensor([2.0, 1.0, 3.0], dtype=torch.float64, requires_grad=True)
+    mask = torch.tensor([True, False, True])
+    natoms = torch.tensor([1, 2])
+    weight = 1 if mode == "sum" else 0.5
+    result = loss_fn(pred, torch.zeros_like(pred), mask, natoms)
+    torch.testing.assert_close(result, pred.new_tensor(13 * weight))
+    torch.testing.assert_close(
+        torch.autograd.grad(result, pred)[0], pred.new_tensor([4, 0, 6]) * weight
+    )
+    empty = loss_fn(pred, torch.zeros_like(pred), ~torch.ones_like(mask), natoms)
+    assert empty.item() == 0
+
+
+def test_masked_loss_unequal_replica_counts(monkeypatch):
+    from fairchem.core.modules.loss import DDPMTLoss
+
+    # Three valid components on this rank and six on its peer.
+    monkeypatch.setattr(distutils, "get_world_size", lambda: 2)
+
+    def add_peer_count(count, **kwargs):
+        assert count.device.type == "cpu" and count.item() == 3
+        return count + 6
+
+    monkeypatch.setattr(distutils, "all_reduce", add_peer_count)
+    pred = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], requires_grad=True)
+    out = DDPMTLoss(MSELoss())(
+        pred, torch.zeros_like(pred), torch.tensor([[True], [False]]), torch.tensor([2])
+    )
+    torch.testing.assert_close(out, pred.new_tensor(28 / 9))
+    torch.testing.assert_close(
+        torch.autograd.grad(out, pred)[0],
+        pred.new_tensor([[4 / 9, 8 / 9, 12 / 9], [0.0, 0.0, 0.0]]),
+    )

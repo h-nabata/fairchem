@@ -13,23 +13,12 @@ import torch
 import torch.nn as nn
 
 
-def _normalized_silu_parts(x, weight, bias, eps):
-    centered = x - x.mean(dim=-1, keepdim=True)
-    inv_std = (centered.square().mean(dim=-1, keepdim=True) + eps).rsqrt()
-    normalized = centered * inv_std
-    affine = normalized * weight + bias
-    sigmoid = affine.sigmoid()
-    derivative = sigmoid * (1 + affine * (1 - sigmoid))
-    return normalized, inv_std, derivative
-
-
 class _LayerNormSiLU(torch.autograd.Function):
     """
     Recompute a cheap epilogue instead of saving a full normalized activation.
 
-    Forward uses the native normalization and SiLU operations. The pure tensor
-    backward is compiler-fusible and supports higher derivatives and vmap;
-    no reduced-precision or approximate transcendental operation is selected.
+    Recompute the same native mean and reciprocal standard deviation in backward.
+    Native LayerNorm also supplies its registered second derivative.
     """
 
     generate_vmap_rule = True
@@ -50,54 +39,36 @@ class _LayerNormSiLU(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         x, weight, bias = ctx.saved_tensors
-        normalized, inv_std, derivative = _normalized_silu_parts(
-            x, weight, bias, ctx.eps
+        shape = (x.shape[-1],)
+        affine, mean, rstd = torch.native_layer_norm(x, shape, weight, bias, ctx.eps)
+        if torch.is_grad_enabled():
+            # The fused first derivative has no second-derivative registration.
+            sigmoid = affine.sigmoid()
+            grad_affine = grad_output * sigmoid * (1 + affine * (1 - sigmoid))
+        else:
+            grad_affine = torch.ops.aten.silu_backward(grad_output, affine)
+        grad_x, grad_weight, grad_bias = torch.ops.aten.native_layer_norm_backward(
+            grad_affine, x, shape, mean, rstd, weight, bias, ctx.needs_input_grad[:3]
         )
-        grad_affine = grad_output * derivative
-        grad_x = grad_weight = grad_bias = None
-        if ctx.needs_input_grad[0]:
-            grad_normalized = grad_affine * weight
-            grad_x = inv_std * (
-                grad_normalized
-                - grad_normalized.mean(dim=-1, keepdim=True)
-                - normalized * (grad_normalized * normalized).mean(dim=-1, keepdim=True)
-            )
-        # Frozen inference weights need coordinate derivatives only. Avoid
-        # materializing a full activation-sized parameter-gradient product and
-        # reducing it, while retaining the full training/higher-gradient paths.
-        batch_dims = tuple(range(x.ndim - 1))
-        if ctx.needs_input_grad[1]:
-            grad_weight = grad_affine * normalized
-            if batch_dims:
-                grad_weight = grad_weight.sum(dim=batch_dims)
-        if ctx.needs_input_grad[2]:
-            grad_bias = grad_affine
-            if batch_dims:
-                grad_bias = grad_bias.sum(dim=batch_dims)
         return grad_x, grad_weight, grad_bias, None
 
     @staticmethod
     def jvp(ctx, tangent_x, tangent_weight, tangent_bias, tangent_eps):
         x, weight, bias = ctx.saved_tensors
-        normalized, inv_std, derivative = _normalized_silu_parts(
-            x, weight, bias, ctx.eps
-        )
-        tangent_affine = torch.zeros_like(x)
-        if tangent_x is not None:
-            tangent_affine = (
-                weight
-                * inv_std
-                * (
-                    tangent_x
-                    - tangent_x.mean(dim=-1, keepdim=True)
-                    - normalized * (tangent_x * normalized).mean(dim=-1, keepdim=True)
-                )
+        inputs = (x, weight, bias)
+        tangents = tuple(
+            tangent if tangent is not None else torch.zeros_like(primal)
+            for tangent, primal in zip(
+                (tangent_x, tangent_weight, tangent_bias), inputs
             )
-        if tangent_weight is not None:
-            tangent_affine = tangent_affine + normalized * tangent_weight
-        if tangent_bias is not None:
-            tangent_affine = tangent_affine + tangent_bias
-        return tangent_affine * derivative
+        )
+
+        def native(x, weight, bias):
+            return torch.nn.functional.silu(
+                torch.nn.functional.layer_norm(x, (x.shape[-1],), weight, bias, ctx.eps)
+            )
+
+        return torch.func.jvp(native, inputs, tangents)[1]
 
 
 def layer_norm_silu(x, weight, bias, eps):

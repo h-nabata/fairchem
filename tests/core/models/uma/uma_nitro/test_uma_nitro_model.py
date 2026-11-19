@@ -41,6 +41,7 @@ from fairchem.core.models.uma.uma_nitro._inference import (  # noqa: E402
 )
 
 
+@torch.no_grad()
 def _reference_tensors(checkpoint, data) -> dict[str, torch.Tensor]:
     """
     HydraModel's merged, fast-PyTorch-prepared tensors under Nitro's names.
@@ -64,7 +65,9 @@ def _reference_tensors(checkpoint, data) -> dict[str, torch.Tensor]:
             conv = getattr(block.edge_wise, f"so2_conv_{c}")
             for j, m_conv in enumerate(conv.so2_m_conv):
                 name = f"backbone.blocks.{i}.edge_wise.so2_conv_{c}.so2_m_conv.{j}"
-                tensors[f"{name}._w_block"] = m_conv._w_block
+                # Hydra builds the m>0 layout when its first GEMM consumes
+                # it. Compare the actual GEMM operand to Nitro's packed matrix.
+                tensors[f"{name}._w_block"] = m_conv.block_weight()
     return tensors
 
 

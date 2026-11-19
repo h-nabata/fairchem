@@ -42,6 +42,7 @@ dependencies = [
 dev = ["pre-commit", "pytest", "pytest-cov", "coverage", "syrupy", "ruff==0.5.1", "ray[serve]>=2.56.1"]
 docs = ["jupyter-book", "jupytext", "sphinx","sphinx-autoapi==3.3.3", "astroid<4", "umap-learn", "vdict", "ipywidgets", "jupyter_book>=2.0", "torch-dftd"]
 adsorbml = ["dscribe", "x3dase", "scikit-image"]
+regression = ["pymatgen>=2025.1.9", "phonopy>=2.37"]
 torchsim = ["torch-sim-atomistic>=0.6.0; python_version >= '3.12'"]
 extras = ["pymatgen>=2025.1.9", "quacc[phonons]>=0.15.3", "pandas", "pyarrow"]
 # 2.56.1 is the first release whose ray.serve._private.config handles
@@ -50,12 +51,14 @@ ray = ["ray[serve]>=2.56.1"]
 
 [dependency-groups]
 cpu = ["torch==2.13.0"]
+xpu = ["torch==2.15.0", "triton-xpu>=3.9,<3.10.dev0; sys_platform == 'linux' and platform_machine == 'x86_64'"]
 cu126 = ["torch==2.13.0"]
 cu130 = ["torch==2.13.0"]
 cu132 = ["torch==2.13.0"]
 
 [project.scripts]
 fairchem = "fairchem.core._cli:main"
+fairchem-regression = "fairchem.core.regression_suite.cli:main"
 
 [project.urls]
 repository = "https://github.com/facebookresearch/fairchem"
@@ -66,18 +69,26 @@ documentation = "https://facebookresearch.github.io/fairchem/"
 default-groups = ["cu130"]
 conflicts = [[
     { group = "cpu" },
+    { group = "xpu" },
     { group = "cu126" },
     { group = "cu130" },
     { group = "cu132" },
 ]]
 
 [tool.uv.sources]
+triton-xpu = [{ index = "pytorch-xpu", group = "xpu" }]
 torch = [
     { index = "pytorch-cpu", group = "cpu" },
+    { index = "pytorch-xpu", group = "xpu" },
     { index = "pytorch-cu126", group = "cu126" },
     { index = "pytorch-cu130", group = "cu130" },
     { index = "pytorch-cu132", group = "cu132" },
 ]
+
+[[tool.uv.index]]
+name = "pytorch-xpu"
+url = "https://download.pytorch.org/whl/xpu"
+explicit = true
 
 [[tool.uv.index]]
 name = "pytorch-cpu"

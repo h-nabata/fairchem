@@ -97,3 +97,50 @@ Full FP64 network merging, XPU compilation, distributed serving, all TorchSim
 integrators, and long dynamics trajectories are not validated by this record.
 Unsupported Ray allocation and XPU D3 requests now fail explicitly; D3 can
 run on CPU alongside a local XPU UMA calculator.
+
+### Reproduce a hardware comparison
+
+Each validation report identifies the resolved XPU ordinal, physical device,
+driver version when available, PyTorch build, source revision, effective settings
+and SHA-256 of the local checkpoint. Use the same checkpoint and frame sequence
+on each backend. Precision-specific tolerances and finite-difference widths
+can be overridden with the CLI flags.
+
+```bash
+python -m fairchem.core.scripts.validate_xpu --device xpu:1 --model "$MODEL" \
+  --compare-merged --stress --hvp --fp64-reference --neighbor-skin 0.5 \
+  --geometry-workloads subskin rebuild strain --output validation.json
+python -m fairchem.core.scripts.benchmark_xpu_batch --checkpoint "$MODEL" \
+  --devices xpu:0 xpu:1 --systems 4 --output batch-two-devices.json
+```
+
+Use `--structure` and `--task` with the validator to test an ASE trajectory.
+The fixed-geometry timing records repeatability. The optional workloads alternate
+between the initial geometry and a displaced or strained geometry, report
+neighbor-cache counters and compare the changed-geometry outputs with CPU.
+Requested graph replay or compilation must show execution evidence. Per-block
+call counts include eager bypasses during derivative evaluation.
+
+The batch benchmark runs serial and packed requests in each independent
+process, synchronizes the selected cards, and counts total structures over the
+shared elapsed interval. Run it again with a single device for the one-card
+comparison. The Ray serving benchmark supports CPU and CUDA. Its per-concurrency
+speedup uses the same structures in its local serial measurement. Each
+successful predictor invocation contributes an identifier to its outputs so the
+report can count a single packed call serving multiple clients. The identifier
+and its transport contribute to both reported timings.
+
+For fixed-cell NVE, `benchmark_md --sample-stream trajectory.jsonl --aggregate-only
+--timing-block 10` retains bounded timing observations while writing the sampled
+energy trajectory. The report includes both maximum absolute drift from the
+post-warmup energy and signed least-squares slope in eV/atom/ps.
+`compare_series_b --all-frames` alternates model order by frame, measures
+deviations across repeated calls and compares relative energies within the
+same composition, charge and spin. `--candidate-first` reverses the starting
+order when repeating a run in a fresh process.
+
+The `Xe hardware validation` workflow runs only on the fork's trusted
+`intel-xpu-fp32` branch when `XE_B70_CI=true`. Point `XE_B70_CHECKPOINT` at
+a local, readable UMA checkpoint on a Linux runner labeled `xe-b70-dual`
+with two visible B70s, an XPU build of PyTorch, Intel Triton, and the project's
+test dependencies. It archives the numerical comparisons and kernel test results.
