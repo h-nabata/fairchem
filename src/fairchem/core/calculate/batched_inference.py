@@ -146,12 +146,13 @@ def plan_microbatches(
             bins.append([index])
             continue
         compatible = open_bins.setdefault(_compatibility_key(structures[index]), {})
-        for key, entry in compatible.items():
+        for bin_index, entry in compatible.items():
             members, used_atoms, used_edges = entry
             if used_atoms + atoms <= limits.max_atoms and (
                 limits.max_edges is None or used_edges + edges <= limits.max_edges
             ):
-                break  # key and members identify the first fit below.
+                key = bin_index
+                break
         else:
             key = len(bins)
             members, used_atoms, used_edges = [], 0, 0

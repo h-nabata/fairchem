@@ -729,9 +729,9 @@ class DatasetSpecificSingleHeadWrapper(nn.Module, HeadInterface):
             return full_output
 
         # check that all the input dataset names is a strict subset of dataset names
-        assert set(data.dataset) <= set(self.dataset_names), (
-            f"Input dataset names: {set(data.dataset)} must be a strict subset of model's valid dataset names: {set(self.dataset_names)} "
-        )
+        assert (
+            set(data.dataset) <= set(self.dataset_names)
+        ), f"Input dataset names: {set(data.dataset)} must be a strict subset of model's valid dataset names: {set(self.dataset_names)} "
         return _route_head_outputs(
             head_output, data, self.dataset_names, self.wrap_property
         )

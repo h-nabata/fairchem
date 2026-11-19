@@ -332,9 +332,9 @@ class MOLE(torch.nn.Module):
         # if the input segment is (5,15) then we compute the following 2 segments
         # (5,10),(10,15)
         input_segment = (ac_start_idx, ac_start_idx + x.shape[0])
-        assert 0 <= input_segment[0] <= input_segment[1] <= start_idxs[-1], (
-            f"Input segment {input_segment} is outside MoLE sizes {start_idxs[-1]}"
-        )
+        assert (
+            0 <= input_segment[0] <= input_segment[1] <= start_idxs[-1]
+        ), f"Input segment {input_segment} is outside MoLE sizes {start_idxs[-1]}"
 
         segments = []
         for n, mole_segment in enumerate(mole_intervals):
@@ -380,9 +380,9 @@ class MOLE(torch.nn.Module):
         ]
 
         result = out[0] if len(out) == 1 else torch.concatenate(out, dim=0)
-        assert result.shape[0] == x.shape[0], (
-            f"result shape {result.shape}, does not match input shape {x.shape} at dim 0"
-        )
+        assert (
+            result.shape[0] == x.shape[0]
+        ), f"result shape {result.shape}, does not match input shape {x.shape} at dim 0"
         return result
 
     def _padded_forward(self, x, weights, plan: PaddedPlan, first_system: int):

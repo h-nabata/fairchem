@@ -586,9 +586,9 @@ def guess_inference_settings(settings: str | InferenceSettings):
             "'multigpu' (turbo's former settings) for multi-worker inference."
         )
     if isinstance(settings, str):
-        assert settings in NAME_TO_INFERENCE_SETTING, (
-            f"inference setting name must be one of {NAME_TO_INFERENCE_SETTING.keys()}"
-        )
+        assert (
+            settings in NAME_TO_INFERENCE_SETTING
+        ), f"inference setting name must be one of {NAME_TO_INFERENCE_SETTING.keys()}"
         # Named presets are shared templates. A caller may customize a returned
         # setting (including its mutable derivative-task sets) before creating
         # a predictor; that must not contaminate subsequent jobs or the presets

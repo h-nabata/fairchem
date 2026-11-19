@@ -244,9 +244,9 @@ class InferenceBenchRunner(Runner):
     ):
         self.natoms_list = natoms_list
         self.input_system = input_system
-        assert (natoms_list is None) ^ (input_system is None), (
-            "input must be either list of natoms or dict names: input system files"
-        )
+        assert (natoms_list is None) ^ (
+            input_system is None
+        ), "input must be either list of natoms or dict names: input system files"
         self.device = device
         self.seed = seed
         self.timeiters = timeiters

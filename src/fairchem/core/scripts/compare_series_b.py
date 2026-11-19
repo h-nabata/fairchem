@@ -233,12 +233,12 @@ def _error_report(reference, candidate):
         if actual.shape != expected.shape:
             raise ValueError(f"Reference/candidate shape mismatch for {name}")
         reference_norm = error_norm = maximum = 0.0
-        for chunk, base in zip(
+        for chunk, reference_chunk in zip(
             actual.reshape(-1).split(65536),
             expected.reshape(-1).split(65536),
             strict=True,
         ):
-            base = base.double()
+            base = reference_chunk.double()
             difference = chunk.double() - base
             reference_norm = math.hypot(
                 reference_norm, torch.linalg.vector_norm(base).item()

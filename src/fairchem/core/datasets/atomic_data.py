@@ -172,8 +172,8 @@ def get_neighbors_pymatgen(
     by_center = np.argsort(_c_index, kind="stable")
     starts = np.cumsum(np.bincount(_c_index, minlength=len(atoms)))[:-1]
     selected = []
-    for row in np.split(by_center, starts):
-        row = row[np.argsort(n_distance[row])]
+    for center_edges in np.split(by_center, starts):
+        row = center_edges[np.argsort(n_distance[center_edges])]
         if enforce_max_neighbors_strictly is None:
             row = row[:max_neigh]  # Original standalone converter semantics.
         elif max_neigh > 0 and len(row) > max_neigh:
@@ -362,9 +362,9 @@ class AtomicData:
             assert len(self.dataset) == self.num_graphs
 
         # dtype checks
-        assert self.pos.dtype == self.cell.dtype == self.cell_offsets.dtype, (
-            "Positions, cell, cell_offsets are all expected to be same. Check data going into AtomicData is correct dtype"
-        )
+        assert (
+            self.pos.dtype == self.cell.dtype == self.cell_offsets.dtype
+        ), "Positions, cell, cell_offsets are all expected to be same. Check data going into AtomicData is correct dtype"
         assert self.pos.dtype in (
             torch.float32,
             torch.float64,
@@ -389,9 +389,9 @@ class AtomicData:
         for name in ("natoms", "nedges", "charge", "spin"):
             value = getattr(self, name)
             assert value.dtype == torch.long, f"{name} must be an int64 tensor"
-            assert value.shape == (self.num_graphs,), (
-                f"{name} must have one entry per system"
-            )
+            assert value.shape == (
+                self.num_graphs,
+            ), f"{name} must have one entry per system"
         assert isinstance(self.num_nodes, int)
         assert isinstance(self.num_graphs, int)
 
@@ -445,9 +445,9 @@ class AtomicData:
             raise ValueError("A fully periodic structure requires a nonsingular cell")
         # TODO: maybe compute a safe cell size if not provided.
         if molecule_cell_size is not None:
-            assert atoms.cell.volume == 0.0, (
-                "atoms must not have a unit cell to begin with to create a molecule cell"
-            )
+            assert (
+                atoms.cell.volume == 0.0
+            ), "atoms must not have a unit cell to begin with to create a molecule cell"
             # create a molecule box with the molecule centered on it if specified
             atoms.center(vacuum=(molecule_cell_size))
             atoms.pbc = np.array([True, True, True])
@@ -484,12 +484,12 @@ class AtomicData:
 
         # graph construction
         if r_edges:
-            assert radius is not None, (
-                "cutoff must be specified for cpu graph construction."
-            )
-            assert max_neigh is not None, (
-                "max_neigh must be specified for cpu graph construction."
-            )
+            assert (
+                radius is not None
+            ), "cutoff must be specified for cpu graph construction."
+            assert (
+                max_neigh is not None
+            ), "max_neigh must be specified for cpu graph construction."
 
             if external_graph_method == ExternalGraphMethod.PYMATGEN:
                 split_idx_dist = get_neighbors_pymatgen(
@@ -664,9 +664,9 @@ class AtomicData:
     @classmethod
     def from_dict(cls, dictionary):
         r"""Creates a data object from a python dictionary."""
-        assert set(_REQUIRED_KEYS).issubset(dictionary.keys()), (
-            f"Missing required keys: {set(_REQUIRED_KEYS) - set(dictionary.keys())}"
-        )
+        assert set(_REQUIRED_KEYS).issubset(
+            dictionary.keys()
+        ), f"Missing required keys: {set(_REQUIRED_KEYS) - set(dictionary.keys())}"
 
         data = cls(
             pos=dictionary["pos"],
@@ -1070,9 +1070,9 @@ def atomicdata_list_to_batch(
     natoms_list = []
 
     for data in data_list:
-        assert data.num_graphs == 1, (
-            "data list must only contain single-graph AtomicData objects."
-        )
+        assert (
+            data.num_graphs == 1
+        ), "data list must only contain single-graph AtomicData objects."
 
         for key in keys:
             item = data[key]

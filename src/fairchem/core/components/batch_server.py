@@ -340,7 +340,9 @@ class BatchPredictServerMixin:
             # still contain several such requests; isolate their forward calls.
             key = (
                 _compatibility_key(data),
-                index if _requires_single_system(predict_unit, data, requested) else None,
+                index
+                if _requires_single_system(predict_unit, data, requested)
+                else None,
             )
             groups[key].append(index)
         if len(groups) > 1:
@@ -372,7 +374,9 @@ class BatchPredictServerMixin:
                 {} if requested is None else {"requested_properties": requested}
             )
             try:
-                predict = getattr(predict_unit, "_predict_owned_batch", predict_unit.predict)
+                predict = getattr(
+                    predict_unit, "_predict_owned_batch", predict_unit.predict
+                )
                 preds = predict(
                     batch,
                     undo_element_references=undo_element_references,

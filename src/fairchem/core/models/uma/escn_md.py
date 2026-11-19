@@ -743,9 +743,9 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
                     gp_utils.get_gp_world_size(),
                 )[gp_utils.get_gp_rank()]
 
-            assert node_partition.numel() > 0, (
-                "Looks like there are no atoms in this graph parallel partition. Cannot proceed"
-            )
+            assert (
+                node_partition.numel() > 0
+            ), "Looks like there are no atoms in this graph parallel partition. Cannot proceed"
 
         if self.otf_graph:
             pbc = None
@@ -757,9 +757,9 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
                     device=data_dict["pos"].device,
                 )
             else:
-                assert "pbc" in data_dict, (
-                    "Since always_use_pbc is False, pbc conditions must be supplied by the input data"
-                )
+                assert (
+                    "pbc" in data_dict
+                ), "Since always_use_pbc is False, pbc conditions must be supplied by the input data"
                 pbc = data_dict["pbc"]
 
             if (
@@ -787,9 +787,9 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
             )
         else:
             # this assume edge_index is provided
-            assert "edge_index" in data_dict, (
-                "otf_graph is false, need to provide edge_index as input!"
-            )
+            assert (
+                "edge_index" in data_dict
+            ), "otf_graph is false, need to provide edge_index as input!"
 
             # Compute shifts from cell offsets
             if len(data_dict["natoms"]) == 1:

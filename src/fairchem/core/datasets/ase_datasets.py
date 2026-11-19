@@ -340,8 +340,9 @@ class AseReadMultiStructureDataset(AseAtomsDataset):
 
         def add_frames(filename, count):
             frames = range(count)[selection]
-            for frame in (frames,) if isinstance(frames, int) else frames:
-                ids.append(f"{filename} {frame}")
+            if isinstance(frames, int):
+                frames = (frames,)
+            ids.extend(f"{filename} {frame}" for frame in frames)
 
         if config.get("index_file") is not None:
             with open(config["index_file"]) as index_file:

@@ -23,8 +23,8 @@ from collections import defaultdict
 from collections.abc import Collection, Mapping
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
-from importlib.util import find_spec
 from functools import cached_property, wraps
+from importlib.util import find_spec
 from typing import TYPE_CHECKING, ClassVar, Protocol
 
 import hydra
@@ -34,8 +34,6 @@ import torch.distributed as dist
 from monty.dev import requires
 from torch.distributed.elastic.utils.distributed import get_free_port
 from torchtnt.framework import PredictUnit, State
-
-ray_installed = find_spec("ray") is not None
 
 from fairchem.core.common import gp_utils
 from fairchem.core.common._model_state import MODEL_STATE_LOCK
@@ -68,13 +66,13 @@ from fairchem.core.units.mlip_unit.api.inference import (
 from fairchem.core.units.mlip_unit.api.model_spec import ModelSpec
 from fairchem.core.units.mlip_unit.inference_runtime import (
     ModelStreamGuard,
-    _preflight_fp64,
-    validate_xpu_policy,
     PreparedModelCache,
+    _preflight_fp64,
     configure_numeric_runtime,
     model_tensor_signature,
     mole_composition_key,
     probe_fp64_support,
+    validate_xpu_policy,
 )
 from fairchem.core.units.mlip_unit.mlip_unit import OutputSpec, Task
 from fairchem.core.units.mlip_unit.series_b_runtime import (
@@ -98,6 +96,8 @@ if TYPE_CHECKING:
     from fairchem.core.common.gp_utils import GraphParallelConfig
     from fairchem.core.units.mlip_unit.api.inference import MLIPInferenceCheckpoint
 
+
+ray_installed = find_spec("ray") is not None
 
 _AUXILIARY_LEVELS = {
     "forces": "atom",
@@ -1410,7 +1410,8 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
             self._initialize(data)  # may fall back: nitro -> multigpu -> general
             revision = get_commit_hash_for_repo(os.path.dirname(__file__))
             backend_name = type(
-                getattr(self.model.module.backbone, "backend", None) or self.model.module
+                getattr(self.model.module.backbone, "backend", None)
+                or self.model.module
             ).__name__
             logging.warning(
                 f"Running ({revision or 'unknown commit'}) with inference settings: "
@@ -1759,9 +1760,9 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
                 if level == "atom":
                     mask = mask[data.batch.to(value.device)]
                 value = value[mask]
-            assert torch.isfinite(value).all(), (
-                f"NaNs/Infs found in prediction for task {task.name}.{prop}"
-            )
+            assert torch.isfinite(
+                value
+            ).all(), f"NaNs/Infs found in prediction for task {task.name}.{prop}"
 
         for task in active_tasks:
             task_name = task.name
@@ -2166,7 +2167,7 @@ class ParallelMLIPPredictUnit(MLIPPredictUnitProtocol):
         import ray
         from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-        worker_type = getattr(sys.modules[__name__], "MLIPWorker")
+        worker_type = sys.modules[__name__].MLIPWorker
 
         num_nodes = math.ceil(num_workers / num_workers_per_node)
         num_workers_on_node_array = [num_workers_per_node] * num_nodes

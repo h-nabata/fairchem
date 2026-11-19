@@ -124,54 +124,57 @@ def load_tasks(checkpoint_location: str) -> list[Task]:
         ]
 
 
-# Strict XPU callers only observe policy. Writers (CUDA scopes and B03) may
-# change process-wide settings, so they exclude both readers and other writers.
-_precision_condition = Condition()
-_precision_readers = {}
-_precision_writer = None
-_precision_waiters = 0
+class _PrecisionGuard:
+    """Strict XPU scopes can share a policy; CUDA and B03 writers need exclusive access."""
 
+    def __init__(self):
+        self.condition = Condition()
+        self.readers: dict[int, int] = {}
+        self.writer: int | None = None
+        self.waiters = 0
 
-@contextmanager
-def _precision_guard(readonly):
-    global _precision_writer, _precision_waiters
-    thread = get_ident()
-    with _precision_condition:
-        nested_writer = _precision_writer == thread
-        if not nested_writer:
-            if readonly:
-                _precision_condition.wait_for(
-                    lambda: (
-                        _precision_writer is None
-                        and (not _precision_waiters or thread in _precision_readers)
-                    )
-                )
-                _precision_readers[thread] = _precision_readers.get(thread, 0) + 1
-            else:
-                if thread in _precision_readers:
-                    raise RuntimeError(
-                        "Cannot change precision inside a strict XPU inference scope"
-                    )
-                _precision_waiters += 1
-                try:
-                    _precision_condition.wait_for(
-                        lambda: _precision_writer is None and not _precision_readers
-                    )
-                    _precision_writer = thread
-                finally:
-                    _precision_waiters -= 1
-    try:
-        yield
-    finally:
-        with _precision_condition:
+    @contextmanager
+    def __call__(self, readonly: bool):
+        thread = get_ident()
+        with self.condition:
+            nested_writer = self.writer == thread
             if not nested_writer:
                 if readonly:
-                    _precision_readers[thread] -= 1
-                    if not _precision_readers[thread]:
-                        del _precision_readers[thread]
+                    self.condition.wait_for(
+                        lambda: (
+                            self.writer is None
+                            and (not self.waiters or thread in self.readers)
+                        )
+                    )
+                    self.readers[thread] = self.readers.get(thread, 0) + 1
                 else:
-                    _precision_writer = None
-                _precision_condition.notify_all()
+                    if thread in self.readers:
+                        raise RuntimeError(
+                            "Cannot change precision inside a strict XPU inference scope"
+                        )
+                    self.waiters += 1
+                    try:
+                        self.condition.wait_for(
+                            lambda: self.writer is None and not self.readers
+                        )
+                        self.writer = thread
+                    finally:
+                        self.waiters -= 1
+        try:
+            yield
+        finally:
+            with self.condition:
+                if not nested_writer:
+                    if readonly:
+                        self.readers[thread] -= 1
+                        if not self.readers[thread]:
+                            del self.readers[thread]
+                    else:
+                        self.writer = None
+                    self.condition.notify_all()
+
+
+_precision_guard = _PrecisionGuard()
 
 
 @contextmanager

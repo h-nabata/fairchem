@@ -248,12 +248,11 @@ def run_md(
         blocks = 0
         if sample_stream is not None:
             Path(sample_stream).parent.mkdir(parents=True, exist_ok=True)
-        stream_context = (
+        with (
             Path(sample_stream).open("w")
             if sample_stream is not None
             else nullcontext(None)
-        )
-        with stream_context as stream:
+        ) as stream:
             sample(0, reference_energy, stream)
             for first_step in range(1, steps + 1, timing_block):
                 last_step = min(first_step + timing_block - 1, steps)
