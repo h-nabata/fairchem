@@ -7,6 +7,7 @@ LICENSE file in the root directory of this source tree.
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, Any
 
 from fairchem.core.regression_suite.spec.schema import (
@@ -31,8 +32,13 @@ def _channel_ratios(
     statistics_key, value_key = CHANNEL_FIELDS[channel]
     if smoke:
         # A few smoke clusters are each held to the loosest statistic's limit.
-        observed = max(
+        values = (
             float(cluster[value_key]) for cluster in candidate["decision_clusters"]
+        )
+        # Python's max can discard a trailing NaN. Every smoke cluster must pass.
+        observed = max(
+            (value if math.isfinite(value) else math.inf for value in values),
+            default=math.inf,
         )
         return {"maximum_cluster_mean": observed / limits[statistics[-1]]}
     return {

@@ -364,12 +364,22 @@ class AtomicData:
 
     @property
     def masses(self) -> torch.Tensor:
-        if hasattr(self, "atomic_masses"):
-            return self.atomic_masses
-        masses = torch.as_tensor(
-            atomic_masses, dtype=self.pos.dtype, device=self.atomic_numbers.device
+        options = {"dtype": self.pos.dtype, "device": self.pos.device}
+        explicit = self.get("atomic_masses")
+        if torch.is_tensor(explicit):  # serialized tensor overrides
+            return explicit.to(**options)
+        if explicit is not None and None not in explicit:
+            return torch.tensor(explicit, **options)
+        defaults = torch.as_tensor(atomic_masses, **options)[self.atomic_numbers]
+        if explicit is None:
+            return defaults
+        mask = torch.tensor(
+            [mass is not None for mass in explicit], device=self.pos.device
         )
-        return masses[self.atomic_numbers]
+        values = torch.tensor(
+            [0 if mass is None else mass for mass in explicit], **options
+        )
+        return torch.where(mask, values, defaults)
 
     def assign_batch_stats(self, slices, cumsum, cat_dims, natoms_list):
         self.__slices__ = slices
@@ -688,14 +698,19 @@ class AtomicData:
         )
 
         if atoms.has("masses"):
-            data["atomic_masses"] = torch.tensor(
-                atoms.get_masses(), dtype=target_dtype, device="cpu"
-            )
+            # Keep ASE's double-precision isotope values as host metadata even
+            # when all model tensors are converted to FP32 or moved to a GPU.
+            data["atomic_masses"] = tuple(atoms.get_masses().tolist())
         return data
 
     def to_ase_single(self) -> ase.Atoms:
         assert self.num_graphs == 1, "Data object must contain a single graph."
 
+        masses = self.get("atomic_masses")
+        if torch.is_tensor(masses):
+            masses = masses.detach().cpu().tolist()
+        if masses is not None and all(value is None for value in masses):
+            masses = None  # preserve the original absence of an ASE masses array
         atoms = ase.Atoms(
             numbers=self.atomic_numbers.cpu().numpy(),
             positions=self.pos.detach().cpu().numpy(),
@@ -703,9 +718,7 @@ class AtomicData:
             pbc=self.pbc.squeeze().tolist(),
             constraint=FixAtoms(mask=self.fixed.bool().tolist()),
             tags=self.tags.cpu().numpy(),
-            masses=self.masses.detach().cpu().numpy()
-            if hasattr(self, "atomic_masses")
-            else None,
+            masses=masses,
         )
 
         if self.__keys__.intersection(["energy", "forces", "stress"]):
@@ -1132,10 +1145,15 @@ def atomicdata_list_to_batch(
         normalized = []
         for source in data_list:
             item = source
-            if "atomic_masses" not in source:
+            values = source.get("atomic_masses")
+            if not isinstance(values, tuple):
                 item = copy.copy(source)
                 item.__keys__ = set(item.__keys__)
-                item["atomic_masses"] = item.masses
+                if torch.is_tensor(values):
+                    values = values.detach().cpu().tolist()
+                item["atomic_masses"] = (
+                    (None,) * item.num_nodes if values is None else tuple(values)
+                )
             normalized.append(item)
         data_list = normalized
     if any(item.cell_offsets.dtype == torch.long for item in data_list):

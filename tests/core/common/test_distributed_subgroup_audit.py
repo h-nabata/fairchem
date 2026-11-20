@@ -55,10 +55,9 @@ def _subgroup_worker(rank, rendezvous):
 
 @pytest.mark.skipif(not dist.is_gloo_available(), reason="requires Gloo")
 def test_nonzero_subgroup_reductions_and_one_way_exchange(tmp_path):
-    mp.start_processes(
+    mp.spawn(
         _subgroup_worker,
         ((tmp_path / "store").as_uri(),),
         nprocs=4,
-        start_method="fork",
         join=True,
     )

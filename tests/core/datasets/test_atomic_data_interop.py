@@ -434,3 +434,20 @@ def test_from_dict_preserves_normalized_sid_and_batch():
     torch.testing.assert_close(rebuilt.batch, torch.tensor([0]))
     fields = atomicdata_list_to_batch([rebuilt, rebuilt]).to_dict()
     assert AtomicData.from_dict({**fields, "sid": None}).sid == ["", ""]
+
+
+def test_ase_isotope_bits_and_implicit_masses_survive_model_dtype_changes():
+    from ase import Atoms
+
+    natural = Atoms("HO")
+    heavy = Atoms("HO", masses=[2.01410177812, 17.99915961286])
+    data = atomicdata_list_to_batch([AtomicData.from_ase(a) for a in (natural, heavy)])
+    for dtype in (torch.float64, torch.float32, torch.float64):
+        data.to(dtype=dtype)
+        expected = np.concatenate((natural.get_masses(), heavy.get_masses()))
+        torch.testing.assert_close(
+            data.masses, torch.tensor(expected, dtype=dtype), rtol=0, atol=0
+        )
+        for restored, original in zip(data.to_ase(), (natural, heavy), strict=True):
+            assert restored.has("masses") == original.has("masses")
+            np.testing.assert_array_equal(restored.get_masses(), original.get_masses())

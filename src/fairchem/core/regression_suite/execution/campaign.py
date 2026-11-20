@@ -621,6 +621,18 @@ def launch_baseline(
             scope,
         )
     ]
+    if any(phase.tasks for phase in phases) and (
+        (baseline["state"] == "partial" and not baseline.get("checkpoint_sha256"))
+        or any(
+            state["state"] == "complete"
+            and not state["identity"].get("checkpoint_sha256")
+            for state in fragments.values()
+        )
+    ):
+        raise RegressionSchemaError(
+            "cannot add runs to legacy fragments without a checkpoint SHA-256; "
+            "choose a new baseline name to record all runs with verified weights"
+        )
     if submit:
         job_ids = {
             job_id

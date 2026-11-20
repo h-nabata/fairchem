@@ -311,3 +311,31 @@ def test_valid_structure_mean_includes_perfect_predictions():
     assert (
         loss(pred, torch.zeros_like(pred), mask, torch.ones(3, dtype=torch.long)) == 2
     )
+
+
+def test_legacy_pickled_multitask_loss_resolves_bound_reducers(tmp_path):
+    from fairchem.core.modules.loss import DDPMTLoss
+
+    loss = DDPMTLoss(MSELoss(), reduction="per_structure")
+    loss.reduction_map = {
+        name: getattr(loss, name) for name in ("mean", "sum", "per_structure")
+    }
+    path = tmp_path / "legacy.pt"
+    torch.save(loss, path)
+    loaded = torch.load(path, weights_only=False)
+    predictions = torch.tensor([1.0, 0.0, 2.0])
+    mask = torch.tensor([True, True, False])
+    natoms = torch.tensor([1, 2])
+    errors = torch.where(mask, predictions.square(), 0)
+    assert (
+        loaded.reduction_map["sum"](predictions, mask, mask.sum(), errors, natoms) == 1
+    )
+    assert (
+        loaded.reduction_map["mean"](predictions, mask, mask.sum(), errors, natoms)
+        == 0.5
+    )
+    assert (
+        loaded.reduction_map["per_structure"](predictions, mask, None, errors, natoms)
+        == 1
+    )
+    assert loaded(predictions, torch.zeros_like(predictions), mask, natoms) == 1

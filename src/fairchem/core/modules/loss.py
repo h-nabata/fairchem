@@ -136,9 +136,36 @@ class DDPMTLoss(nn.Module):
         if self.reduction == "mean":
             return self.coefficient * self._ddp_mean(valid.sum(), loss.sum(), invalid)
 
+        return self.coefficient * self._structure_mean(
+            loss,
+            valid,
+            natoms,
+            invalid,
+            include_perfect=self.reduction == "per_valid_structure",
+        )
+
+    # Whole-module checkpoints written before the row-mask fix pickle a dict
+    # of bound reduction methods. Keep those public names and signatures.
+    def sum(self, input, mult_mask, num_samples, loss, natoms):
+        return loss.sum()
+
+    def mean(self, input, mult_mask, num_samples, loss, natoms):
+        return self._ddp_mean(num_samples, loss.sum(), ~loss.isfinite().all())
+
+    def per_structure(self, input, mult_mask, num_samples, loss, natoms):
+        valid = mult_mask.bool().reshape(loss.shape[0], -1)
+        if loss.ndim == 1:
+            valid = valid.any(dim=1)
+        else:
+            valid = valid.expand(loss.shape[0], loss.shape[1:].numel()).reshape_as(loss)
+        return self._structure_mean(
+            loss, valid, natoms, ~loss.isfinite().all(), include_perfect=False
+        )
+
+    def _structure_mean(self, loss, valid, natoms, invalid, *, include_perfect):
         # Compute the mean over valid components in each structure. A vector
         # norm contributes one observation per atom; MSE contributes one per axis.
-        struct = torch.arange(natoms.numel(), device=input.device)
+        struct = torch.arange(natoms.numel(), device=loss.device)
         if loss.size(0) != natoms.numel():
             struct = torch.repeat_interleave(struct, natoms, output_size=loss.shape[0])
         row_shape = (loss.size(0), loss.shape[1:].numel())
@@ -150,8 +177,8 @@ class DDPMTLoss(nn.Module):
         )
         means = totals / counts.clamp_min(1)
         # Existing checkpoints/configs retain the historical nonzero-loss divisor.
-        structures = means != 0 if self.reduction == "per_structure" else counts > 0
-        return self.coefficient * self._ddp_mean(structures.sum(), means.sum(), invalid)
+        structures = counts > 0 if include_perfect else means != 0
+        return self._ddp_mean(structures.sum(), means.sum(), invalid)
 
 
 @registry.register_loss("mae")

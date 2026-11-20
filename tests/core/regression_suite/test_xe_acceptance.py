@@ -135,6 +135,14 @@ def test_fast_checks_tier_and_rejects_substituted_reference(tmp_path, monkeypatc
     assert full["limiting"]["tier"] == "FP64"
 
     assert smoke._fast_suite(**args, minimum_tier="TF32")["passed"]
+    clusters = check["summary"]["observables"]["energy"]["decision_clusters"]
+    clusters.append(
+        {**clusters[0], "cluster_id": "invalid", "primary_mean": float("nan")}
+    )
+    nonfinite = qualify_suite(
+        check["summary"], baseline["suites"]["test"], smoke=True, minimum_tier="TF32"
+    )
+    assert not nonfinite["passed"]
 
     (tmp_path / "reference").rename(tmp_path / "original")
     make_reference("reference", 0.5)
