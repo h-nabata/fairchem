@@ -216,12 +216,14 @@ def write_reference(
 
 def load_reference(
     directory: str | ArtifactPath,
+    *,
+    expected_hash: str | None = None,
 ) -> tuple[dict[str, Any], list[MeasurementRecord]]:
     """
     Load a verified reference artifact and its full-resolution records.
     """
     source = Path(directory) if isinstance(directory, str) else directory
-    manifest = load_reference_manifest(source)
+    manifest = load_reference_manifest(source, expected_hash=expected_hash)
     with (
         (source / str(manifest["values_file"])).open("rb") as handle,
         np.load(handle, allow_pickle=False) as arrays,
@@ -236,7 +238,9 @@ def load_reference(
     return manifest, records
 
 
-def load_reference_manifest(directory: str | ArtifactPath) -> dict[str, Any]:
+def load_reference_manifest(
+    directory: str | ArtifactPath, *, expected_hash: str | None = None
+) -> dict[str, Any]:
     """
     Load a reference manifest after checking its hash and its values file.
     """
@@ -245,6 +249,8 @@ def load_reference_manifest(directory: str | ArtifactPath) -> dict[str, Any]:
     if not manifest_path.is_file():
         raise RegressionSchemaError(f"reference is incomplete: {source}")
     manifest = load_sealed(manifest_path, "reference_hash", "reference manifest")
+    if expected_hash is not None and manifest["reference_hash"] != expected_hash:
+        raise RegressionSchemaError("reference hash differs from the pinned baseline")
     if manifest["schema_version"] != SCHEMA_VERSION:
         raise RegressionSchemaError("reference schema version is unsupported")
     values_path = source / str(manifest["values_file"])
@@ -285,7 +291,10 @@ def pack_baseline(artifact_dir: str | Path, destination: str | Path) -> Path:
                 archive.write(root / member, member)
         sealed = zipfile.Path(temporary)
         for entry in payload["suites"].values():
-            load_reference_manifest((sealed / entry["reference"]["manifest"]).parent)
+            load_reference_manifest(
+                (sealed / entry["reference"]["manifest"]).parent,
+                expected_hash=entry["reference"]["reference_hash"],
+            )
             for collection in ("profiles", "verifications"):
                 for run in entry[collection].values():
                     manifest = sealed / run["fragment"]
@@ -318,9 +327,18 @@ def checkout_root() -> Path:
 
 def artifact_root() -> Path:
     """
-    Return ``regression-artifacts/`` in the checkout the suite is imported from.
+    Honor FAIRCHEM_REGRESSION_ROOT, defaulting to checkout or per-user state.
     """
-    return checkout_root() / "regression-artifacts"
+    override = os.environ.get("FAIRCHEM_REGRESSION_ROOT")
+    if override:
+        return Path(override).expanduser().resolve()
+    try:
+        return checkout_root() / "regression-artifacts"
+    except CommandError:
+        return (
+            Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
+            / "fairchem/regression"
+        )
 
 
 def report_directory(root: str | Path, profile: str, mode: str, run: str) -> Path:

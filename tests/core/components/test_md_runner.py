@@ -8,7 +8,10 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 import json
+import multiprocessing
+import os
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -17,15 +20,25 @@ import ase.io
 import numpy as np
 import numpy.testing as npt
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from ase import Atoms, units
 from ase.build import bulk
 from ase.calculators.emt import EMT
-from ase.constraints import FixAtoms, FixCom, FixSubsetCom
+from ase.constraints import (
+    FixAtoms,
+    FixBondLengths,
+    FixCom,
+    FixInternals,
+    FixLinearTriatomic,
+    FixSubsetCom,
+)
 from ase.io import Trajectory
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
 from ase.md.verlet import VelocityVerlet
 
+from fairchem.core.components import runner as runner_module
 from fairchem.core.components.calculate import (
     BerendsenNPT,
     BussiThermostat,
@@ -39,6 +52,7 @@ from fairchem.core.components.calculate import (
 from fairchem.core.components.calculate.simulation_tools.initialization import (
     initialize_momenta,
 )
+from fairchem.core.datasets.common_structures import get_slab_adsorbate
 
 
 @dataclass
@@ -463,6 +477,8 @@ class TestMDRunner:
         results = runner.calculate(job_num=0, num_jobs=1)
 
         assert results["stopped_by_stopfair"] is True
+        assert results["total_steps"] == 20
+        assert results["target_steps"] == 100
         assert (checkpoint_dir / "checkpoint.extxyz").exists()
         assert (checkpoint_dir / "md_state.json").exists()
         assert not stopfair_path.exists()
@@ -516,10 +532,6 @@ class TestTrajectoryFrame:
         Run MD on an OC20-style slab+adsorbate and verify the parquet
         trajectory preserves tags, FixAtoms constraints, and charge/spin.
         """
-        from ase.constraints import FixAtoms
-
-        from fairchem.core.datasets.common_structures import get_slab_adsorbate
-
         atoms = get_slab_adsorbate()
 
         assert np.any(atoms.get_tags() != 0)
@@ -560,9 +572,7 @@ class TestTrajectoryFrame:
                     return np.stack(val).astype(dtype)
                 return np.asarray(val, dtype=dtype)
 
-            from ase import Atoms as _Atoms
-
-            reconstructed = _Atoms(
+            reconstructed = Atoms(
                 numbers=_to_array(d["atomic_numbers"], dtype=int),
                 positions=_to_array(d["positions"]),
                 cell=_to_array(d["cell"]),
@@ -591,3 +601,325 @@ class TestTrajectoryFrame:
 
             assert reconstructed.info["charge"] == atoms.info["charge"]
             assert reconstructed.info["spin"] == atoms.info["spin"]
+
+
+@pytest.mark.parametrize("interval", [1, 3])
+def test_nullable_trajectory_schema(tmp_path, interval):
+    atoms = Atoms("H")
+    path = tmp_path / "trajectory.parquet"
+    with ParquetTrajectoryWriter(path, interval) as writer:
+        for step, sid, energy in [(0, None, None), (1, 12, -3.25), (2, "12", None)]:
+            frame = TrajectoryFrame.from_atoms(atoms, step)
+            frame.sid, frame.energy = sid, energy
+            writer.append(frame)
+    rows = pq.read_table(path).to_pylist()
+    assert [row["energy"] for row in rows] == [None, -3.25, None]
+    assert [row["sid"] for row in rows] == [None, "12", "12"]
+    assert [row["sid_integer"] for row in rows] == [None, 12, None]
+    assert all(row["stress"] is None for row in rows)
+
+
+def test_frame_reports_calculation_failure():
+    atoms = Atoms("H2", positions=[[0, 0, 0], [0.75, 0, 0]], calculator=EMT())
+    atoms.info["sid"] = "molecule"
+    frame = TrajectoryFrame.from_atoms(atoms, step=7)
+    assert frame.stress is None
+    assert frame.energy is not None
+
+    class BrokenEMT(EMT):
+        def get_forces(self, atoms=None):
+            raise RuntimeError("force kernel failed")
+
+    atoms.calc = BrokenEMT()
+    with pytest.raises(RuntimeError, match="force kernel failed") as error:
+        TrajectoryFrame.from_atoms(atoms, step=7)
+    assert "forces at MD step 7, sid='molecule'" in error.value.__notes__[0]
+
+
+@pytest.mark.parametrize(
+    "thermostat",
+    [
+        BussiThermostat(300, 25, thermostat_seed=17),
+        LangevinThermostat(300, 0.01, thermostat_seed=17),
+    ],
+)
+def test_thermostat_rng_isolation(cu_atoms, thermostat):
+    first = thermostat.build(cu_atoms.copy(), 1.0)
+    other = thermostat.build(cu_atoms.copy(), 1.0)
+    state = thermostat.save_state(first)
+    assert first.rng is not other.rng
+    expected = first.rng.normal(size=4)
+    npt.assert_array_equal(other.rng.normal(size=4), expected)
+    expected_next = first.rng.normal(size=4)
+    thermostat.restore_state(first, state)
+    npt.assert_array_equal(first.rng.normal(size=4), expected)
+    npt.assert_array_equal(other.rng.normal(size=4), expected_next)
+
+
+def test_langevin_new_and_legacy_com_modes(cu_atoms):
+    thermostat = LangevinThermostat(300, 0.01, thermostat_seed=3)
+    dyn = thermostat.build(cu_atoms.copy(), 1.0)
+    assert not dyn.fix_com
+    assert dyn.atoms.get_number_of_degrees_of_freedom() == 3 * len(cu_atoms) - 3
+    state = thermostat.save_state(dyn)
+    state.pop("use_fix_com_constraint")
+    state["rng_state"].pop("version")
+    assert thermostat.build_for_restart(cu_atoms.copy(), 1.0, state).fix_com
+    with pytest.raises(ValueError, match="at least two mobile atoms"):
+        thermostat.build(Atoms("Cu", constraint=FixCom()), 1.0)
+
+
+def test_same_directory_restarts_match_constrained_nve(tmp_path):
+    atoms = Atoms("H2", positions=[[0.11532198765, 0, 0], [0.879652345678, 0, 0]])
+    atoms.set_momenta([[0.012, 0.031, 0], [-0.012, -0.026, 0]])
+    atoms.set_constraint(FixBondLengths([[0, 1]]))
+    atoms.new_array("labels_int32", np.array([1, 2], dtype=np.int32))
+    reference_dir = tmp_path / "reference"
+    reference_dir.mkdir()
+
+    def run(directory, steps, load=False, interval=None):
+        checkpoint = tmp_path / "checkpoint"
+        runner = MDRunner(
+            EMT(),
+            VelocityVerletThermostat(),
+            atoms.copy(),
+            steps=steps,
+            timestep_fs=0.5,
+            trajectory_interval=1,
+            checkpoint_interval=interval,
+        )
+        runner._job_config = _create_mock_job_config(str(directory), str(checkpoint))
+        if load:
+            runner.load_state(str(checkpoint))
+            assert isinstance(runner._atoms.constraints[0], FixBondLengths)
+            assert runner._atoms.arrays["labels_int32"].dtype == np.int32
+        return runner, runner.calculate()
+
+    reference, _ = run(reference_dir, 9)
+    run(tmp_path, 5, interval=3)  # Published output extends beyond the checkpoint.
+    run(tmp_path, 8, load=True, interval=4)
+    resumed, result = run(tmp_path, 9, load=True)
+    assert result["total_steps"] == result["target_steps"] == 9
+    reference_frames = pd.read_parquet(reference_dir / "trajectory.parquet")
+    frames = pd.read_parquet(tmp_path / "trajectory.parquet")
+    assert list(frames.step) == list(range(10))
+    for name in ("energy", "kinetic_energy"):
+        npt.assert_array_equal(frames[name], reference_frames[name])
+    for name in ("positions", "forces"):
+        for actual, expected in zip(frames[name], reference_frames[name], strict=True):
+            npt.assert_array_equal(np.vstack(actual), np.vstack(expected))
+    npt.assert_array_equal(reference._atoms.get_momenta(), resumed._atoms.get_momenta())
+    npt.assert_array_equal(
+        reference._atoms.constraints[0].bondlengths,
+        resumed._atoms.constraints[0].bondlengths,
+    )
+
+
+def test_stopfair_failed_publication_keeps_old_state(tmp_path, cu_atoms, monkeypatch):
+    checkpoint = tmp_path / "checkpoint"
+    runner = MDRunner(
+        EMT(),
+        VelocityVerletThermostat(),
+        cu_atoms,
+        steps=3,
+        heartbeat_interval=1,
+        checkpoint_interval=1,
+    )
+    runner._job_config = _create_mock_job_config(str(tmp_path), str(checkpoint))
+    runner.calculate()
+    previous = (checkpoint / "md_state.json").read_bytes()
+    trajectory = (tmp_path / "trajectory.parquet").read_bytes()
+    sentinel = tmp_path / "STOPFAIR"
+    sentinel.touch()
+    real_replace = runner_module.os.replace
+
+    def fail_publish(src, dst):
+        if Path(dst).name == ".current":
+            raise OSError("injected failure")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(runner_module.os, "replace", fail_publish)
+    with pytest.raises(OSError, match="Failed to save STOPFAIR"):
+        runner.calculate()
+    assert sentinel.is_file()
+    assert (checkpoint / "md_state.json").read_bytes() == previous
+    assert (tmp_path / "trajectory.parquet").read_bytes() == trajectory
+
+
+@pytest.mark.parametrize(
+    "boundary", ["writing", "before_publish", "after_publish", "cleanup"]
+)
+def test_checkpoint_survives_process_exit(tmp_path, boundary):
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("Fault injection requires POSIX fork")
+
+    class State(runner_module.PreemptableMixin):
+        def __init__(self, value):
+            self.value = value
+
+        def save_simulation_state(self, directory, is_preemption):
+            (directory / "a").write_text(self.value)
+            if self.value == "interrupted" and boundary == "writing":
+                os._exit(7)
+            (directory / "b").write_text(self.value)
+
+        def load_simulation_state(self, directory):
+            self.loaded = [(directory / key).read_text() for key in ("a", "b")]
+
+    checkpoint = tmp_path / "cp"
+    assert State("first").save_state(str(checkpoint))
+    assert State("good").save_state(str(checkpoint))
+
+    def interrupt():
+        replace, remove = os.replace, runner_module.shutil.rmtree
+
+        def publish(src, dst):
+            if Path(dst).name == ".current" and boundary == "before_publish":
+                os._exit(7)
+            replace(src, dst)
+            if Path(dst).name == ".current" and boundary == "after_publish":
+                os._exit(7)
+
+        def cleanup(*args, **kwargs):
+            if boundary == "cleanup":
+                os._exit(7)
+            remove(*args, **kwargs)
+
+        os.replace, runner_module.shutil.rmtree = publish, cleanup
+        State("interrupted").save_state(str(checkpoint))
+
+    client = multiprocessing.get_context("fork").Process(target=interrupt)
+    client.start()
+    client.join(timeout=15)
+    assert client.exitcode == 7
+    reader = State("reader")
+    reader.load_state(str(checkpoint))
+    expected = "interrupted" if boundary in {"after_publish", "cleanup"} else "good"
+    assert reader.loaded == [expected, expected]
+    assert State("recovered").save_state(str(checkpoint))
+    assert len(list((checkpoint / ".generations").glob("state-*"))) == 2
+
+
+def test_resume_legacy_parquet_preserves_prefix_and_optional_columns(tmp_path):
+    path = tmp_path / "trajectory.parquet"
+    # Legacy schema depends on which properties appeared in the first frame.
+    pq.write_table(
+        pa.table({"step": [0, 2, 4], "sid": [2, 2, 2], "energy": [None, -2.0, 14.0]}),
+        path,
+    )
+    frame = TrajectoryFrame.from_atoms(Atoms("H"), 4)
+    frame.sid = "new"
+    with ParquetTrajectoryWriter(path) as writer:
+        writer.resume(step=2, state=None)
+        writer.append(frame)
+    result = pq.read_table(path).to_pylist()
+    assert [row["step"] for row in result] == [0, 2, 4]
+    assert [row["energy"] for row in result] == [None, -2.0, None]
+    assert [row["sid"] for row in result] == ["2", "2", "new"]
+    assert [row["sid_integer"] for row in result] == [2, 2, None]
+
+
+@pytest.mark.parametrize(
+    "thermostat",
+    [
+        BussiThermostat(300, 25, thermostat_seed=47),
+        LangevinThermostat(300, 0.01, thermostat_seed=47),
+    ],
+)
+def test_interleaved_and_resumed_stochastic_paths(cu_atoms, thermostat):
+    def new_atoms():
+        atoms = cu_atoms.copy()
+        atoms.calc = EMT()
+        return atoms
+
+    reference = thermostat.build(new_atoms(), 0.5)
+    reference.run(6)
+    a, b = (thermostat.build(new_atoms(), 0.5) for _ in range(2))
+    for step in range(6):
+        a.run(1)
+        b.run(1)
+        if step == 2:
+            state = json.loads(json.dumps(thermostat.save_state(a)))
+            restored = a.atoms.copy()
+            restored.calc = EMT()
+            a = thermostat.build_for_restart(restored, 0.5, state)
+    npt.assert_array_equal(b.atoms.positions, reference.atoms.positions)
+    npt.assert_array_equal(b.atoms.get_momenta(), reference.atoms.get_momenta())
+    # A fresh EMT neighbor list can accumulate the same forces in a different order.
+    npt.assert_allclose(
+        a.atoms.positions, reference.atoms.positions, rtol=0, atol=1e-13
+    )
+    npt.assert_allclose(
+        a.atoms.get_momenta(), reference.atoms.get_momenta(), rtol=0, atol=1e-13
+    )
+
+
+@pytest.mark.parametrize(
+    "constraint",
+    [
+        FixInternals(bonds=[[None, [0, 1]]]),
+        FixLinearTriatomic([[0, 1, 2]]),
+    ],
+)
+def test_restart_retains_original_constraint_targets(tmp_path, constraint):
+    atoms = Atoms("OCO", positions=[[0, 0, 0], [1.15, 0, 0], [2.29, 0, 0]])
+    atoms.set_constraint(constraint)
+    constraint.initialize(atoms)
+    # The restart geometry lies slightly away from the original target.
+    atoms.positions[0, 0] = 1e-10
+    runner = MDRunner(EMT(), VelocityVerletThermostat(), atoms, steps=1)
+    runner._job_config = _create_mock_job_config(str(tmp_path))
+    runner._dyn = runner.thermostat.build(atoms, 1.0)
+    assert runner.save_state(str(tmp_path / "checkpoint"))
+    runner.load_state(str(tmp_path / "checkpoint"))
+    restored = runner._atoms.constraints[0]
+    npt.assert_array_equal(atoms.positions, runner._atoms.positions)
+    if isinstance(constraint, FixInternals):
+        restored.initialize(runner._atoms)
+        assert (
+            restored.constraints[0].targetvalue == constraint.constraints[0].targetvalue
+        )
+    else:
+        npt.assert_array_equal(restored.bondlengths, constraint.bondlengths)
+        npt.assert_array_equal(restored.C1, constraint.C1)
+
+
+def test_unsupported_constraint_is_reported(tmp_path, caplog):
+    class CustomConstraint(FixAtoms):
+        pass
+
+    atoms = Atoms("Cu", constraint=CustomConstraint(indices=[0]))
+    runner = MDRunner(EMT(), VelocityVerletThermostat(), atoms, steps=1)
+    runner._job_config = _create_mock_job_config(str(tmp_path))
+    runner._dyn = runner.thermostat.build(atoms, 1.0)
+    assert not runner.save_state(str(tmp_path / "checkpoint"))
+    assert "Cannot checkpoint constraint CustomConstraint" in caplog.text
+
+
+def test_parallel_checkpoint_publication_preserves_shards(tmp_path):
+    class Job(runner_module.PreemptableMixin):
+        checkpoint_shard_pattern = "shard-*.json"
+
+        def __init__(self, index):
+            self.index = index
+
+        def save_simulation_state(self, directory, is_preemption):
+            (directory / f"shard-{self.index}.json").write_text(str(self.index))
+            (directory / "step").write_text(str(self.index))
+
+        def load_simulation_state(self, directory):
+            step = int((directory / "step").read_text())
+            assert int((directory / f"shard-{step}.json").read_text()) == step
+
+    checkpoint = str(tmp_path / "cp")
+
+    def save_then_read(i):
+        job = Job(i)
+        assert job.save_state(checkpoint)
+        job.load_state(checkpoint)
+
+    with ThreadPoolExecutor(max_workers=4) as workers:
+        list(workers.map(save_then_read, range(8)))
+    assert sorted(
+        int(path.read_text()) for path in Path(checkpoint).glob("shard-*.json")
+    ) == list(range(8))

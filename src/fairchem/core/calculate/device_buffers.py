@@ -8,14 +8,16 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 import copy
-import types
 from contextlib import nullcontext
-from dataclasses import dataclass, field, fields, is_dataclass
+from dataclasses import dataclass, field
 from numbers import Integral
 from threading import RLock
 from typing import TYPE_CHECKING
 
 import torch
+
+from fairchem.core.common.distutils import parse_device
+from fairchem.core.datasets.atomic_data import _tensors
 
 if TYPE_CHECKING:
     from fairchem.core.datasets.atomic_data import AtomicData
@@ -28,41 +30,6 @@ def device_scope(device: torch.device):
     if device.type == "cpu":
         return nullcontext()
     return getattr(torch, device.type).device(device)
-
-
-def _tensors(value, path=(), seen=None):
-    if seen is None:
-        seen = set()
-    if isinstance(value, torch.Tensor):
-        yield path, value
-        return
-    if id(value) in seen:
-        return
-    seen.add(id(value))
-    if isinstance(value, dict):
-        for index, (key, item) in enumerate(value.items()):
-            # Paths identify reusable buffers, without retaining caller-owned
-            # keys (which can themselves be tensors or mutable objects).
-            yield from _tensors(key, (*path, ("key", index)), seen)
-            yield from _tensors(item, (*path, ("value", index)), seen)
-    elif isinstance(value, (list, tuple)):
-        for index, item in enumerate(value):
-            yield from _tensors(item, (*path, ("item", index)), seen)
-    elif is_dataclass(value) and not isinstance(value, type):
-        for item in fields(value):
-            yield from _tensors(
-                getattr(value, item.name), (*path, ("field", item.name)), seen
-            )
-        if hasattr(value, "__dict__"):
-            yield from _tensors(vars(value), (*path, "attributes"), seen)
-    elif (
-        hasattr(value, "__dict__")
-        and not isinstance(value, (type, types.ModuleType))
-        and not callable(value)
-    ):
-        # Match AtomicData.clone's object traversal: these tensors also need
-        # admission checks, staging copies and cross-thread stream tracking.
-        yield from _tensors(vars(value), (*path, "attributes"), seen)
 
 
 @dataclass
@@ -180,7 +147,7 @@ class DeviceBatchStager:
         max_batch_bytes: int = 256 * 1024 * 1024,
         pack_small_tensors: bool = False,
     ) -> None:
-        self.device = torch.device(device)
+        self.device = parse_device(device)
         if self.device.type not in {"cpu", "cuda", "xpu"}:
             raise ValueError("Staging supports CPU, CUDA and XPU devices")
         if self.device.type != "cpu" and self.device.index is None:
@@ -285,10 +252,7 @@ class DeviceBatchStager:
             return self._stage(batch)
 
     def _stage(self, batch):
-        unique = {}
-        for path, tensor in _tensors(vars(batch)):
-            unique.setdefault(id(tensor), (path, tensor))
-        tensors = list(unique.values())
+        tensors = list(_tensors(batch, strict=True))
         if any(t.device.type != "cpu" for _, t in tensors):
             raise ValueError("Staging inputs must be on CPU")
         if any(t.requires_grad for _, t in tensors):
@@ -383,7 +347,17 @@ class DeviceBatchStager:
             raise
         slot.leased = True
         try:
+            # Custom __deepcopy__ implementations must substitute the admitted
+            # views from memo, just like standard Python containers do.
+            staged_ids = {id(view) for view in memo.values()}
             result = copy.deepcopy(batch, memo)
+            if any(
+                id(tensor) not in staged_ids
+                for _, tensor in _tensors(result, strict=True)
+            ):
+                raise ValueError(
+                    "Metadata copy introduced a tensor outside the staged buffers"
+                )
         except BaseException:
             # A failed metadata copy has no consumer. Keep the ready event so
             # later reuse still waits for the already queued transfer.

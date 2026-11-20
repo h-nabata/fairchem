@@ -41,6 +41,8 @@ from fairchem.core.common.distutils import (
     CURRENT_DEVICE_TYPE_STR,
     assign_device_for_local_rank,
     get_device_for_local_rank,
+    parse_device,
+    resolve_cuda_device,
     resolve_xpu_device,
     setup_env_local_multi_gpu,
 )
@@ -409,12 +411,20 @@ def _copy_data_to_device(
 def _has_standard_mole_check(model) -> bool:
     """Inspect hooks without retaining the current model across a fallback reload."""
     from fairchem.core.models.base import HydraModel
-    from fairchem.core.models.uma.escn_moe import eSCNMDMoeBackbone
+    from fairchem.core.models.uma.escn_moe import _MergedDatasetHead, eSCNMDMoeBackbone
 
     return (
         getattr(model.on_predict_check, "__func__", None) is HydraModel.on_predict_check
         and getattr(model.backbone.on_predict_check, "__func__", None)
         is eSCNMDMoeBackbone.on_predict_check
+        # A routing-key hit covers the built-in dataset checks. A custom
+        # head may check other, uncached request metadata.
+        and all(
+            getattr(head, "on_predict_check", None) is None
+            or getattr(head.on_predict_check, "__func__", None)
+            is _MergedDatasetHead.on_predict_check
+            for head in model.output_heads.values()
+        )
     )
 
 
@@ -938,18 +948,12 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         Setup inference device.
         """
         device = str(device)
-        if device in ("cpu", "cuda"):
-            self.device = get_device_for_local_rank() if device == "cuda" else "cpu"
+        if device == "cpu":
+            self.device = "cpu"
             return
-        requested = torch.device(device)
+        requested = parse_device(device)
         if requested.type == "cuda":
-            if not torch.cuda.is_available():
-                raise RuntimeError(
-                    f"Requested CUDA device {requested}, but CUDA is unavailable"
-                )
-            if requested.index is None or requested.index >= torch.cuda.device_count():
-                raise ValueError(f"CUDA device index {requested.index} is unavailable")
-            self.device = str(requested)
+            self.device = resolve_cuda_device(requested)
             return
         if requested.type != "xpu":
             raise ValueError(
@@ -2045,7 +2049,7 @@ class ParallelMLIPPredictUnit(MLIPPredictUnitProtocol):
 
         super().__init__()
 
-        device_type = torch.device(device).type
+        device_type = parse_device(device).type
         if device_type == "xpu":
             raise ValueError("ParallelMLIPPredictUnit does not support XPU devices.")
         if device_type not in {"cpu", "cuda"}:

@@ -42,3 +42,9 @@ def test_invalid_xpu_index_does_not_fall_back_to_current_device(monkeypatch):
     monkeypatch.setattr(torch.xpu, "device_count", lambda: 2)
     with pytest.raises(ValueError, match="Requested xpu:2"):
         distutils.get_device_for_local_rank()
+
+
+@pytest.mark.parametrize("request_name", ["xpu:128", "xpu:255", "xpu:256", "cuda:257"])
+def test_device_ordinal_checked_before_torch_representation(request_name):
+    with pytest.raises(ValueError, match="index"):
+        distutils.parse_device(request_name)

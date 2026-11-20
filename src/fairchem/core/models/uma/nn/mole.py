@@ -8,6 +8,8 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import lru_cache
 from itertools import accumulate, pairwise
@@ -59,11 +61,18 @@ def _pnorm(x):
     return torch.nn.functional.normalize(x.abs() + 2 / x.shape[0], p=1.0, dim=1)
 
 
+def _pnorm_per_system(x):
+    """Batch-independent L1 routing with a total smoothing weight of two per system."""
+    return torch.nn.functional.normalize(x.abs() + 2 / x.shape[1], p=1.0, dim=1)
+
+
 def norm_str_to_fn(act):
     if act == "softmax":
         return _softmax
     elif act == "pnorm":
         return _pnorm
+    elif act == "pnorm_per_system":
+        return _pnorm_per_system
     else:
         raise ValueError
 
@@ -217,6 +226,20 @@ def init_linear(num_experts, use_bias, out_features, in_features):
     return weights, bias
 
 
+# A checkpoint can outlive later forward calls on the same module. Keep its
+# routing local to the invocation, including when autograd replays the chunk.
+_checkpoint_routes = ContextVar("mole_checkpoint_routes", default=None)
+
+
+@contextmanager
+def checkpoint_routes(routes):
+    token = _checkpoint_routes.set(routes)
+    try:
+        yield
+    finally:
+        _checkpoint_routes.reset(token)
+
+
 class MOLEDGL(torch.nn.Module):
     def __init__(
         self,
@@ -246,22 +269,29 @@ class MOLEDGL(torch.nn.Module):
                 "Use mole_layer_type='pytorch' for Intel GPU inference."
             )
         fairchem_cpp = _load_fairchem_cpp()
+        state = self.global_mole_tensors
+        routes = _checkpoint_routes.get()
+        route = routes.get(id(state)) if routes else None
+        sizes = state.mole_sizes
+        if route is not None:
+            state = route
+            # segment_mm consumes one length per system for this chunk.
+            ends = (route.mole_sizes.cumsum(0) - route.ac_start_idx).clamp(0, len(x))
+            sizes = ends.diff(prepend=ends.new_zeros(1)).to(route.mole_sizes.dtype)
         with torch.autocast(device_type=self.weights.device.type, enabled=False):
             weights = torch.einsum(
                 "eoi, be->bio",
                 self.weights,
-                self.global_mole_tensors.expert_mixing_coefficients,
+                state.expert_mixing_coefficients,
             )
         x_shape = x.shape
         if x.ndim == 2:
-            r = fairchem_cpp.ops.segment_mm(
-                x, weights, self.global_mole_tensors.mole_sizes
-            )
+            r = fairchem_cpp.ops.segment_mm(x, weights, sizes)
         elif x.ndim == 3:
             r = fairchem_cpp.ops.segment_mm(
                 x.reshape(-1, x_shape[-1]),
                 weights,
-                self.global_mole_tensors.mole_sizes * x_shape[1],
+                sizes * x_shape[1],
             ).reshape(*x_shape[:-1], -1)
         else:
             raise ValueError("x.ndim not in (2,3) not allowed")
@@ -317,11 +347,13 @@ class MOLE(torch.nn.Module):
         return linear
 
     def forward(self, x):
-        ac_start_idx = self.global_mole_tensors.ac_start_idx
-        assert len(self.global_mole_tensors.mole_sizes) > 0
-        start_idxs, plan = self.global_mole_tensors.row_layout(
-            ac_start_idx, x.shape[0], x.device
-        )
+        state = self.global_mole_tensors
+        routes = _checkpoint_routes.get()
+        if routes:
+            state = routes.get(id(state), state)
+        ac_start_idx = state.ac_start_idx
+        assert len(state.mole_sizes) > 0
+        start_idxs, plan = state.row_layout(ac_start_idx, x.shape[0], x.device)
         mole_intervals = pairwise(start_idxs)
 
         # Because activation checkpointing can chunk the inputs, we need to only compute
@@ -359,9 +391,7 @@ class MOLE(torch.nn.Module):
             weights = torch.einsum(
                 "eoi, be->boi",
                 self.weights,
-                self.global_mole_tensors.expert_mixing_coefficients[
-                    first_system:last_system
-                ],
+                state.expert_mixing_coefficients[first_system:last_system],
             )
 
         if plan is not None:

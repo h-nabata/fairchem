@@ -116,6 +116,10 @@ def baseline_provenance(
         "baseline_id": baseline["baseline_id"],
         "created_at": baseline.get("created_at"),
         "checkpoint": baseline["checkpoint"],
+        "checkpoint_sha256": baseline.get("checkpoint_sha256"),
+        "checkpoint_verification": "sha256"
+        if baseline.get("checkpoint_sha256")
+        else "name_only",
         "campaign": baseline["campaign"],
         "scope": baseline["scope"],
         "device": baseline["device"],

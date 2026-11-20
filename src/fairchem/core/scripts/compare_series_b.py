@@ -30,6 +30,7 @@ from ase.io import read
 
 from fairchem.core.calculate import pretrained_mlip
 from fairchem.core.calculate.series_b_workflows import _release_failed_workflow
+from fairchem.core.common.distutils import parse_device
 from fairchem.core.datasets.atomic_data import AtomicData
 from fairchem.core.units.mlip_unit.api.inference import (
     inference_settings_xpu,
@@ -65,13 +66,13 @@ def _properties(properties):
 
 
 def _synchronize(device):
-    device = torch.device(device)
+    device = parse_device(device)
     if device.type in ("cuda", "xpu"):
         getattr(torch, device.type).synchronize(device)
 
 
 def _allocator(device, *, reset=False):
-    device = torch.device(device)
+    device = parse_device(device)
     if device.type not in ("cuda", "xpu"):
         return None
     backend = getattr(torch, device.type)
@@ -145,7 +146,7 @@ def _max_deviation(value, anchor):
 def _measure_predictor(
     predictor, data, properties, warmup, repeats, measure_memory, anchor=None
 ):
-    device = torch.device(predictor.device)
+    device = parse_device(predictor.device)
     natoms = int(data.natoms.sum().item())
     if data.natoms.numel() != 1 or natoms < 1:
         raise ValueError("Comparison requires exactly one nonempty atomic system")
@@ -373,7 +374,7 @@ def compare_predictors(
         raise ValueError("Reference and candidate must use the same base precision")
     if reference.inference_settings.compile or reference.inference_settings.xpu_graph:
         raise ValueError("The reference predictor must use eager execution")
-    if torch.device(reference.device) != torch.device(candidate.device):
+    if parse_device(reference.device) != parse_device(candidate.device):
         raise ValueError("Reference and candidate must use the same device")
     properties = _properties(properties)
     warmup, repeats = _count("warmup", warmup, 0), _count("repeats", repeats, 1)
@@ -432,7 +433,7 @@ def run_comparison(
         series_b = SeriesBSettings(**series_b)
     properties = _properties(properties)
     warmup, repeats = _count("warmup", warmup, 0), _count("repeats", repeats, 1)
-    device = torch.device(device)
+    device = parse_device(device)
     if device.type not in ("cpu", "cuda", "xpu"):
         raise ValueError("Comparison device must be CPU, CUDA or XPU")
     if device.type != "cpu" and not getattr(torch, device.type).is_available():

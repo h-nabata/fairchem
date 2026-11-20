@@ -240,11 +240,14 @@ def alternative_candidates(
             source = source_pos[source_start : source_start + ns]
             target = target_pos[target_start : target_start + nt]
             if ns and nt and method == "bvh":
-                si, ti = _bvh_candidates(source, target, radius)
+                result = _bvh_candidates(
+                    source, target, radius, return_distances=return_distances
+                )
+                si, ti = result[:2]
                 source_parts.append(si + source_start)
                 target_parts.append(ti + target_start)
                 if return_distances:
-                    distances.append((target[ti] - source[si]).square().sum(-1))
+                    distances.append(result[2])
             elif ns and nt:
                 source_width = min(ns, _PAIR_TILE)
                 target_width = max(1, _PAIR_TILE // source_width)
@@ -275,13 +278,38 @@ def alternative_candidates(
     return pair
 
 
-def _bvh_candidates(source_pos, target_pos, radius):
+def morton_keys(coordinates):
+    """Interleave three unsigned ten-bit integer coordinates into a sorting key."""
+    spread = (coordinates | (coordinates << 16)) & 0x030000FF
+    spread = (spread | (spread << 8)) & 0x0300F00F
+    spread = (spread | (spread << 4)) & 0x030C30C3
+    spread = (spread | (spread << 2)) & 0x09249249
+    return spread[:, 0] | (spread[:, 1] << 1) | (spread[:, 2] << 2)
+
+
+def _bvh_candidates(source_pos, target_pos, radius, *, return_distances=False):
+    if len(source_pos) > _PAIR_TILE:
+        # One very large source cloud can exceed the work budget even for a
+        # single target. Emit exact hits from bounded subtrees in target order.
+        parts = []
+        for first in range(0, len(source_pos), _PAIR_TILE):
+            result = _bvh_candidates(
+                source_pos[first : first + _PAIR_TILE],
+                target_pos,
+                radius,
+                return_distances=return_distances,
+            )
+            parts.append((result[0] + first, *result[1:]))
+        concatenated = [torch.cat(column) for column in zip(*parts, strict=True)]
+        order = concatenated[1].argsort(stable=True)
+        return tuple(column[order] for column in concatenated)
     device = source_pos.device
-    # Median-split tree with eight sources per leaf. Exact bounding boxes, not
-    # the longest-axis sorting heuristic, decide which leaves may be discarded.
+    # Spatially group all three dimensions before building the leaf boxes.
     leaf_size = 8
-    axis = int((source_pos.amax(0) - source_pos.amin(0)).argmax())
-    order = torch.argsort(source_pos[:, axis], stable=True)
+    lo, hi = source_pos.amin(0), source_pos.amax(0)
+    extent = (hi - lo).clamp_min(torch.finfo(source_pos.dtype).tiny)
+    coords = (((source_pos - lo) / extent) * 1023).clamp(0, 1023).long()
+    order = torch.argsort(morton_keys(coords), stable=True)
     leaves = 1 << max(
         0, math.ceil(math.log2(max(1, math.ceil(len(order) / leaf_size))))
     )
@@ -298,31 +326,45 @@ def _bvh_candidates(source_pos, target_pos, radius):
         lower[width // 2 : width] = lower[width : 2 * width].view(-1, 2, 3).amin(1)
         upper[width // 2 : width] = upper[width : 2 * width].view(-1, 2, 3).amax(1)
         width //= 2
-    targets = torch.arange(len(target_pos), device=device)
-    nodes = torch.ones_like(targets)
     margin = (
         32
         * torch.finfo(source_pos.dtype).eps
         * (source_pos.abs().amax() + target_pos.abs().amax() + radius + 1)
     )
-    for _ in range(leaves.bit_length()):
-        positions = target_pos[targets]
-        delta = (lower[nodes] - positions).clamp(min=0) + (
-            positions - upper[nodes]
-        ).clamp(min=0)
-        keep = delta.square().sum(-1) <= (radius + margin) ** 2
-        targets, nodes = targets[keep], nodes[keep]
-        del positions, delta, keep
-        if width == leaves:
-            break
-        width *= 2
-        targets = targets.repeat_interleave(2)
-        nodes = (nodes[:, None] * 2 + torch.tensor([0, 1], device=device)).flatten()
-    leaf_indices = (nodes[:, None] - leaves) * leaf_size + torch.arange(
-        leaf_size, device=device
-    )
-    valid = leaf_indices < len(order)
-    expanded_targets = targets[:, None].expand(-1, leaf_size)[valid]
-    expanded_sources = order[leaf_indices[valid]]
-    sort = torch.argsort(expanded_targets, stable=True)
-    return expanded_sources[sort], expanded_targets[sort]
+    source_parts, target_parts, squared_parts = [], [], []
+    tile = max(1, _PAIR_TILE // (leaves * leaf_size))
+    for start in range(0, len(target_pos), tile):
+        targets = torch.arange(start, min(start + tile, len(target_pos)), device=device)
+        nodes = torch.ones_like(targets)
+        width = 1
+        for _ in range(leaves.bit_length()):
+            positions = target_pos[targets]
+            delta = (lower[nodes] - positions).clamp(min=0) + (
+                positions - upper[nodes]
+            ).clamp(min=0)
+            keep = delta.square().sum(-1) <= (radius + margin) ** 2
+            targets, nodes = targets[keep], nodes[keep]
+            del positions, delta, keep
+            if width == leaves:
+                break
+            width *= 2
+            targets = targets.repeat_interleave(2)
+            nodes = (nodes[:, None] * 2 + torch.tensor([0, 1], device=device)).flatten()
+        leaf_indices = (nodes[:, None] - leaves) * leaf_size + torch.arange(
+            leaf_size, device=device
+        )
+        valid = leaf_indices < len(order)
+        expanded_targets = targets[:, None].expand(-1, leaf_size)[valid]
+        expanded_sources = order[leaf_indices[valid]]
+        squared = (
+            (target_pos[expanded_targets] - source_pos[expanded_sources])
+            .square()
+            .sum(-1)
+        )
+        keep = squared <= radius * radius
+        source_parts.append(expanded_sources[keep])
+        target_parts.append(expanded_targets[keep])
+        if return_distances:
+            squared_parts.append(squared[keep])
+    pair = torch.cat(source_parts), torch.cat(target_parts)
+    return (*pair, torch.cat(squared_parts)) if return_distances else pair

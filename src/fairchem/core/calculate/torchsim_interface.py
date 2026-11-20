@@ -17,6 +17,7 @@ import torch
 
 from fairchem.core import pretrained_mlip
 from fairchem.core.calculate.ase_calculator import UMATask
+from fairchem.core.common.distutils import parse_device
 from fairchem.core.common.utils import setup_imports, setup_logging
 from fairchem.core.datasets.atomic_data import AtomicData
 from fairchem.core.units.mlip_unit.api.inference import (
@@ -534,7 +535,7 @@ class FairChemModel(_TSModelInterface):
                 device = "xpu"
             else:
                 device = "cpu"
-        self._device = torch.device(device)
+        self._device = parse_device(device)
         device_str = str(self._device)
         self.task_name = task_name
 

@@ -198,9 +198,9 @@ def test_scaled_positions_lammps_vs_ase(cell_name, cell, fractional_positions):
         wrapped_original = normalize_fractional(fractional_positions)
         wrapped_ase = normalize_fractional(ase_scaled_positions)
 
-        assert np.allclose(wrapped_ase, wrapped_original, atol=1e-5), (
-            f"Cell {cell_name}: Scaled positions don't match.\nASE: {wrapped_ase}\nOriginal: {wrapped_original}"
-        )
+        assert np.allclose(
+            wrapped_ase, wrapped_original, atol=1e-5
+        ), f"Cell {cell_name}: Scaled positions don't match.\nASE: {wrapped_ase}\nOriginal: {wrapped_original}"
 
         lmp.close()
 
@@ -254,7 +254,8 @@ def test_lammps_hydra_entrypoint_startup(monkeypatch, tmp_path):
         lammps_input_path,
         task_name,
         charge=0,
-        spin=0,
+        spin=None,
+        compute_stress=True,
     ):
         run_args.update(
             {
@@ -293,8 +294,8 @@ def test_lammps_hydra_entrypoint_startup(monkeypatch, tmp_path):
 
     assert run_args["lammps_input_path"] == "lammps_in_example.file"
     assert run_args["task_name"] == "omol"
-    assert run_args["charge"] == 0
-    assert run_args["spin"] == 1
+    assert run_args["charge"] is None
+    assert run_args["spin"] is None
     assert not hasattr(lammps_state["lmp"], "_predictor")
 
 
@@ -335,6 +336,7 @@ def test_callback_mass_table_and_fp64(monkeypatch):
 
 def test_lammps_callback_repeated_runs_preserve_types_and_precision(tmp_path):
     from types import SimpleNamespace
+
     import torch
 
     class Predictor:
@@ -353,24 +355,23 @@ def test_lammps_callback_repeated_runs_preserve_types_and_precision(tmp_path):
     predictor = Predictor()
     script = tmp_path / "two_runs.in"
     script.write_text(
-        "\n".join(
-            (
-                "units metal",
-                "atom_style atomic",
-                "boundary p p p",
-                "region sim block 0 5 0 5 0 5",
-                "create_box 1 sim",
-                "create_atoms 1 single 1 1 1",
-                "mass 1 12.011",
-                "pair_style zero 2.0",
-                "pair_coeff * *",
-                "run 0",
-                "mass 1 15.999",
-                "run 0",
-            )
-        )
+        """units metal
+atom_style atomic
+boundary p p p
+region sim block 0 5 0 5 0 5
+create_box 1 sim
+create_atoms 1 single 1 1 1
+mass 1 12.011
+pair_style zero 2.0
+pair_coeff * *
+run 0
+mass 1 15.999
+run 0
+"""
     )
-    lmp = lammps_fc.run_lammps_with_fairchem(predictor, str(script), "omat")
+    lmp = lammps_fc.run_lammps_with_fairchem(
+        predictor, str(script), "omat", compute_stress=False
+    )
     try:
         assert predictor.steps == [
             ([6], torch.float64, ("energy", "forces")),

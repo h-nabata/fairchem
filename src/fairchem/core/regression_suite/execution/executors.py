@@ -13,7 +13,7 @@ import pickle
 import queue
 import subprocess
 import sys
-import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -56,7 +56,7 @@ def create_slurm_executor(
         "timeout_min": resources.timeout_hr * 60,
         "slurm_partition": resources.partition,
         "gpus_per_node": gpus_per_node
-        if device.split(":")[0] in {"cuda", "xpu"}
+        if device.split(":", maxsplit=1)[0] in {"cuda", "xpu"}
         else 0,
         "cpus_per_task": resources.cpus_per_task,
         "tasks_per_node": 1,
@@ -190,6 +190,7 @@ class LocalExecutor:
         pending: queue.Queue[int] = queue.Queue()
         for index in range(len(calls)):
             pending.put(index)
+        completed: set[int] = set()
         failures: dict[int, Path] = {}
 
         def worker(slot: dict[str, str]) -> None:
@@ -223,16 +224,27 @@ class LocalExecutor:
                 state = "done" if result.returncode == 0 else "FAILED"
                 if result.returncode:
                     failures[index] = log
+                completed.add(index)
                 print(
                     f"[local] {self.name} {index + 1}/{len(calls)} {state}: {log}",
                     flush=True,
                 )
 
-        threads = [threading.Thread(target=worker, args=(slot,)) for slot in slots]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
+        if not calls:
+            return []
+        with ThreadPoolExecutor(max_workers=len(slots)) as pool:
+            futures = [pool.submit(worker, slot) for slot in slots]
+        # Every worker has stopped. Report tasks that never produced a result,
+        # including the task that raised and any it left queued.
+        for future in futures:
+            try:
+                future.result()
+            except Exception as error:
+                unfinished = sorted(set(range(len(calls))) - completed)
+                raise CommandError(
+                    f"Local {self.name} worker failed; unfinished task indices "
+                    f"{unfinished}: {error}"
+                ) from error
         if failures:
             logs = ", ".join(str(failures[index]) for index in sorted(failures))
             raise CommandError(

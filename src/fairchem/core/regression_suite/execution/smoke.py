@@ -39,7 +39,7 @@ from fairchem.core.regression_suite.execution.runner import (
 )
 from fairchem.core.regression_suite.reporting.check_report import finite_or_none
 from fairchem.core.regression_suite.spec.profiles import profile_config
-from fairchem.core.regression_suite.spec.schema import CHANNEL_FIELDS
+from fairchem.core.regression_suite.spec.schema import CHANNEL_FIELDS, PRECISION_TIERS
 from fairchem.core.regression_suite.suites import load_suite
 
 if TYPE_CHECKING:
@@ -158,6 +158,7 @@ def _fast_suite(
     device: str,
     checkpoint: str,
     checkpoint_id: str,
+    minimum_tier: str | None = None,
 ) -> SuiteCheck:
     """
     Run and qualify one suite's smoke cases against a finalized baseline.
@@ -165,19 +166,32 @@ def _fast_suite(
     started = time.perf_counter()
     root = open_artifact(baseline_dir)
     baseline = load_baseline(root / "baseline.json")
+    required_tier = minimum_tier or profile_config(profile.replace("-", "_")).get(
+        "minimum_tier", "TF32"
+    )
+    if required_tier not in PRECISION_TIERS:
+        raise ValueError(f"unknown minimum tier: {required_tier}")
     records_path, label = _run_smoke_cases(
         suite,
         profile,
         output_dir,
         checkpoint=checkpoint,
         checkpoint_id=checkpoint_id,
+        checkpoint_sha256=baseline.get("checkpoint_sha256"),
         seed=int(baseline["seed"]),
         device=device,
     )
     baseline_suite = baseline["suites"][suite]
     reference_path = (root / baseline_suite["reference"]["manifest"]).parent
-    summary = summarize_run(records_path, reference_path, load_suite(suite))
-    qualification = qualify_suite(summary, baseline_suite, smoke=True)
+    summary = summarize_run(
+        records_path,
+        reference_path,
+        load_suite(suite),
+        reference_hash=baseline_suite["reference"]["reference_hash"],
+    )
+    qualification = qualify_suite(
+        summary, baseline_suite, smoke=True, minimum_tier=required_tier
+    )
     verdicts = {}
     for name in summary["observables"]:
         decision = qualification["observables"].get(name)
@@ -195,7 +209,7 @@ def _fast_suite(
         "reference_path": str(reference_path),
         "summary": summary,
         "status": qualification["status"],
-        "passed": qualification["status"].startswith("SMOKE_PASS"),
+        "passed": qualification["passed"],
         "verdicts": verdicts,
         "qualification": qualification,
         "elapsed_seconds": time.perf_counter() - started,
@@ -254,6 +268,7 @@ def run_quick(
 def run_fast(
     *,
     baseline_dir: str | Path,
+    minimum_tier: str | None = None,
     profile: str,
     suites: Sequence[str],
     output_dir: str | Path,
@@ -280,6 +295,7 @@ def run_fast(
         functools.partial(
             _fast_suite,
             baseline_dir=baseline_root,
+            minimum_tier=minimum_tier,
             profile=profile,
             device=device,
             checkpoint=checkpoint,

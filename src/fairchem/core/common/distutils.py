@@ -199,8 +199,8 @@ def get_rank() -> int:
     return dist.get_rank() if initialized() else 0
 
 
-def get_world_size() -> int:
-    return dist.get_world_size() if initialized() else 1
+def get_world_size(group=None) -> int:
+    return dist.get_world_size(group) if initialized() else 1
 
 
 def is_master() -> bool:
@@ -232,16 +232,18 @@ def broadcast_object_list(
 def all_reduce(
     data, group=dist.group.WORLD, average: bool = False, device=None
 ) -> torch.Tensor:
-    if get_world_size() == 1:
+    if get_world_size(group) == 1:
         return data
     tensor = data
     if not isinstance(data, torch.Tensor):
         tensor = torch.tensor(data)
     if device is not None:
         tensor = tensor.to(device)
+    if average and not (tensor.is_floating_point() or tensor.is_complex()):
+        tensor = tensor.to(torch.get_default_dtype())
     dist.all_reduce(tensor, group=group)
     if average:
-        tensor /= get_world_size()
+        tensor.div_(get_world_size(group))
     if not isinstance(data, torch.Tensor):
         result = tensor.cpu().numpy() if tensor.numel() > 1 else tensor.item()
     else:
@@ -250,14 +252,14 @@ def all_reduce(
 
 
 def all_gather(data, group=dist.group.WORLD, device=None) -> list[torch.Tensor]:
-    if get_world_size() == 1:
+    if group is None and get_world_size() == 1:
         return data
     tensor = data
     if not isinstance(data, torch.Tensor):
         tensor = torch.tensor(data)
     if device is not None:
         tensor = tensor.to(device)
-    tensor_list = [tensor.new_zeros(tensor.shape) for _ in range(get_world_size())]
+    tensor_list = [tensor.new_zeros(tensor.shape) for _ in range(get_world_size(group))]
     dist.all_gather(tensor_list, tensor, group=group)
     if not isinstance(data, torch.Tensor):
         result = [tensor.cpu().numpy() for tensor in tensor_list]
@@ -268,11 +270,15 @@ def all_gather(data, group=dist.group.WORLD, device=None) -> list[torch.Tensor]:
 
 def gather_objects(data: T, group: dist.ProcessGroup = dist.group.WORLD) -> list[T]:
     """Gather a list of pickleable objects into rank 0"""
-    if get_world_size() == 1:
+    if get_world_size(group) == 1:
         return [data]
 
-    output = [None for _ in range(get_world_size())] if is_master() else None
-    dist.gather_object(data, output, group=group, dst=0)
+    output = (
+        [None for _ in range(get_world_size(group))]
+        if dist.get_rank(group) == 0
+        else None
+    )
+    dist.gather_object(data, output, group=group, group_dst=0)
     return output
 
 
@@ -285,9 +291,36 @@ def assign_device_for_local_rank(cpu: bool, local_rank: int) -> None:
         torch.cuda.set_device(local_rank)
 
 
+def parse_device(device: str | torch.device) -> torch.device:
+    """Reject accelerator ordinals that torch.device would truncate to a byte."""
+    raw = str(device)
+    kind, separator, ordinal = raw.partition(":")
+    if (
+        separator
+        and kind in {"cuda", "xpu"}
+        and (not ordinal.isascii() or not ordinal.isdecimal() or int(ordinal) > 127)
+    ):
+        raise ValueError(f"Invalid {kind} device index {ordinal!r}")
+    return torch.device(device)
+
+
+def resolve_cuda_device(device: str | torch.device) -> str:
+    requested = parse_device(device)
+    if requested.type != "cuda":
+        raise ValueError(f"Expected a CUDA device, got {device!r}")
+    if not torch.cuda.is_available():
+        raise RuntimeError(
+            f"Requested CUDA device {requested}, but CUDA is unavailable"
+        )
+    index = torch.cuda.current_device() if requested.index is None else requested.index
+    if not 0 <= index < min(128, torch.cuda.device_count()):
+        raise ValueError(f"CUDA device index {index} is unavailable")
+    return f"cuda:{index}"
+
+
 def resolve_xpu_device(device: str | torch.device) -> str:
     """Validate an Intel device before checkpoint I/O and preserve its ordinal."""
-    requested = torch.device(device)
+    requested = parse_device(device)
     if requested.type != "xpu":
         raise ValueError(f"Expected an XPU device, got {device!r}")
     if not hasattr(torch, "xpu") or not torch.xpu.is_available():
@@ -296,7 +329,7 @@ def resolve_xpu_device(device: str | torch.device) -> str:
             "Install an XPU-enabled PyTorch build and a compatible Intel GPU driver."
         )
     index = torch.xpu.current_device() if requested.index is None else requested.index
-    if index >= torch.xpu.device_count():
+    if not 0 <= index < min(128, torch.xpu.device_count()):
         raise ValueError(
             f"Requested xpu:{index}, but only {torch.xpu.device_count()} "
             "XPU device(s) are available."
@@ -307,18 +340,15 @@ def resolve_xpu_device(device: str | torch.device) -> str:
 def get_device_for_local_rank() -> str:
     if os.environ.get(CURRENT_DEVICE_TYPE_STR) is None:
         os.environ[CURRENT_DEVICE_TYPE_STR] = (
-            f"cuda:{torch.cuda.current_device()}"
-            if torch.cuda.is_available()
-            else "cpu"
+            resolve_cuda_device("cuda") if torch.cuda.is_available() else "cpu"
         )
         logging.warning(
             f"WARNING: assign_device_for_local_rank was never called, automatically defaulting to using {os.environ[CURRENT_DEVICE_TYPE_STR]}"
         )
         return os.environ[CURRENT_DEVICE_TYPE_STR]
 
-    if "cuda" in os.environ[CURRENT_DEVICE_TYPE_STR]:
-        assert torch.cuda.is_available(), "cannot set cpu=false and no cuda available!"
-        return f"cuda:{torch.cuda.current_device()}"
+    if os.environ[CURRENT_DEVICE_TYPE_STR].partition(":")[0] == "cuda":
+        return resolve_cuda_device(os.environ[CURRENT_DEVICE_TYPE_STR])
     elif os.environ[CURRENT_DEVICE_TYPE_STR].split(":", 1)[0] == "xpu":
         return resolve_xpu_device(os.environ[CURRENT_DEVICE_TYPE_STR])
     elif os.environ[CURRENT_DEVICE_TYPE_STR] == "cpu":

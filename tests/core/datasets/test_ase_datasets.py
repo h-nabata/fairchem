@@ -265,7 +265,11 @@ def test_trajectory_frame_selection_cache_and_path_spaces(
 
     def transform(atoms):
         transforms.append(len(atoms))
+        # A rigid translation preserves this synthetic scalar label. Reattach
+        # it explicitly to the transformed state, as a label-aware transform.
+        energy = atoms.get_potential_energy()
         atoms.positions += 0.5
+        atoms.calc = SinglePointCalculator(atoms, energy=energy)
         return atoms
 
     dataset = AseReadMultiStructureDataset(cfg, atoms_transform=transform)
@@ -293,3 +297,17 @@ def test_trajectory_frame_selection_cache_and_path_spaces(
     assert np.allclose(second.pos, 0.5)
     dataset[dataset.ids.index(f"{paths[1]} 3")]
     assert reads == [1, -1, 3]
+
+
+def test_db_ids_distinguish_sources_and_preserve_explicit_identifiers(tmp_path):
+    from ase import Atoms
+    from ase.db import connect
+
+    for name in ("first", "second"):
+        db = connect(tmp_path / f"{name}.db")
+        db.write(Atoms("H"))
+        db.write(Atoms("He"), sid=17)
+    dataset = AseDBDataset({"src": str(tmp_path)})
+    assert dataset[0].sid[0].endswith("first.db#1")
+    assert dataset[2].sid[0].endswith("second.db#1")
+    assert dataset[1].sid == ["17"]

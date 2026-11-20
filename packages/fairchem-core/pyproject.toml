@@ -9,6 +9,7 @@ license = {text = "MIT License"}
 dynamic = ["version", "readme"]
 requires-python = ">=3.11, <3.15"
 dependencies = [
+    "filelock",
     "torch>=2.13.0,<2.16",
     "numpy>=2.0,<2.5",
     "scipy>=1.15.0",
@@ -122,6 +123,9 @@ directory = "../../dist-core"
 
 [tool.hatch.build.targets.sdist]
 only-include = ["src/fairchem/core", "src/fairchem/experimental"]
+
+[tool.hatch.build.targets.sdist.force-include]
+"../../README.md" = "README.md"
 
 [tool.hatch.build.targets.wheel]
 sources = ["src"]

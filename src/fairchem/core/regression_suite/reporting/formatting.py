@@ -109,8 +109,12 @@ EXECUTION_HEADERS = (
     "Accelerator",
     "Compute capability",
     "CPU architecture",
+    "CPU model",
+    "Available CPUs",
+    "PyTorch threads",
     "PyTorch",
-    "CUDA",
+    "Accelerator runtime",
+    "XPU driver",
     "Suites",
 )
 
@@ -131,8 +135,14 @@ def execution_rows(report: Mapping[str, Any]) -> list[list[Any]]:
                 environment["accelerator_name"] or environment["device_type"],
                 "-" if capability is None else f"{capability[0]}.{capability[1]}",
                 environment["cpu_architecture"],
+                environment.get("cpu_model") or "-",
+                environment.get("cpu_count") or "-",
+                environment.get("torch_num_threads") or "-",
                 environment["torch_version"],
-                environment["cuda_version"] or "-",
+                environment.get("xpu_runtime_version")
+                or environment["cuda_version"]
+                or "-",
+                environment.get("xpu_driver_version") or "-",
                 len(execution["suites"]),
             ]
         )
@@ -339,6 +349,13 @@ def provenance_lines(provenance: Mapping[str, Any]) -> list[str]:
         f"  {provenance['checkpoint']}, {provenance['campaign']} campaign, "
         f"{provenance['scope']} scope, {provenance['device']}",
     ]
+    if "checkpoint_sha256" in provenance:
+        digest = provenance["checkpoint_sha256"]
+        lines.append(
+            f"  Checkpoint SHA-256: {digest}"
+            if digest
+            else "  Legacy baseline: checkpoint identity verified by name only"
+        )
     software = [
         f"{label} {provenance[key]}"
         for label, key in (

@@ -29,7 +29,9 @@ from fairchem.core.common.parallelism.graph_partition import (
 from fairchem.core.common.registry import registry
 from fairchem.core.common.utils import conditional_grad
 from fairchem.core.graph.compute import (
-    edge_cell_offsets,
+    canonicalize_external_edges,
+    external_edge_geometry,
+    filter_edges_by_node_partition,
     generate_graph,
     spatially_order_graph,
 )
@@ -716,6 +718,12 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
             # create the partitions
             atomic_numbers_full = data_dict["atomic_numbers_full"]
             gp_config = gp_utils.get_gp_config()
+            world_size = gp_utils.get_gp_world_size()
+            if len(atomic_numbers_full) < world_size:
+                raise ValueError(
+                    f"Graph parallelism needs at least one atom per rank; "
+                    f"got {len(atomic_numbers_full)} atoms for {world_size} ranks"
+                )
 
             if gp_config.mode == "all_to_all":
                 # All-to-all: compute rank_assignments FIRST, then derive
@@ -728,7 +736,7 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
                     pos=data_dict["pos"],
                     total_atoms=natoms,
                     device=atomic_numbers_full.device,
-                    world_size=gp_utils.get_gp_world_size(),
+                    world_size=world_size,
                     rank=gp_utils.get_gp_rank(),
                     strategy=PartitionStrategy(gp_config.partition),
                 )
@@ -791,32 +799,26 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
                 "edge_index" in data_dict
             ), "otf_graph is false, need to provide edge_index as input!"
 
-            # Compute shifts from cell offsets
-            if len(data_dict["natoms"]) == 1:
-                # Single system: use matmul (compile-friendly, no data-dependent ops)
-                shifts = data_dict["cell_offsets"].to(
-                    data_dict["cell"].dtype
-                ) @ data_dict["cell"].squeeze(0)
-            else:
-                shifts = edge_cell_offsets(
-                    data_dict["cell"],
-                    data_dict["cell_offsets"],
-                    data_dict["nedges"],
+            edges = data_dict["edge_index"]
+            cells = data_dict["cell_offsets"]
+            counts = data_dict["nedges"]
+            if len(counts) > 1:
+                # AtomicData tensors may have been edited after construction.
+                # Keep system segments and image offsets aligned at consumption.
+                edges, cells = canonicalize_external_edges(
+                    data_dict["batch"], edges, cells, counts
                 )
-            edge_distance_vec = (
-                data_dict["pos"][data_dict["edge_index"][0]]
-                - data_dict["pos"][data_dict["edge_index"][1]]
-                + shifts
-            )  # [n_edges, 3]
-            # pylint: disable=E1102
-            edge_distance = torch.linalg.norm(
-                edge_distance_vec, dim=-1, keepdim=False
-            )  # [n_edges, 1]
-
+            if node_partition is not None:
+                edges, cells, counts = filter_edges_by_node_partition(
+                    node_partition, edges, cells, counts, len(data_dict["pos"])
+                )
+            vectors, _ = external_edge_geometry(
+                data_dict["pos"], edges, data_dict["cell"], cells, counts
+            )
             graph_dict = {
-                "edge_index": data_dict["edge_index"],
-                "edge_distance": edge_distance,
-                "edge_distance_vec": edge_distance_vec,
+                "edge_index": edges,
+                "edge_distance": vectors.norm(dim=-1),
+                "edge_distance_vec": vectors,
             }
 
         if getattr(self, "graph_edge_order", "original") == "spatial":

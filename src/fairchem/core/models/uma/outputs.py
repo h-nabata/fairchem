@@ -279,25 +279,47 @@ def compute_forces_and_stress(
         - forces: Shape [N, 3].
         - stress: Shape [num_systems, 9] (flattened 3x3 tensor).
     """
-    grads = _energy_gradients(energy_part, (pos, cell), create_graph=training)
+    cell64 = cell.double()
+    # Explicit 3-D triple product also works without an FP64 LU backend.
+    a, b, c = cell64.unbind(dim=1)
+    volume = (a * torch.linalg.cross(b, c)).sum(-1).abs()
+    valid_volume = (volume > 0) & volume.isfinite()
+    if torch.compiler.is_compiling():
+        torch._assert_async(
+            valid_volume.all(), "Stress requires a finite, nonzero cell volume"
+        )
+    elif not bool(valid_volume.all()):
+        invalid = (~valid_volume).nonzero().flatten().tolist()
+        raise ValueError(
+            f"Stress requires a finite, nonzero cell volume for systems {invalid}"
+        )
 
+    grads = _energy_gradients(energy_part, (pos, cell), create_graph=training)
     num_systems = cell.shape[0]
 
-    # Compute pos_virial from LOCAL (unreduced) gradients so that
-    # reduce_node_to_system performs the single correct GP all-reduce.
-    # Using already-reduced gradients here would cause double-reduction
-    # since reduce_node_to_system also calls reduce_from_model_parallel_region.
-    if num_systems == 1 and not compensated_reduction_enabled():
-        # Round each product at the input precision, as in the batched path.
-        # Reduce one [N,3] row at a time and communicate only the final [1,3,3].
-        pos_virial = torch.stack(
-            [(g[:, None] * pos).sum(0, dtype=torch.float64) for g in grads[0].unbind(1)]
-        ).unsqueeze(0)
+    # The strict virial needs FP64 products as well as an FP64 sum: large
+    # opposite terms can lose the entire force moment before accumulation.
+    if compensated_reduction_enabled():
+        per_atom = grads[0].unsqueeze(2) * pos.unsqueeze(1)
+        pos_virial, _ = reduce_node_to_system(per_atom, batch, num_systems)
+    else:
+        g, r = grads[0].double(), pos.double()
+        if num_systems == 1:
+            pos_virial = torch.stack(
+                [(col[:, None] * r).sum(0) for col in g.unbind(1)]
+            ).unsqueeze(0)
+        else:
+            # Limit temporaries to three components per atom, even for large
+            # batches. Communicate the completed virial only once per GP rank.
+            pos_virial = torch.stack(
+                [
+                    r.new_zeros(num_systems, 3).index_add_(0, batch, col[:, None] * r)
+                    for col in g.unbind(1)
+                ],
+                dim=1,
+            )
         if gp_utils.initialized():
             pos_virial = gp_utils.reduce_from_model_parallel_region(pos_virial)
-    else:
-        pos_virial_per_atom = grads[0].unsqueeze(2) * pos.unsqueeze(1)
-        pos_virial, _ = reduce_node_to_system(pos_virial_per_atom, batch, num_systems)
 
     # Now all-reduce gradients for forces and cell_virial
     if gp_utils.initialized():
@@ -307,10 +329,10 @@ def compute_forces_and_stress(
         grad_pos, grad_cell = grads[0], grads[1]
 
     forces = torch.neg(grad_pos)
-    cell_virial = cell.mT @ grad_cell  # [B, 3, 3]
+    # Keep this small contraction in portable FP64 pointwise/reduction ops.
+    cell_virial = (cell64.unsqueeze(3) * grad_cell.double().unsqueeze(2)).sum(1)
 
     virial = (pos_virial + pos_virial.mT + cell_virial + cell_virial.mT) / 2
-    volume = torch.det(cell).abs().unsqueeze(-1)
     stress = virial / volume.view(-1, 1, 1)
     stress = stress.view(-1, 9)
 

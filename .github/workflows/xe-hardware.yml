@@ -68,11 +68,19 @@ jobs:
         run: |
           test -f "$BASELINE"
           test -n "$CHECKPOINT_ID"
-          for profile in xpu xpu-fp64 xpu-int8; do
+          status=0
+          for pair in xpu:FP32 xpu-fp64:FP64 xpu-int8:TF32; do
+            profile=${pair%:*}
+            tier=${pair#*:}
             python -m fairchem.core.regression_suite fast "$profile" --run-on local --device xpu:1 \
               --suite prediction-fidelity --baseline "$BASELINE" --checkpoint "$MODEL" \
-              --checkpoint-id "$CHECKPOINT_ID" --no-wandb --format json > "results/reference-$profile.json"
+              --minimum-tier "$tier" --checkpoint-id "$CHECKPOINT_ID" --no-wandb --format json > "results/reference-$profile.json" || status=1
           done
+          exit "$status"
+      - name: Record omitted physical-reference comparison
+        if: vars.XE_B70_BASELINE == ''
+        run: |
+          echo 'Pinned physical-reference comparison was not run (XE_B70_BASELINE is unset).' >> "$GITHUB_STEP_SUMMARY"
       - name: Measure single-card and independent dual-card batch throughput
         run: |
           for count in 1 2; do

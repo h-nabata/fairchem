@@ -19,7 +19,8 @@ from fairchem.core.regression_suite.spec.structures import frame_identities
 
 # The molecules are shared with the physical-constraint suite.
 _STRUCTURES = frame_identities(
-    Path(__file__).parents[1] / "physical_constraints/structures/molecules.extxyz.xz"
+    Path(__file__).parents[1] / "physical_constraints/structures/molecules.extxyz.xz",
+    mass_dependent=True,
 )
 
 

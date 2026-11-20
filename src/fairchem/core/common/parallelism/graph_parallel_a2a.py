@@ -51,10 +51,18 @@ def _safe_all_to_all(
                 # Local copy
                 if input_list[r].numel() > 0:
                     output_list[r].copy_(input_list[r])
-            elif input_list[r].numel() > 0 or output_list[r].numel() > 0:
-                # Skip zero-length P2P ops to avoid potential hangs
-                ops.append(dist.P2POp(dist.isend, input_list[r], r, group=group))
-                ops.append(dist.P2POp(dist.irecv, output_list[r], r, group=group))
+            else:
+                if input_list[r].numel():
+                    ops.append(
+                        dist.P2POp(dist.isend, input_list[r], group=group, group_peer=r)
+                    )
+                if output_list[r].numel():
+                    ops.append(
+                        dist.P2POp(
+                            dist.irecv, output_list[r], group=group, group_peer=r
+                        )
+                    )
+
         if ops:
             reqs = dist.batch_isend_irecv(ops)
             for req in reqs:

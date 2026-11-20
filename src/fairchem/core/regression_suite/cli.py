@@ -14,6 +14,7 @@ import functools
 import json
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TextIO
 
@@ -89,6 +90,7 @@ from fairchem.core.regression_suite.reporting.wandb_report import (
 )
 from fairchem.core.regression_suite.spec.profiles import resolve_profile
 from fairchem.core.regression_suite.spec.schema import (
+    PRECISION_TIERS,
     PROFILE_TIERS,
     CommandError,
     RegressionSchemaError,
@@ -105,7 +107,8 @@ if TYPE_CHECKING:
 
 
 def _timestamp() -> str:
-    return datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%SZ")
+    stamp = datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%SZ")
+    return f"{stamp}-{uuid.uuid4().hex}"
 
 
 def _short_commit(repo_dir: Path) -> str:
@@ -479,6 +482,7 @@ def _fast(args: argparse.Namespace, settings: DictConfig, output: TextIO) -> int
         group=baseline_run_directory(resolved.path).name,
         baseline=baseline_provenance(baseline, resolved.path, suites),
         baseline_dir=resolved.path,
+        minimum_tier=args.minimum_tier,
         profile=profile,
         suites=suites,
         checkpoint=args.checkpoint,
@@ -803,6 +807,11 @@ def _parser() -> argparse.ArgumentParser:
         "--reference",
         default="fp32",
         help="profile to compare with (default: fp32)",
+    )
+    checks["fast"].add_argument(
+        "--minimum-tier",
+        choices=PRECISION_TIERS,
+        help="minimum acceptable calibrated accuracy tier (default: profile policy)",
     )
     for command in ("fast", "full"):
         checks[command].add_argument("--baseline", help=_BASELINE_HELP)

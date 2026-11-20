@@ -17,6 +17,8 @@ from typing import Any
 
 import torch
 
+from fairchem.core.common.distutils import parse_device
+
 _TRITON_SEED_CACHE = "FAIRCHEM_TRITON_SEED_CACHE_DIR"
 
 
@@ -24,8 +26,28 @@ def execution_environment(device: str) -> dict[str, Any]:
     """
     Describe the execution architecture without node-specific identity.
     """
-    parsed = torch.device(device)
+    parsed = parse_device(device)
+    try:
+        cpuinfo = Path("/proc/cpuinfo").read_text()
+    except OSError:
+        cpuinfo = ""
+    cpu_model = next(
+        (
+            line.partition(":")[2].strip()
+            for line in cpuinfo.splitlines()
+            if line.partition(":")[0].strip() in {"model name", "Hardware"}
+        ),
+        platform.processor() or None,
+    )
     result: dict[str, Any] = {
+        "cpu_model": cpu_model,
+        "cpu_count": len(os.sched_getaffinity(0))
+        if hasattr(os, "sched_getaffinity")
+        else os.cpu_count(),
+        "torch_num_threads": torch.get_num_threads(),
+        "torch_num_interop_threads": torch.get_num_interop_threads(),
+        "omp_num_threads": os.environ.get("OMP_NUM_THREADS"),
+        "mkl_num_threads": os.environ.get("MKL_NUM_THREADS"),
         "device_type": parsed.type,
         "cpu_architecture": platform.machine(),
         "torch_version": str(torch.__version__),
@@ -41,7 +63,12 @@ def execution_environment(device: str) -> dict[str, Any]:
             compute_capability=[properties.major, properties.minor],
         )
     elif parsed.type == "xpu":
-        result["accelerator_name"] = torch.xpu.get_device_name(parsed)
+        properties = torch.xpu.get_device_properties(parsed)
+        result.update(
+            accelerator_name=properties.name,
+            xpu_driver_version=getattr(properties, "driver_version", None),
+            xpu_runtime_version=getattr(torch.version, "xpu", None),
+        )
     return result
 
 
@@ -77,6 +104,10 @@ def prepare_compilation_cache() -> None:
         os.environ["TRITON_CACHE_DIR"] = str(triton)
         return
 
+    triton = cache_root / "triton"
+    triton.mkdir(parents=True, exist_ok=True)
+    os.environ["TRITON_CACHE_DIR"] = str(triton)
+
     extension = sysconfig.get_config_var("EXT_SUFFIX")
     if not isinstance(extension, str) or not extension:
         return
@@ -84,11 +115,7 @@ def prepare_compilation_cache() -> None:
         os.environ.get(_TRITON_SEED_CACHE, Path.home() / ".triton" / "cache")
     ).expanduser()
     seed_helpers = sorted(seed_root.glob(f"*/cuda_utils{extension}"))
-    if not seed_helpers:
-        return
-    triton = cache_root / "triton"
     for source in seed_helpers:
         destination = triton / source.parent.name / source.name
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, destination)
-    os.environ["TRITON_CACHE_DIR"] = str(triton)

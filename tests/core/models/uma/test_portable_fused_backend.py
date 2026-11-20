@@ -14,6 +14,7 @@ from dataclasses import replace
 import pytest
 import torch
 from ase.build import bulk, molecule
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from fairchem.core.datasets.atomic_data import AtomicData
 from fairchem.core.models.uma.common.so3 import CoefficientMapping
@@ -590,3 +591,58 @@ def test_native_two_stage_csr_high_degree_and_empty_rows(monkeypatch):
         values.append((y, *grad, *hvp))
     for a, b in zip(*values):
         torch.testing.assert_close(a, b, atol=3e-4, rtol=3e-4)
+
+
+def test_chunked_adjoint_accumulates_into_one_owned_node_tensor():
+    class TrackNodeSums(TorchDispatchMode):
+        def __init__(self):
+            super().__init__()
+            self.destinations = []
+            self.copies = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if func is torch.ops.aten.index_add_.default:
+                self.destinations.append(args[0].data_ptr())
+            elif func is torch.ops.aten.index_add.default:
+                self.copies += 1
+            return func(*args, **(kwargs or {}))
+
+    x = torch.randn(5, 9, 2)
+    index = torch.tensor([[0, 2, 4, 2, 0], [2, 3, 0, 1, 4]])
+    wigner, hidden, weight, bias = (
+        torch.randn(s) for s in ((5, 35), (5, 4), (24, 4), (24,))
+    )
+    incoming = [torch.randn(5, width * 2) for width in (6, 8, 4)]
+    with TrackNodeSums() as tracker:
+        dx, *_ = producer_projected_adjoint(
+            *incoming,
+            x,
+            index,
+            wigner,
+            hidden,
+            weight,
+            bias,
+            2,
+            needs=(True, False, False, False, False),
+            chunk_edges=2,
+        )
+    assert tracker.copies == 0
+    assert set(tracker.destinations) == {dx.data_ptr()}
+    assert dx.data_ptr() != x.data_ptr()
+
+    def derivative(*incoming):
+        return producer_projected_adjoint(
+            *incoming,
+            x,
+            index,
+            wigner,
+            hidden,
+            weight,
+            bias,
+            2,
+            needs=(True, False, False, False, False),
+            chunk_edges=2,
+        )[0]
+
+    batched = [torch.stack((g, -g)) for g in incoming]
+    torch.testing.assert_close(torch.vmap(derivative)(*batched), torch.stack((dx, -dx)))

@@ -61,32 +61,29 @@ class DDPMTLoss(nn.Module):
     def __init__(
         self,
         loss_fn: torch.nn.Module,
-        reduction: Literal["mean", "sum", "per_structure"] = "mean",
+        reduction: Literal[
+            "mean", "sum", "per_structure", "per_valid_structure"
+        ] = "mean",
         coefficient: float = 1.0,
     ) -> None:
         super().__init__()
         self.loss_fn = loss_fn
         self.reduction = reduction
-        self.reduction_map = {
-            "mean": self.mean,
-            "sum": self.sum,
-            "per_structure": self.per_structure,
-        }
         self.coefficient = coefficient
-        assert self.reduction in list(
-            self.reduction_map.keys()
-        ), "Reduction must be one of: 'mean', 'sum', 'per_structure'"
+        if reduction not in {"mean", "sum", "per_structure", "per_valid_structure"}:
+            raise ValueError(f"Unknown loss reduction {reduction!r}")
 
-    def sum(self, input, mult_mask, num_samples, loss, natoms):
-        # this sum will reduce the loss down to a single scalar
-        return torch.sum(loss)
-
-    def _ddp_mean(self, num_samples, loss):
-        # global_samples can be 0 if the head has no valid samples in the batch
-        # protect against division by zero
-        global_samples = distutils.all_reduce(
-            num_samples, device=loss.device
-        ).clamp_min(1)
+    def _ddp_mean(self, num_samples, loss, invalid):
+        # All ranks observe an invalid input before any rank can proceed to
+        # backward. Piggyback the error flag on the existing sample-count sum.
+        if distutils.initialized() and distutils.get_world_size() > 1:
+            counts = torch.stack((num_samples, invalid.to(num_samples.dtype)))
+            global_samples, invalid = distutils.all_reduce(counts).unbind()
+        else:
+            global_samples = distutils.all_reduce(num_samples, device=loss.device)
+        if invalid.item():
+            raise RuntimeError("Nonfinite loss on a valid label")
+        global_samples = global_samples.clamp_min(1)
         # Multiply by world size since gradients are averaged across DDP replicas
         # warning this is probably incorrect for any model parallel approach
         # Graph parallel note: numerator and denominator are inflated by the same
@@ -101,66 +98,60 @@ class DDPMTLoss(nn.Module):
             return gp_utils.scale_backward_grad(corrected_loss)
         return corrected_loss
 
-    def mean(self, input, mult_mask, num_samples, loss, natoms):
-        # this sum will reduce the loss down from num_sample -> 1
-        loss = self.sum(input, mult_mask, num_samples, loss, natoms)
-        return self._ddp_mean(num_samples, loss)
-
-    def per_structure(self, input, mult_mask, num_samples, loss, natoms):
-        struct_idx = torch.repeat_interleave(
-            torch.arange(natoms.numel(), device=input.device),
-            natoms,
-            output_size=loss.shape[0],
-        )
-        per_struct_loss = loss.new_zeros(natoms.numel()).scatter_add_(
-            0, struct_idx, loss
-        )
-        free_natoms = torch.zeros_like(natoms).scatter_add_(
-            0, struct_idx, mult_mask.reshape(-1).to(dtype=natoms.dtype)
-        )
-        denom = torch.where(free_natoms == 0, natoms, free_natoms).clamp_min(1)
-        per_struct_loss = per_struct_loss / denom
-        # Preserve the established weighting of structures with zero loss.
-        return self._ddp_mean(
-            torch.count_nonzero(per_struct_loss), per_struct_loss.sum()
-        )
-
-    def _reduction(self, input, mult_mask, loss, natoms):
-        num_samples = None
-        if self.reduction == "mean":
-            values_per_mask = loss.numel() // max(1, mult_mask.numel())
-            num_samples = mult_mask.sum(dtype=torch.long) * values_per_mask
-        return self.reduction_map[self.reduction](
-            input, mult_mask, num_samples, loss, natoms
-        )
-
-    def forward(
-        self,
-        input: torch.Tensor,
-        target: torch.Tensor,
-        mult_mask: torch.Tensor,
-        natoms: torch.Tensor,
-    ):
-        # ensure torch doesn't do any unwanted broadcasting
-        assert (
-            input.shape[0] == target.shape[0] == mult_mask.shape[0]
-        ), f"Mismatched shapes: {input.shape} and {target.shape} and {mult_mask.shape}"
-
-        # Ensure torch doesn't do any unwanted broadcasting
-        target = target.view(input.shape)
-        if input.numel() == mult_mask.numel():
-            mult_mask = mult_mask.view(input.shape)
-
-        loss = (
-            self.loss_fn(
-                input, torch.nan_to_num(target, posinf=0.0, neginf=0.0), natoms
+    def forward(self, input, target, mult_mask, natoms):
+        if input.shape[0] != target.shape[0] or input.shape[0] != mult_mask.shape[0]:
+            raise ValueError(
+                "Prediction, target and mask must share a leading dimension"
             )
-            * mult_mask
-        )
-        loss = self._reduction(input, mult_mask, loss, natoms)
+        target = target.reshape_as(input)
+        mask = mult_mask.bool()
+        if mask.numel() == input.numel():
+            mask = mask.reshape_as(input)
+        elif mask.numel() == input.size(0):
+            mask = mask.reshape((-1,) + (1,) * (input.ndim - 1)).expand_as(input)
+        else:
+            raise ValueError("Expected one mask per row or per target component")
 
-        loss = torch.nan_to_num(loss, nan=0.0)
-        return self.coefficient * loss
+        # Mask before differentiation: even a zero upstream gradient through a
+        # NaN square can produce a NaN parameter gradient.
+        pred = torch.where(mask, input, 0)
+        target = torch.where(mask, target, 0)
+        loss = self.loss_fn(pred, target, natoms)
+        if loss.shape == input.shape:
+            valid = mask
+        elif loss.shape == input.shape[:1]:
+            valid = mask.reshape(input.size(0), input.shape[1:].numel()).any(dim=1)
+        else:
+            raise ValueError(
+                "Loss must return one value per row or per target component"
+            )
+        loss = torch.where(valid, loss, 0)
+        invalid = ~loss.isfinite().all()
+        if self.reduction == "sum":
+            if distutils.initialized() and distutils.get_world_size() > 1:
+                invalid = distutils.all_reduce(invalid.to(torch.long))
+            if invalid.item():
+                raise RuntimeError("Nonfinite loss on a valid label")
+            return self.coefficient * loss.sum()
+        if self.reduction == "mean":
+            return self.coefficient * self._ddp_mean(valid.sum(), loss.sum(), invalid)
+
+        # Compute the mean over valid components in each structure. A vector
+        # norm contributes one observation per atom; MSE contributes one per axis.
+        struct = torch.arange(natoms.numel(), device=input.device)
+        if loss.size(0) != natoms.numel():
+            struct = torch.repeat_interleave(struct, natoms, output_size=loss.shape[0])
+        row_shape = (loss.size(0), loss.shape[1:].numel())
+        totals = loss.new_zeros(natoms.numel()).scatter_add_(
+            0, struct, loss.reshape(row_shape).sum(dim=1)
+        )
+        counts = torch.zeros_like(natoms).scatter_add_(
+            0, struct, valid.reshape(row_shape).sum(dim=1).to(natoms.dtype)
+        )
+        means = totals / counts.clamp_min(1)
+        # Existing checkpoints/configs retain the historical nonzero-loss divisor.
+        structures = means != 0 if self.reduction == "per_structure" else counts > 0
+        return self.coefficient * self._ddp_mean(structures.sum(), means.sum(), invalid)
 
 
 @registry.register_loss("mae")

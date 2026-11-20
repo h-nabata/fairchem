@@ -83,6 +83,8 @@ def geometry_core(
     distance=None,
     fold_envelope=False,
     valid=None,
+    *,
+    radial_modules=None,
 ):
     """
     Joint geometry graph suitable for torch.compile pointwise fusion.
@@ -101,10 +103,19 @@ def geometry_core(
     l2 = (quartic_monomials(quaternion) @ quartic_coefficients.T).reshape(-1, 5, 5)
     ones = vectors.new_ones((vectors.shape[0], 1))
     wigner = torch.cat((ones, l1.flatten(1), l2.flatten(1)), dim=1)
-    scaled = distance / cutoff
-    envelope = torch.where(
-        scaled < 1, 1 + scaled**p * (a + scaled * (b + c * scaled)), 0
-    )[:, None]
+    if radial_modules is None:
+        # Tensor-only entry point and standalone modules from older checkpoints.
+        scaled = distance / cutoff
+        envelope = torch.where(
+            scaled < 1, 1 + scaled**p * (a + scaled * (b + c * scaled)), 0
+        )[:, None]
+        radial = torch.exp(
+            gaussian_coeff * (distance[:, None] - offsets[None]).square()
+        )
+    else:
+        distance_expansion, envelope_module = radial_modules
+        radial = distance_expansion(distance)
+        envelope = envelope_module(distance / cutoff).reshape(-1, 1)
     if valid is not None:
         envelope = torch.where(valid[:, None], envelope, 0)
     inv1 = l1.transpose(1, 2).flatten(1)
@@ -113,7 +124,6 @@ def geometry_core(
         inverse = torch.cat((envelope, inv1 * envelope, inv2 * envelope), dim=1)
     else:
         inverse = torch.cat((ones, inv1, inv2), dim=1)
-    radial = torch.exp(gaussian_coeff * (distance[:, None] - offsets[None]).square())
     return radial, envelope, wigner, inverse
 
 
@@ -122,7 +132,7 @@ class PortableGeometry(torch.nn.Module):
     Own immutable l=2 and radial coefficients for the portable execution mode.
     """
 
-    def __init__(self, model):
+    def __init__(self, model, *, standalone=True):
         super().__init__()
         coefficients = model.wigner_data.custom_kernels.C_l2
         self.register_buffer(
@@ -140,25 +150,43 @@ class PortableGeometry(torch.nn.Module):
             model.distance_expansion.offset.detach().clone(),
             persistent=False,
         )
+        if standalone:
+            self.distance_expansion = model.distance_expansion
+            self.envelope = model.envelope
         self.gaussian_coeff = model.distance_expansion.coeff
         self.cutoff = model.cutoff
         self.p = model.envelope.p
         self.a, self.b, self.c = model.envelope.a, model.envelope.b, model.envelope.c
 
     def forward(
-        self, vectors, gamma=None, *, distance=None, fold_envelope=False, valid=None
+        self,
+        vectors,
+        gamma=None,
+        *,
+        distance=None,
+        fold_envelope=False,
+        valid=None,
+        model=None,
     ):
         if gamma is None:
             gamma = torch.rand(
                 vectors.shape[0], device=vectors.device, dtype=vectors.dtype
             ) * (2 * math.pi)
+        # In a prepared backbone the original modules can be replaced or get
+        # hooks after preparation. Read both from the live owner on every call.
+        owner = self if model is None else model
+        modules = (
+            (owner.distance_expansion, owner.envelope)
+            if hasattr(owner, "distance_expansion")
+            else None
+        )
         return geometry_core(
             vectors,
             gamma,
             self.quartic_coefficients,
             self.offsets,
             self.gaussian_coeff,
-            self.cutoff,
+            owner.cutoff,
             self.p,
             self.a,
             self.b,
@@ -166,4 +194,5 @@ class PortableGeometry(torch.nn.Module):
             distance=distance,
             fold_envelope=fold_envelope,
             valid=valid,
+            radial_modules=modules,
         )

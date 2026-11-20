@@ -338,8 +338,21 @@ class AseReadMultiStructureDataset(AseAtomsDataset):
         self._relaxed_energies = {}
         ids = []
 
+        out_of_range = config.get("out_of_range", "error")
+        if out_of_range not in ("error", "skip"):
+            raise ValueError("out_of_range must be 'error' or 'skip'")
+
         def add_frames(filename, count):
-            frames = range(count)[selection]
+            try:
+                frames = range(count)[selection]
+            except IndexError as exc:
+                message = (
+                    f"{filename}: frame {selection} is out of range for {count} frames"
+                )
+                if out_of_range == "error":
+                    raise IndexError(message) from exc
+                logging.warning("Skipping trajectory: %s", message)
+                return
             if isinstance(frames, int):
                 frames = (frames,)
             ids.extend(f"{filename} {frame}" for frame in frames)
@@ -515,8 +528,8 @@ class AseDBDataset(AseAtomsDataset):
     def get_atoms(self, idx: int) -> ase.Atoms:
         """Get atoms object corresponding to datapoint idx. Useful to read other properties not in data object.
 
-        NOTE: if the row data in the database does not include a entry "sid" for the system id,
-            The integer idx will be used.
+        Preserve explicit row identifiers. Otherwise combine the source filename
+        and the ASE row ID, which remains stable when a selection is reordered.
 
         Args:
             idx (int): index in dataset
@@ -541,7 +554,10 @@ class AseDBDataset(AseAtomsDataset):
             atoms.info.update(atoms_row.data)
 
         if "sid" not in atoms.info:
-            atoms.info["sid"] = idx
+            source = os.fspath(self.dbs[db_idx].filename)
+            atoms.info["sid"] = str(
+                atoms_row.get("sid", f"{source}#{self.db_ids[db_idx][el_idx]}")
+            )
 
         return atoms
 
@@ -549,8 +565,8 @@ class AseDBDataset(AseAtomsDataset):
     def connect_db(
         address: str | Path, connect_args: dict | None = None
     ) -> ase.db.core.Database:
-        if connect_args is None:
-            connect_args = {}
+        address = os.fspath(address)
+        connect_args = dict(connect_args or {})
 
         # If we're using an aselmdb, let's set readonly=True to be safe!
         if "aselmdb" in address:

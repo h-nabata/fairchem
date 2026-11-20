@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 import torch
 from omegaconf import DictConfig, OmegaConf
 
+from fairchem.core.common.distutils import parse_device
 from fairchem.core.launchers.api import SlurmConfig
 from fairchem.core.regression_suite.spec.profiles import (
     CONFIGS,
@@ -83,7 +84,7 @@ def resolve_device(device: str, run_on: str, *, source: str = "--device cuda") -
     if device == "auto":
         return "cuda" if run_on == "slurm" or torch.cuda.is_available() else "cpu"
     try:
-        parsed = torch.device(device)
+        parsed = parse_device(device)
     except (RuntimeError, ValueError) as err:
         raise CommandError(f"Invalid accelerator device {device!r}") from err
     if parsed.type not in {"cpu", "cuda", "xpu"} or (

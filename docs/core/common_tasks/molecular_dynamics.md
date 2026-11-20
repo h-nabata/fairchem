@@ -98,8 +98,13 @@ described in [Prerequisites](#prerequisites).
 The explicit `FixCom` constraint with `fixcm=False` follows ASE's recommended
 Langevin behavior. ASE's legacy internal `fixcm=True` correction does not
 strictly sample the correct NVT position and momentum distributions, with a
-larger effect for small systems. The Hydra NVT example selects the same
-constraint-based behavior through `use_fix_com_constraint: true`.
+larger effect for small systems. New `LangevinThermostat` runs and the Hydra NVT example use this constraint
+by default. At least two mobile atoms are required. With fixed atoms, only
+mobile atoms participate in the center-of-mass constraint. When resuming a new
+checkpoint, the saved COM method is restored. A pre-versioned checkpoint uses
+the method specified by its original configuration (legacy internal correction
+when omitted). Set `thermostat_seed` on Langevin or Bussi to reproduce the
+stochastic thermostat independently of `velocity_seed`.
 
 ## Run with Hydra
 
@@ -212,15 +217,29 @@ The Parquet trajectory uses the following units and conventions:
 | `stress` | eV/Å³ in ASE Voigt order `(xx, yy, zz, yz, xz, xy)` |
 | `pressure` | Bar, computed as `-trace(stress) / 3`; this is configurational pressure and excludes kinetic stress |
 | `temperature` | K |
-| `tags`, `charge`, `spin`, `sid` | Unmodified ASE metadata |
+| `tags`, `charge`, `spin` | Integer ASE metadata |
+| `sid`, `sid_integer` | Structure ID as text; `sid_integer` also records its original value for integer IDs |
 
-`checkpoint_interval` writes a rolling checkpoint containing atoms, velocities,
-thermostat state, step count, and generated `resume_config.yaml` and
-`portable_config.yaml` files. Full restart output handling is under active
-development. Currently, resuming into the same results directory recreates
-`trajectory.parquet`, replacing its pre-checkpoint frames, while appending to
-`thermo.log`. Preserve the trajectory before using a generated resume
-configuration.
+The Parquet schema includes nullable columns for optional properties. A
+property unsupported by the calculator is stored as null. A calculation error
+stops the run and identifies the property and frame.
+
+`checkpoint_interval` publishes a rolling checkpoint with lossless atom arrays,
+constraints, thermostat and random-number state, completed step, trajectory
+index, and generated `resume_config.yaml` and `portable_config.yaml` files.
+The checkpoint directory contains the latest and preceding generations. Copy
+the whole directory, including hidden entries, when moving a checkpoint.
+Legacy ExtXYZ checkpoints can be loaded with the precision and constraints
+present in those files.
+
+When resuming in the same results directory, the checkpoint's Parquet parts
+are reused through its completed step. New frames are written to new parts.
+Closing the run publishes a complete `trajectory.parquet`. Keep the hidden
+`.trajectory.parquet.parts` directory alongside the public file to preserve
+restart history. Its JSON indexes list each part's first and last step and row
+count. A resume in an empty results directory writes the continuation there.
+The text log appends on resume. In `metadata.json`, `total_steps` counts steps
+actually completed and `target_steps` records the requested target.
 
 When `heartbeat_interval` is enabled, creating a file named `STOPFAIR` alongside
 the run's `checkpoints` directory requests a checkpoint and graceful stop.

@@ -61,6 +61,7 @@ except ImportError:
 
 from fairchem.core import FAIRChemCalculator, pretrained_mlip
 from fairchem.core.calculate._batch import AutobatchConfig, InferenceBatcher
+from fairchem.core.common.distutils import parse_device
 from fairchem.core.datasets.atomic_data import AtomicData
 
 if TYPE_CHECKING:
@@ -307,7 +308,7 @@ def sweep_batch_server(
     Returns:
         Aggregated results dictionary (also written to JSON).
     """
-    selected = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    selected = parse_device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     if selected.type not in {"cpu", "cuda"}:
         raise ValueError("The Ray batch server supports CPU and CUDA devices")
     if selected.type == "cuda":
@@ -369,7 +370,7 @@ def sweep_batch_server(
             logging.info(
                 f"Autobatch: max_batch_size={autobatch.max_batch_size}, "
                 f"timeout={autobatch.batch_wait_timeout_s:.4f}s, "
-                f"median_latency={autobatch.median_latency_s:.4f}s"
+                f"median_latency_s={autobatch.median_latency_s}"
             )
 
             # Warmup the server so probe/JIT costs don't pollute timings.

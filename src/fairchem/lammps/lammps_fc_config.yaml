@@ -29,6 +29,7 @@ parallel_predict_unit:
 predict_unit: ${local_predict_unit}
 lmp_in: "lammps_in_example.file"
 task_name: "omol"
-charge: 0  # total charge; use 0 for tasks other than omol
-spin: 1  # omol: spin multiplicity (2S+1), 1 = singlet; use 0 for tasks other than omol
+charge: null  # defaults to zero
+spin: null  # defaults to 1 for omol and 0 for other tasks
+compute_stress: true  # set false only for fixed-cell E/F-only simulations
 type_to_atomic_number: null  # optional LAMMPS atom type -> atomic number for isotope masses

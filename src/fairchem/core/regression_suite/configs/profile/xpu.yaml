@@ -1,3 +1,4 @@
 label: xpu
 preset: xpu
 predictor_scope: structure
+minimum_tier: FP32

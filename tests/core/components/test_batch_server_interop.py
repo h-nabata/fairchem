@@ -10,7 +10,9 @@ from __future__ import annotations
 import asyncio
 import weakref
 from collections import OrderedDict, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from threading import Event
 from types import SimpleNamespace
 from typing import ClassVar
 from unittest.mock import Mock
@@ -532,3 +534,164 @@ def test_checkpoint_update_preserves_cached_client_interface(monkeypatch, change
             batcher.update_checkpoint(new)
         update.assert_not_called()
         assert batcher.predict_unit is old
+
+
+def test_server_can_split_an_oom_during_collation(monkeypatch):
+    sizes, refs = [], []
+    original = batch_server.atomicdata_list_to_batch
+
+    def collate(items, **kwargs):
+        assert all(ref() is None for ref in refs)
+        sizes.append(len(items))
+        if len(items) > 1:
+            temporary = torch.zeros(128)
+            refs.append(weakref.ref(temporary))
+            raise torch.OutOfMemoryError("collate")
+        return original(items, **kwargs)
+
+    monkeypatch.setattr(batch_server, "atomicdata_list_to_batch", collate)
+    output = _server()._run_batched_inference(
+        [_data(1), _data(2)], MixedTaskPredictor(), False
+    )
+    assert sizes == [2, 1, 1]
+    assert [result["energy"].item() for result in output] == [1, 4]
+
+
+@pytest.mark.parametrize("failure", ["model", "small", "large", None])
+def test_autobatch_uses_predictor_ordinal_and_only_successful_measurements(
+    monkeypatch, failure
+):
+    device = torch.device("cuda:3")
+    active = []
+
+    @contextmanager
+    def scope(ordinal):
+        assert ordinal == device
+        active.append(device)
+        yield
+        active.pop()
+
+    monkeypatch.setattr(torch.cuda, "device", scope)
+
+    def exact(ordinal):
+        assert active == [device]
+        assert ordinal == device
+        return 0
+
+    def empty_cache():
+        assert active == [device]
+
+    monkeypatch.setattr(torch.cuda, "synchronize", exact)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", exact)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", exact)
+    monkeypatch.setattr(
+        torch.cuda, "mem_get_info", lambda ordinal: (exact(ordinal), 2**30)
+    )
+    monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
+
+    def predict(data, **kwargs):
+        if failure == "model":
+            raise RuntimeError("bad weights")
+        if failure == "small" or (failure == "large" and data.num_nodes > 2):
+            raise torch.OutOfMemoryError("allocator")
+
+    predictor = SimpleNamespace(device=device, predict=predict)
+    config = batch_server.AutobatchConfig(
+        min_batch_size=4, max_batch_size_cap=8, probe_steps=2
+    )
+    if failure is None:
+        result = batch_server.probe_optimal_batch_size(predictor, [_data()], config)
+        assert result.max_batch_size == int(8 * config.backoff_factor)
+        assert result.median_latency_s > 0
+    else:
+        error = RuntimeError if failure == "model" else torch.OutOfMemoryError
+        message = {
+            "model": "bad weights",
+            "small": "single-request",
+            "large": "configured probe range",
+        }[failure]
+        with pytest.raises(error, match=message):
+            batch_server.probe_optimal_batch_size(predictor, [_data()], config)
+
+
+@pytest.mark.parametrize("first", ["weights", "config"])
+def test_registry_serializes_concurrent_model_and_batch_updates(monkeypatch, first):
+    entered, release, attempted = Event(), Event(), Event()
+    deployed = []
+    name = "concurrent"
+    original = batch_server.BatchConfig(max_batch_size=16)
+    new = batch_server.BatchConfig(max_batch_size=32)
+
+    def run(app, **kwargs):
+        deployed.append(app)
+        if len(deployed) == 2:
+            entered.set()
+            assert release.wait(5)
+        return object()
+
+    class Deployment:
+        def options(self, **options):
+            return SimpleNamespace(
+                bind=lambda ref, **kwargs: (
+                    ref,
+                    options["user_config"]["max_batch_size"],
+                )
+            )
+
+    monkeypatch.setattr(batch_server, "_DEPLOYED_APPS", {})
+    monkeypatch.setattr(batch_server.ray, "put", lambda unit: unit.name)
+    monkeypatch.setattr(batch_server.serve, "run", run)
+    batch_server._deploy_app(Deployment(), {}, ("old",), {}, original, name, "/")
+    model = SimpleNamespace(device="cpu", name="new")
+    update = {
+        "weights": lambda: batch_server.update_served_predict_unit(name, model),
+        "config": lambda: batch_server.update_batch_config(name, new),
+    }
+    last = "config" if first == "weights" else "weights"
+
+    def second():
+        attempted.set()
+        update[last]()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_job = executor.submit(update[first])
+        try:
+            assert entered.wait(5)
+            second_job = executor.submit(second)
+            assert attempted.wait(5)
+        finally:
+            release.set()
+        first_job.result(timeout=5)
+        second_job.result(timeout=5)
+    assert deployed[-1] == ("new", 32)
+    assert batch_server._DEPLOYED_APPS[name].bind_args == ("new",)
+    assert batch_server._DEPLOYED_APPS[name].batch_config == new
+
+
+def test_batcher_delete_releases_registry_after_success_and_preserves_retry(
+    monkeypatch,
+):
+    name = "test-delete"
+    owner = object()
+    handle = object()
+    record = SimpleNamespace(owner=owner)
+    registry = {name: record}
+    delete = Mock(side_effect=[RuntimeError("temporarily unavailable"), None])
+    monkeypatch.setattr(batch_server, "_DEPLOYED_APPS", registry)
+    monkeypatch.setattr(batch_server.ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(batch_server.serve, "delete", delete)
+    batcher = _batch.InferenceBatcher.__new__(_batch.InferenceBatcher)
+    batcher.deployment_name = name
+    batcher._deployment_owner = owner
+    batcher.predict_server_handle = handle
+    with pytest.raises(RuntimeError, match="temporarily unavailable"):
+        batcher.delete()
+    assert batcher.predict_server_handle is handle
+    assert registry[name] is record
+    batcher.delete()
+    assert name not in registry
+    assert batcher.predict_server_handle is None
+    registry[name] = SimpleNamespace(owner=object())
+    batch_server.delete_batch_predict_server(name, owner=owner)
+    assert name in registry
+    assert delete.call_count == 2

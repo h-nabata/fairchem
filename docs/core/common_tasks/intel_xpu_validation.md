@@ -144,3 +144,16 @@ The `Xe hardware validation` workflow runs only on the fork's trusted
 a local, readable UMA checkpoint on a Linux runner labeled `xe-b70-dual`
 with two visible B70s, an XPU build of PyTorch, Intel Triton, and the project's
 test dependencies. It archives the numerical comparisons and kernel test results.
+
+
+The optional pinned-reference step reads `XE_B70_BASELINE` and
+`XE_B70_CHECKPOINT_ID`. It gates the prediction-fidelity smoke cases at FP64
+for `xpu-fp64`, FP32 for `xpu`, and TF32 for `xpu-int8`. The reported tier
+describes the observed errors on those cases. New baselines verify the checkpoint
+bytes by SHA-256. Reports identify older baselines that record only a model name.
+
+The batch benchmark compares each packed energy and each force component with
+the corresponding serial prediction before timing either path. Its defaults are
+0.001 eV per system and 0.0001 eV/Å per force component. Set `--energy-atol`
+and `--force-atol` to choose other bounds. On a parity failure the JSON contains
+the affected systems and errors, and the command exits with status 1.

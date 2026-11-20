@@ -15,6 +15,7 @@ import torch
 from monty.dev import requires
 
 from fairchem.core.graph.radius_graph_pbc import (
+    complete_periodic_cell,
     get_max_neighbors_mask,
     system_pbc_flags,
     validate_graph_geometry,
@@ -177,6 +178,7 @@ def get_neighbors_nvidia(
     cell_basis_signs = None
     neighbor_cell = None
     if bool(pbc.any()):
+        cell = complete_periodic_cell(cell, pbc)
         volume = (cell[:, 0] * torch.cross(cell[:, 1], cell[:, 2], dim=-1)).sum(-1)
         if bool((pbc.any(-1) & ((volume == 0) | ~torch.isfinite(volume))).any()):
             raise ValueError(
@@ -358,6 +360,7 @@ def get_neighbors_nvidia_atoms(
     max_neigh: int,
     *,
     target_dtype: torch.dtype = torch.float32,
+    enforce_max_neighbors_strictly: bool | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Performs nearest neighbor search using NVIDIA nvalchemiops and returns edge index, distances,
     and cell offsets.
@@ -387,7 +390,11 @@ def get_neighbors_nvidia_atoms(
         cutoff=cutoff,
         max_neigh=max_neigh,
         method="cell_list",
-        enforce_max_neighbors_strictly=True,
+        enforce_max_neighbors_strictly=(
+            True
+            if enforce_max_neighbors_strictly is None
+            else enforce_max_neighbors_strictly
+        ),
         return_distances_sq=True,
     )
 

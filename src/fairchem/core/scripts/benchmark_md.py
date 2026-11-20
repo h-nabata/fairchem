@@ -28,6 +28,8 @@ from ase import units
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
 from ase.md.verlet import VelocityVerlet
 
+from fairchem.core.common.distutils import parse_device
+
 
 def _backend(device):
     if device.type == "cpu":
@@ -81,8 +83,8 @@ def _effective_settings(calculator, require_nitro):
 
 def _resolve_device(calculator, device):
     actual = getattr(getattr(calculator, "predictor", None), "device", None)
-    actual = torch.device(actual) if actual is not None else None
-    requested = torch.device(device if device is not None else actual or "cpu")
+    actual = parse_device(actual) if actual is not None else None
+    requested = parse_device(device if device is not None else actual or "cpu")
     if actual is not None and requested.type != actual.type:
         raise ValueError("Benchmark device must match calculator.predictor.device")
     backend = _backend(requested)
@@ -400,7 +402,8 @@ def main(argv=None):
             raise ValueError(
                 "max-samples must be at least two and timing-block positive"
             )
-        _backend(torch.device(args.device))
+        load_device = parse_device(args.device)
+        load_backend = _backend(load_device)
         if args.edge_margin is not None:
             if not math.isfinite(args.edge_margin) or args.edge_margin < 1:
                 raise ValueError("edge-margin must be finite and >= 1")
@@ -426,7 +429,7 @@ def main(argv=None):
                 raise ValueError(
                     "Nitro MD does not support base_precision_dtype=float64"
                 )
-            if torch.device(args.device).type == "xpu":
+            if load_device.type == "xpu":
                 from fairchem.core.units.mlip_unit.inference_runtime import (
                     probe_fp64_support,
                 )
@@ -440,8 +443,6 @@ def main(argv=None):
             if args.input
             else bulk("Si", cubic=True).repeat(args.repeat)
         )
-        load_device = torch.device(args.device)
-        load_backend = _backend(load_device)
         if load_backend is not None:
             load_backend.synchronize(load_device)
             load_backend.reset_peak_memory_stats(load_device)

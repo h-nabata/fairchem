@@ -7,7 +7,9 @@ LICENSE file in the root directory of this source tree.
 
 from __future__ import annotations
 
+import pickle
 from types import SimpleNamespace
+from typing import ClassVar
 
 import numpy as np
 import pytest
@@ -236,6 +238,9 @@ def test_formation_wrapper_caches_owns_references_and_invalidates_parameters():
     wrapper = FormationEnergyCalculator(base, references, apply_corrections=False)
     atoms = _atoms()
     atoms.calc = wrapper
+    atoms.get_forces()
+    restored = pickle.loads(pickle.dumps(wrapper))
+    assert restored.check_state(atoms) == []
     forces = atoms.get_forces()
     energy = atoms.get_potential_energy()
     assert wrapper.atoms is not None
@@ -353,3 +358,96 @@ def test_real_uma_sella_job_accepts_numpy_hessian_callback():
     optimizer.run(fmax=1e-12, steps=1)
     assert np.isfinite(atoms.positions).all()
     assert np.isfinite(atoms.get_forces()).all()
+
+
+@pytest.mark.parametrize("wrap", ["predictor", "formation", "d3"])
+def test_cached_energy_tracks_tags_and_fixed_mask(monkeypatch, wrap):
+    from ase.calculators.calculator import Calculator
+
+    from fairchem.core.calculate import dftd3_calculator
+
+    class InputPredictor(BufferPredictor):
+        def predict(self, data, requested_properties):
+            self.calls += 1
+            return {"energy": data.tags.sum() + 10 * data.fixed.sum()}
+
+    class ZeroDispersion(Calculator):
+        implemented_properties = ("energy",)
+
+        def calculate(self, atoms, properties, system_changes):
+            super().calculate(atoms, properties, system_changes)
+            self.results = {"energy": 0.0}
+
+    predictor = InputPredictor()
+    atoms = _atoms()
+    calc = FAIRChemCalculator(predictor, "omol")
+    if wrap != "predictor":
+        calc = FormationEnergyCalculator(calc, {"H": 0, "O": 0})
+    if wrap == "d3":
+        monkeypatch.setattr(
+            dftd3_calculator,
+            "_NValChemiDFTD3Calculator",
+            lambda *a, **k: ZeroDispersion(),
+        )
+        calc = dftd3_calculator.DFTD3Calculator(calc, "pbe")
+    atoms.calc = calc
+    assert atoms.get_potential_energy() == 0
+    atoms.set_tags([0, 2, 0])
+    assert atoms.get_potential_energy() == 2
+    atoms.set_constraint(FixAtoms(indices=[0, 2]))
+    assert atoms.get_potential_energy() == 22
+    atoms.set_constraint([FixAtoms(indices=[0]), FixAtoms(indices=[2])])
+    assert atoms.get_potential_energy() == 22
+    assert predictor.calls == 3
+
+
+def test_distinct_formation_energy_and_child_cache(monkeypatch):
+    from ase import Atoms
+    from ase.calculators.calculator import Calculator
+
+    from fairchem.core.calculate import dftd3_calculator
+
+    class EnergyPair(Calculator):
+        implemented_properties = ("energy", "free_energy")
+        default_parameters: ClassVar = {"offset": 0}
+
+        def calculate(self, atoms, properties, system_changes):
+            super().calculate(atoms, properties, system_changes)
+            self.results = {
+                p: {"energy": 10, "free_energy": 8}[p] + self.parameters.offset
+                for p in properties
+            }
+
+    atoms = Atoms("H")
+    base = FormationEnergyCalculator(EnergyPair(), {"H": 2})
+    assert base.get_property("free_energy", atoms) == 6
+    base.calculate(atoms, ["energy", "free_energy"])
+    assert base.results == {"energy": 8, "free_energy": 6}
+    d3 = EnergyPair()
+    monkeypatch.setattr(
+        dftd3_calculator, "_NValChemiDFTD3Calculator", lambda *a, **k: d3
+    )
+    total = dftd3_calculator.DFTD3Calculator(base, "pbe")
+    assert total.get_potential_energy(atoms) == 18
+    base.element_references["H"] = 7
+    assert total.get_potential_energy(atoms) == 13
+    base.element_references["H"] = 3
+    assert base.get_potential_energy(atoms) == 7
+    assert total.get_potential_energy(atoms) == 17
+    d3.parameters.offset += 1
+    assert total.get_potential_energy(atoms) == 18
+
+
+@pytest.mark.parametrize("request_aware", [True, False])
+def test_undefined_molecular_stress_never_cached(request_aware):
+    predictor = BufferPredictor()
+    predictor.supports_requested_properties = request_aware
+    predictor.override["stress"] = torch.full((3, 3), float("nan"))
+    atoms = _atoms()
+    atoms.set_cell([0, 0, 0])
+    atoms.calc = FAIRChemCalculator(predictor, "omol")
+    assert np.isfinite(atoms.get_potential_energy())
+    assert np.isfinite(atoms.get_forces()).all()
+    assert "stress" not in atoms.calc.results
+    with pytest.raises(ValueError, match="finite nonzero volume"):
+        atoms.get_stress()

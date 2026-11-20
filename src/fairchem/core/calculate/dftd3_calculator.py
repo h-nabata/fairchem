@@ -24,6 +24,8 @@ import torch
 from ase.calculators.calculator import Calculator, all_changes
 from ase.stress import full_3x3_to_voigt_6_stress
 
+from fairchem.core.common.distutils import parse_device
+
 if TYPE_CHECKING:
     from os import PathLike
 
@@ -267,7 +269,7 @@ class _NValChemiDFTD3Calculator(Calculator):
 
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.device = torch.device(device)
+        self.device = parse_device(device)
         if self.device.type not in {"cpu", "cuda"}:
             raise ValueError(
                 "The nvalchemiops DFT-D3 backend supports only CPU and CUDA, "
@@ -466,6 +468,7 @@ class DFTD3Calculator(Calculator):
     ) -> None:
         super().__init__()
         self.contributions: dict[str, tuple[Any, Any]] = {}
+        self._base_snapshot = self._dispersion_snapshot = None
         self.base_calculator = calculator
         self.dispersion_calculator = _NValChemiDFTD3Calculator(
             functional,
@@ -482,13 +485,28 @@ class DFTD3Calculator(Calculator):
             if prop in dispersion_properties
         ]
 
+    def reset(self):
+        super().reset()
+        self._base_snapshot = self._dispersion_snapshot = None
+        self.contributions = {}
+
     def check_state(self, atoms: Atoms, tol: float = 1e-15) -> list[str]:
-        from fairchem.core.calculate.ase_calculator import _metadata_equal
+        from fairchem.core.calculate.ase_calculator import (
+            _child_cache_changes,
+            _model_input_changes,
+        )
 
         changes = super().check_state(atoms, tol)
-        if not changes and not _metadata_equal(self.atoms.info, atoms.info):
-            changes.append("info")
-        return changes
+        return (
+            changes
+            or _model_input_changes(self.atoms, atoms)
+            or _child_cache_changes(
+                self.base_calculator, self._base_snapshot, atoms, tol
+            )
+            or _child_cache_changes(
+                self.dispersion_calculator, self._dispersion_snapshot, atoms, tol
+            )
+        )
 
     def calculate(
         self,
@@ -499,6 +517,8 @@ class DFTD3Calculator(Calculator):
         """
         Evaluate each calculator once and directly add common results.
         """
+
+        from fairchem.core.calculate.ase_calculator import _child_cache_snapshot
 
         self.contributions = {}
         self.results = {}
@@ -533,6 +553,8 @@ class DFTD3Calculator(Calculator):
             contributions[prop] = (base_result, dispersion_result)
         self.results = results
         self.contributions = contributions
+        self._base_snapshot = _child_cache_snapshot(self.base_calculator)
+        self._dispersion_snapshot = _child_cache_snapshot(self.dispersion_calculator)
 
     @property
     def functional(self) -> str:

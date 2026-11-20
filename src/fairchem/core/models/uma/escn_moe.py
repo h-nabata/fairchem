@@ -170,7 +170,9 @@ class eSCNMDMoeBackbone(eSCNMDBackbone, MOLEInterface):
 
         # drop moe parameters from merged model
         for block in self.blocks:
-            block.edge_wise._chunk_mole_states = ()
+            block.edge_wise._checkpoint_mole_states = ()
+            if hasattr(block.edge_wise, "_chunk_mole_states"):
+                del block.edge_wise._chunk_mole_states
         self.routing_mlp = None
         self.composition_embedding = None
         self.num_experts = 0
@@ -495,7 +497,28 @@ class eSCNMDMoeBackbone(eSCNMDBackbone, MOLEInterface):
         return self
 
 
-class DatasetSpecificMoEWrapper(nn.Module, HeadInterface):
+class _MergedDatasetHead(nn.Module, HeadInterface):
+    def _merge_dataset(self, data):
+        datasets = data.dataset
+        if not datasets or any(name != datasets[0] for name in datasets):
+            raise MergeMoleConsistencyError(
+                f"A merged output head requires one dataset across the batch, got {datasets}"
+            )
+        if datasets[0] not in self.dataset_names:
+            raise ValueError(f"Unknown dataset {datasets[0]!r} for this output head")
+        self.on_predict_check(data)
+        return datasets[0]
+
+    def on_predict_check(self, data):
+        if self.merged_on_dataset is not None and any(
+            dataset != self.merged_on_dataset for dataset in data.dataset
+        ):
+            raise MergeMoleConsistencyError(
+                f"Output head was merged for {self.merged_on_dataset}, got {data.dataset}"
+            )
+
+
+class DatasetSpecificMoEWrapper(_MergedDatasetHead):
     def __init__(
         self,
         backbone,
@@ -583,7 +606,7 @@ class DatasetSpecificMoEWrapper(nn.Module, HeadInterface):
 
         Sets one-hot expert coefficients and replaces all MOLE→Linear.
         """
-        self.merged_on_dataset = data.dataset[0]
+        self.merged_on_dataset = self._merge_dataset(data)
         expert_idx = self.dataset_name_to_exp[self.merged_on_dataset]
         self.global_mole_tensors.expert_mixing_coefficients = torch.zeros(
             1,
@@ -618,6 +641,7 @@ class DatasetSpecificMoEWrapper(nn.Module, HeadInterface):
     def forward(self, data, emb: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         # Fast path for merged model - skip MOLE routing overhead
         if self.merged_on_dataset is not None:
+            self.on_predict_check(data)
             head_output = self.head(data, emb)
             full_output = {}
             for key in head_output:
@@ -669,7 +693,7 @@ class DatasetSpecificMoEWrapper(nn.Module, HeadInterface):
         )
 
 
-class DatasetSpecificSingleHeadWrapper(nn.Module, HeadInterface):
+class DatasetSpecificSingleHeadWrapper(_MergedDatasetHead):
     def __init__(
         self, backbone, dataset_names, head_cls, wrap_property=True, head_kwargs=None
     ):
@@ -687,7 +711,7 @@ class DatasetSpecificSingleHeadWrapper(nn.Module, HeadInterface):
         self.merged_on_dataset = None
 
     def merge_MOLE_model(self, data):
-        self.merged_on_dataset = data.dataset[0]
+        self.merged_on_dataset = self._merge_dataset(data)
         self.non_merged_dataset_names = [
             name for name in self.dataset_names if name != self.merged_on_dataset
         ]
@@ -703,7 +727,7 @@ class DatasetSpecificSingleHeadWrapper(nn.Module, HeadInterface):
 
     @conditional_grad(torch.enable_grad())
     def forward(self, data, emb: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        # run the internal head
+        self.on_predict_check(data)
         head_output = self.head(data, emb)
 
         # if merged just return the merged outputs

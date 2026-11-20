@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import math
 import operator
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -191,15 +192,98 @@ def get_max_neighbors_mask(
     return mask, sum_partitions(selected_counts, image_indptr)
 
 
-def _wrap_graph_positions(pos, batch, cell, reciprocal, pbc):
-    pos = pos.to(torch.promote_types(pos.dtype, cell.dtype))
+def complete_periodic_cell(cell, flags):
+    """Complete only undefined nonperiodic axes for lattice searches."""
+    flags = flags.expand(len(cell), -1)
+    volume = (cell[:, 0] * torch.cross(cell[:, 1], cell[:, 2], dim=-1)).sum(-1)
+    incomplete = flags.any(-1) & (volume == 0)
+    if not bool(incomplete.any()):
+        return cell
+    completed = cell.clone()
+    for system in torch.where(incomplete)[0].tolist():
+        axes = torch.where(flags[system])[0].tolist()
+        missing = torch.where(~flags[system])[0].tolist()
+        basis = cell[system, axes]
+        if not missing or bool((basis.norm(dim=-1) == 0).any()):
+            raise ValueError(
+                "Periodic lattice vectors must span a nonsingular subspace"
+            )
+        if len(axes) == 2:
+            normal = torch.cross(basis[0], basis[1], dim=0)
+            length = normal.norm()
+            if not bool(length > 0):
+                raise ValueError(
+                    "Periodic lattice vectors must span a nonsingular subspace"
+                )
+            completed[system, missing[0]] = normal / length
+        else:
+            direction = basis[0] / basis[0].norm()
+            pivot = torch.zeros_like(direction)
+            pivot[direction.abs().argmin()] = 1
+            normal = torch.cross(direction, pivot, dim=0)
+            normal = normal / normal.norm()
+            completed[system, missing[0]] = normal
+            completed[system, missing[1]] = torch.cross(direction, normal, dim=0)
+    return completed
+
+
+def public_image_offsets(images, dtype):
+    """Use the historical floating dtype whenever it represents every image ID."""
+    converted = images.to(dtype)
+    return converted if torch.equal(converted.long(), images) else images
+
+
+def periodic_search_frame(data, flags):
+    """Return differentiable local positions, integer image IDs and reciprocal vectors."""
+    cell = data.cell
+    with torch.no_grad():
+        search_cell = complete_periodic_cell(cell, flags)
+        cross = torch.cross(search_cell.roll(-1, 1), search_cell.roll(-2, 1), dim=-1)
+        volume = (search_cell[:, 0] * cross[:, 0]).sum(-1)
+        periodic = flags.any(1)
+        if bool((periodic & ((volume == 0) | ~volume.isfinite())).any()):
+            raise ValueError(
+                "Periodic graph generation requires a nonsingular finite-volume cell"
+            )
+        reciprocal = cross / torch.where(periodic, volume, 1)[:, None, None]
+        batch = getattr(data, "batch", None)
+        if batch is None and len(cell) > 1:
+            batch = torch.arange(len(cell), device=cell.device).repeat_interleave(
+                data.natoms, output_size=len(data.pos)
+            )
+        pos = data.pos.to(torch.promote_types(data.pos.dtype, cell.dtype))
+        if len(cell) == 1:
+            frac = pos @ reciprocal[0].T.to(pos)
+            fractional_images = torch.where(flags, frac.floor(), 0)
+        else:
+            frac = (reciprocal[batch].to(pos) @ pos.unsqueeze(-1)).squeeze(-1)
+            fractional_images = torch.where(
+                flags.expand(len(cell), -1)[batch], frac.floor(), 0
+            )
+    if pos.dtype == torch.float32 and bool((fractional_images.abs() >= 16384).any()):
+        # FP32 cannot reliably subtract large integer multiples of a nonbinary
+        # lattice vector. Reduce only such unwrapped inputs in double. Xe devices
+        # without FP64 can still run the model in FP32 after a CPU reduction.
+        device = (
+            pos.device if pos.device.type in {"cpu", "cuda"} else torch.device("cpu")
+        )
+        wide = SimpleNamespace(
+            pos=data.pos.to(device=device, dtype=torch.float64),
+            cell=cell.to(device=device, dtype=torch.float64),
+            batch=None if batch is None else batch.to(device),
+            natoms=data.natoms.to(device),
+        )
+        local, exact_images, _ = periodic_search_frame(wide, flags.to(device))
+        return local.to(pos), exact_images.to(pos.device), reciprocal
+    if pos.dtype == torch.float64 and bool((fractional_images.abs() >= 2**62).any()):
+        raise ValueError("Periodic image difference exceeds supported integer range")
+    images = fractional_images.long()
+    pos = data.pos.to(torch.promote_types(data.pos.dtype, cell.dtype))
     if len(cell) == 1:
-        frac = pos @ reciprocal[0].T.to(pos)
-        images = torch.where(pbc, frac.detach().floor(), 0)
-        return pos - images @ cell[0].to(pos), images
-    frac = (reciprocal[batch].to(pos) @ pos.unsqueeze(-1)).squeeze(-1)
-    images = torch.where(pbc.expand(len(cell), -1)[batch], frac.detach().floor(), 0)
-    return pos - (images.unsqueeze(1) @ cell[batch].to(pos)).squeeze(1), images
+        pos = pos - images.to(pos) @ cell[0].to(pos)
+    else:
+        pos = pos - (images.to(pos).unsqueeze(1) @ cell[batch].to(pos)).squeeze(1)
+    return pos, images, reciprocal
 
 
 # @torch.no_grad() # breaks torch compile test with OOM
@@ -209,6 +293,8 @@ def radius_graph_pbc(
     max_num_neighbors_threshold,
     enforce_max_neighbors_strictly: bool = False,
     pbc: torch.Tensor | None = None,
+    *,
+    _frame=None,
 ):
     flags = system_pbc_flags(data, pbc)
     pbc = flags.any(0).tolist()
@@ -275,20 +361,8 @@ def radius_graph_pbc(
 
     images = None
     if any(pbc):
-        cross = torch.cross(data.cell.roll(-1, 1), data.cell.roll(-2, 1), dim=-1)
-        volume = (data.cell[:, 0] * cross[:, 0]).sum(-1)
-        if bool(((volume == 0) | ~volume.isfinite()).any()):
-            raise ValueError(
-                "Periodic graph generation requires a nonsingular finite-volume cell"
-            )
-        reciprocal = cross / volume[:, None, None]
-        batch = getattr(data, "batch", None)
-        if batch is None and batch_size > 1:
-            batch = torch.arange(batch_size, device=device).repeat_interleave(
-                data.natoms
-            )
-        atom_pos, images = _wrap_graph_positions(
-            atom_pos, batch, data.cell, reciprocal, flags
+        atom_pos, images, reciprocal = (
+            periodic_search_frame(data, flags) if _frame is None else _frame
         )
         repetitions = torch.where(flags, (radius * reciprocal.norm(dim=-1)).ceil(), 0)
         max_rep = repetitions.amax(dim=0)
@@ -364,7 +438,10 @@ def radius_graph_pbc(
         unit_cell = unit_cell.view(-1, 3)
 
     if images is not None:
-        unit_cell = unit_cell + (images[index1] - images[index2]).to(unit_cell)
+        original_dtype = unit_cell.dtype
+        unit_cell = unit_cell.long() + (images[index1] - images[index2])
+        if _frame is None:
+            unit_cell = public_image_offsets(unit_cell, original_dtype)
     edge_index = torch.stack((index2, index1))
 
     return edge_index, unit_cell, num_neighbors_image
@@ -547,6 +624,7 @@ def _image_counts(repetitions):
 
 
 _STENCIL_TILE = 262144
+_CELL_PAIR_TILE = 32768
 
 
 def _cell_candidates(
@@ -587,10 +665,10 @@ def _cell_candidates(
             include_self=False,
         )
         # The sparse integer hash must fit int64, including batch offsets.
-        max_extent = (source_atom_pos - origin[source_atom_image]).abs().max()
+        max_extent = (source_atom_pos - origin[source_atom_image]).abs().amax(0)
         safe_axis = min(1000000, int((2**59 / max(1, batch_size)) ** (1 / 3)))
-        if bool(max_extent / grid_resolution > safe_axis):
-            grid_resolution = max_extent / safe_axis
+        # Widen only the overflowing axes so vacuum in x cannot crowd y/z bins.
+        grid_resolution = (max_extent / safe_axis).clamp_min(grid_resolution)
     source_atom_grid = torch.floor(
         (source_atom_pos - origin[source_atom_image]) / grid_resolution
     ).long()
@@ -662,7 +740,7 @@ def _cell_candidates(
     grid_cell_start = torch.cumsum(grid_cell_atom_count, 0) - grid_cell_atom_count
 
     # How many grid cells do we need to include in each direction given the search radius?
-    padding_size = math.floor(radius / grid_resolution) + 1
+    padding_size = math.floor(radius / grid_resolution) + 1 if legacy_order else 2
     num_padding_grid_cells = (
         (2 * padding_size + 1) * (2 * padding_size + 1) * (2 * padding_size + 1)
     )
@@ -706,10 +784,9 @@ def _cell_candidates(
             delta = (grid_index - relative[:, None]).clamp_min(0) + (
                 relative[:, None] - grid_index - 1
             ).clamp_min(0)
-            margin = 64 * torch.finfo(atom_pos.dtype).eps * (relative.abs().amax() + 1)
-            in_bounds &= (
-                delta.square().sum(-1) <= (radius / grid_resolution + margin) ** 2
-            )
+            margin = 64 * torch.finfo(atom_pos.dtype).eps * (relative.abs() + 1)
+            nearest = (delta - margin[:, None]).clamp_min_(0) * grid_resolution
+            in_bounds &= nearest.square().sum(-1) <= radius * radius
             del delta
         del grid_index
         keys = target_atom_grid_id[rows, None] + padding_ids[systems]
@@ -724,21 +801,36 @@ def _cell_candidates(
         counts = torch.where(
             occupied_grid_ids[occupied] == keys, grid_cell_atom_count[occupied], 0
         )
-        starts = counts.cumsum(0) - counts
-        offsets = torch.repeat_interleave(grid_cell_start[occupied] - starts, counts)
-        source = sort_indices[torch.arange(len(offsets), device=device) + offsets]
-        target = torch.repeat_interleave(
-            torch.arange(start, min(len(target_atom_pos), start + tile), device=device),
-            counts.view(-1, num_padding_grid_cells).sum(1),
-            output_size=len(source),
-        )
-        squared = (target_atom_pos[target] - source_atom_pos[source]).square().sum(-1)
-        keep = squared <= radius * radius
-        if not include_zero_distance:
-            keep &= squared != 0
-        source_parts.append(source[keep])
-        target_parts.append(target[keep])
-        squared_parts.append(squared[keep])
+        ends = counts.cumsum(0)
+        total = int(ends[-1])
+        # Bound atom pairs even when one occupied bin contains a dense cluster.
+        # Prefix sums let a single target/bin run span several pair tiles.
+        for first in range(0, total, _CELL_PAIR_TILE):
+            pair = torch.arange(
+                first, min(first + _CELL_PAIR_TILE, total), device=device
+            )
+            if total <= _CELL_PAIR_TILE:
+                group = torch.arange(len(counts), device=device).repeat_interleave(
+                    counts, output_size=total
+                )
+            else:
+                group = torch.searchsorted(ends, pair, right=True)
+            source = sort_indices[
+                grid_cell_start[occupied[group]] + pair - (ends[group] - counts[group])
+            ]
+            target = start + group // num_padding_grid_cells
+            squared = (
+                (target_atom_pos[target] - source_atom_pos[source]).square().sum(-1)
+            )
+            keep = squared <= radius * radius
+            if not include_zero_distance:
+                keep &= squared != 0
+            source_parts.append(source[keep])
+            target_parts.append(target[keep])
+            squared_parts.append(squared[keep])
+    if not source_parts:
+        empty = torch.empty(0, dtype=torch.long, device=device)
+        return empty, empty, atom_pos.new_empty(0)
     return tuple(
         torch.cat(parts) if len(parts) > 1 else parts[0]
         for parts in (source_parts, target_parts, squared_parts)
@@ -755,6 +847,7 @@ def radius_graph_pbc_v2(
     *,
     method: str = "cell",
     include_zero_distance: bool = False,
+    _frame=None,
 ):
     radius, max_num_neighbors_threshold, enforce_max_neighbors_strictly = (
         validate_graph_parameters(
@@ -806,14 +899,9 @@ def radius_graph_pbc_v2(
     image_numbers = None
     if any(pbc):
         cell = data.cell
-        cross = torch.cross(cell.roll(-1, 1), cell.roll(-2, 1), dim=-1)
-        volume = (cell[:, 0] * cross[:, 0]).sum(-1)
-        periodic = sys_pbc.any(1)
-        if bool((periodic & ((volume == 0) | ~volume.isfinite())).any()):
-            raise ValueError(
-                "Periodic graph generation requires a nonsingular finite-volume cell"
-            )
-        reciprocal = cross / torch.where(periodic, volume, 1)[:, None, None]
+        atom_pos, image_numbers, reciprocal = (
+            periodic_search_frame(data, sys_pbc) if _frame is None else _frame
+        )
         repetitions = torch.where(sys_pbc, (radius * reciprocal.norm(dim=-1)).ceil(), 0)
         # Compute image counts in Python integer arithmetic. FP32 cannot
         # represent all products above 2**24 and int64 products may overflow.
@@ -835,12 +923,6 @@ def radius_graph_pbc_v2(
                     for offsets, system_cell in zip(unit_cells, cell, strict=True)
                 ]
             )
-        # Search inside one primary cell, then translate each returned edge
-        # back into the caller's original coordinate frame.
-        atom_pos, image_numbers = _wrap_graph_positions(
-            atom_pos, data_batch_idxs, cell, reciprocal, sys_pbc
-        )
-
     # If node_partition exists, this means we want to generate only a partial graph
     # from a subset of target atoms to the entire set of source atoms
     if hasattr(data, "node_partition"):
@@ -973,9 +1055,11 @@ def radius_graph_pbc_v2(
         source_atom_edge_index = source_atom_edge_index[mask]
     if any(pbc):
         source_idx = source_atom_index[source_atom_edge_index]
-        source_cell = unit_cell[pbc_cell_index[source_atom_edge_index]] + (
+        source_cell = unit_cell[pbc_cell_index[source_atom_edge_index]].long() + (
             image_numbers[target_idx] - image_numbers[source_idx]
-        ).to(data.cell.dtype)
+        )
+        if _frame is None:
+            source_cell = public_image_offsets(source_cell, data.cell.dtype)
     else:
         source_idx = source_atom_edge_index
         source_cell = data.cell.new_zeros((len(source_idx), 3))

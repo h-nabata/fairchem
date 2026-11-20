@@ -14,6 +14,7 @@ import gc
 import json
 import uuid
 from contextlib import nullcontext
+from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -24,6 +25,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from fairchem.core import FAIRChemCalculator
 from fairchem.core.calculate import pretrained_mlip
+from fairchem.core.common.distutils import parse_device
 from fairchem.core.regression_suite.artifacts.storage import (
     fragment_path,
     load_reference,
@@ -41,6 +43,7 @@ from fairchem.core.regression_suite.execution.environment import execution_envir
 from fairchem.core.regression_suite.execution.source import source_provenance
 from fairchem.core.regression_suite.spec.hashing import (
     canonical_json,
+    file_sha256,
     stable_hash,
 )
 from fairchem.core.regression_suite.spec.profiles import (
@@ -211,7 +214,7 @@ def _release_predictor(*, compiled: bool, device: str) -> None:
     if compiled:
         torch.compiler.reset()
     gc.collect()
-    parsed = torch.device(device)
+    parsed = parse_device(device)
     if parsed.type in {"cuda", "xpu"}:
         backend = getattr(torch, parsed.type)
         with backend.device(parsed):
@@ -291,6 +294,9 @@ def _prepare_run(
         raise ValueError(f"role must be one of {sorted(_RUN_ROLES)}")
     if role == "reference" and profile != "fp64-eager":
         raise ValueError("only fp64-eager may produce a reference fragment")
+    digest = checkpoint_digest(str(cfg.checkpoint))
+    if cfg.get("checkpoint_sha256") is not None and digest != cfg.checkpoint_sha256:
+        raise RegressionSchemaError("checkpoint SHA-256 differs from the launch")
     git_commit, git_dirty = source_provenance()
     identity = {
         "suite": suite.name,
@@ -298,6 +304,7 @@ def _prepare_run(
         "role": role,
         "run_id": str(cfg.get("run_id") or uuid.uuid4().hex),
         "checkpoint": str(cfg.checkpoint_id or cfg.checkpoint),
+        "checkpoint_sha256": digest,
         "seed": int(cfg.seed),
         "git_commit": git_commit,
         "git_dirty": git_dirty,
@@ -391,6 +398,8 @@ def run_suite(config: DictConfig | Mapping[str, Any]) -> dict[str, Any]:
             finally:
                 del predictor
                 _release_predictor(compiled=settings.compile, device=identity["device"])
+    if checkpoint_digest(str(cfg.checkpoint)) != identity["checkpoint_sha256"]:
+        raise RegressionSchemaError("checkpoint changed while the suite was running")
     sidecar = None
     if identity["role"] != "reference" and not smoke and shard_index is None:
         sidecar = _performance_sidecar(suite, samples, identity=identity)
@@ -479,6 +488,26 @@ def resolve_checkpoint(checkpoint: str, checkpoint_id: str | None) -> tuple[str,
     return str(path.resolve()), checkpoint_id
 
 
+@lru_cache(maxsize=16)
+def _cached_checkpoint_digest(path: Path, file_identity: tuple[int, ...]) -> str:
+    # The stat identity invalidates the cached digest on replacement or modification.
+    return file_sha256(path)
+
+
+def checkpoint_digest(checkpoint: str) -> str:
+    """Hash the checkpoint bytes on the machine executing the run."""
+    path = Path(
+        pretrained_mlip.pretrained_checkpoint_path_from_name(checkpoint)
+        if checkpoint in pretrained_mlip.available_models
+        else checkpoint
+    ).resolve(strict=True)
+    stat = path.stat()
+    return _cached_checkpoint_digest(
+        path,
+        (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns),
+    )
+
+
 def resolve_baseline_checkpoint(
     baseline: Mapping[str, Any],
     checkpoint: str | None,
@@ -493,4 +522,12 @@ def resolve_baseline_checkpoint(
     )
     if checkpoint_id != baseline["checkpoint"]:
         raise RegressionSchemaError("checkpoint differs from the baseline's")
+    # Registered weights may only be cached on the execution node. Each worker
+    # verifies them in _prepare_run before constructing its first predictor.
+    if (
+        checkpoint not in pretrained_mlip.available_models
+        and baseline.get("checkpoint_sha256") is not None
+        and checkpoint_digest(checkpoint) != baseline["checkpoint_sha256"]
+    ):
+        raise RegressionSchemaError("checkpoint SHA-256 differs from the baseline's")
     return checkpoint, checkpoint_id

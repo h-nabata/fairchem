@@ -45,6 +45,7 @@ class RelaxationRunner(PreemptableMixin, CalculateRunner):
     processes the input data in chunks, and saves the results.
     """
 
+    checkpoint_shard_pattern = "relaxation_checkpoint_*.json.gz"
     result_glob_pattern: ClassVar[str] = "relaxation_*-*.json.gz"
 
     def __init__(
@@ -183,9 +184,7 @@ class RelaxationRunner(PreemptableMixin, CalculateRunner):
                         f"STOPFAIR detected at structure {i}, saving "
                         f"{len(self._current_results)} completed results to {save_path}"
                     )
-                    self.save_state(save_path, is_preemption=True)
-                    self.stopfair_path.unlink(missing_ok=True)
-                    raise  # propagate to outer except StopfairDetected
+                    self.handle_stopfair()
 
                 except Exception as ex:  # TODO too broad-figure out which to catch
                     results.update(dict.fromkeys(self._calculate_properties, np.nan))

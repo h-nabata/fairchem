@@ -112,6 +112,7 @@ def qualify_suite(
     baseline_suite: Mapping[str, Any],
     *,
     smoke: bool = False,
+    minimum_tier: str | None = None,
 ) -> dict[str, Any]:
     """
     Return the tightest calibrated tier passed by every decision observable.
@@ -156,9 +157,17 @@ def qualify_suite(
         "tier_pass": tier_pass,
         "observables": observable_results,
     }
+    tier = tightest or PRECISION_TIERS[-1]
+    if minimum_tier is not None:
+        accepted = tier_pass[minimum_tier]
+        qualification.update(
+            minimum_tier=minimum_tier, passed=accepted, classification=status
+        )
+        if not accepted:
+            qualification["status"] = "SMOKE_FAIL" if smoke else "FAIL"
+            tier = minimum_tier
     if smoke:
         return qualification
-    tier = tightest or PRECISION_TIERS[-1]
     name, channel, statistic, ratio = max(
         ((name, *limiting_check(result, tier)) for name, result in decisions.items()),
         key=lambda item: item[3],

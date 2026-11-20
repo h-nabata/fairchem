@@ -21,6 +21,7 @@ from ase.calculators.calculator import (
     all_changes,
     equal,
 )
+from ase.constraints import FixAtoms
 from ase.stress import full_3x3_to_voigt_6_stress
 
 from fairchem.core.calculate import pretrained_mlip
@@ -117,6 +118,90 @@ def _calculator_predictions(pred, properties, natoms):
     return results
 
 
+def _predictor_graph_options(predict_unit):
+    """Resolve the same model graph and precision contract for ASE and LAMMPS."""
+    settings = getattr(predict_unit, "inference_settings", None)
+    graph = getattr(predict_unit, "graph_settings", None)
+    if not isinstance(graph, dict):
+        backbone = getattr(
+            getattr(getattr(predict_unit, "model", None), "module", None),
+            "backbone",
+            None,
+        )
+        graph = {
+            name: getattr(backbone, name)
+            for name in (
+                "cutoff",
+                "max_neighbors",
+                "otf_graph",
+                "enforce_max_neighbors_strictly",
+            )
+            if hasattr(backbone, name)
+            and isinstance(getattr(backbone, name), (float, int, bool))
+        }
+    otf_graph = graph.get("otf_graph")
+    external = getattr(settings, "external_graph_gen", False) is True
+    r_edges = external or otf_graph is False
+    if external and otf_graph is True:
+        raise ValueError(
+            "external_graph_gen=True conflicts with backbone otf_graph=True"
+        )
+    radius = graph.get("cutoff", 6.0) if r_edges else 6.0
+    max_neigh = graph.get("max_neighbors", 300) if r_edges else None
+
+    return {
+        "r_edges": r_edges,
+        "max_neigh": max_neigh,
+        "radius": radius,
+        "enforce_max_neighbors_strictly": graph.get(
+            "enforce_max_neighbors_strictly", True
+        ),
+        "target_dtype": getattr(settings, "base_precision_dtype", torch.float32),
+    }
+
+
+def _fixed_mask(atoms):
+    mask = np.zeros(len(atoms), dtype=bool)
+    for constraint in atoms.constraints:
+        if isinstance(constraint, FixAtoms):
+            mask[constraint.index] = True
+    return mask
+
+
+def _model_input_changes(previous, atoms):
+    if not _metadata_equal(previous.info, atoms.info):
+        return ["info"]
+    if ("tags" in atoms.arrays or "tags" in previous.arrays) and not np.array_equal(
+        previous.get_tags(), atoms.get_tags()
+    ):
+        return ["tags"]
+    if (previous.constraints or atoms.constraints) and not np.array_equal(
+        _fixed_mask(previous), _fixed_mask(atoms)
+    ):
+        return ["constraints"]
+    return []
+
+
+def _child_cache_snapshot(calculator):
+    # ASE replaces its stored Atoms on calculate/reset. Keep the identity so
+    # an independent evaluation of a shared child also invalidates the parent.
+    return calculator.atoms, copy.deepcopy(calculator.parameters)
+
+
+def _child_cache_changes(calculator, snapshot, atoms, tol):
+    changes = calculator.check_state(atoms, tol=tol)
+    if changes:
+        return changes
+    if snapshot is None:
+        return ["parameters"]
+    previous_atoms, parameters = snapshot
+    if calculator.atoms is not previous_atoms or not _metadata_equal(
+        parameters, calculator.parameters
+    ):
+        return ["parameters"]
+    return []
+
+
 class FAIRChemCalculator(Calculator):
     def __init__(
         self,
@@ -176,47 +261,12 @@ class FAIRChemCalculator(Calculator):
 
         self.predictor = predict_unit
 
-        settings = predict_unit.inference_settings
-        graph = getattr(predict_unit, "graph_settings", None)
-        if not isinstance(graph, dict):
-            backbone = getattr(
-                getattr(getattr(predict_unit, "model", None), "module", None),
-                "backbone",
-                None,
-            )
-            graph = {
-                name: getattr(backbone, name)
-                for name in (
-                    "cutoff",
-                    "max_neighbors",
-                    "otf_graph",
-                    "enforce_max_neighbors_strictly",
-                )
-                if hasattr(backbone, name)
-                and isinstance(getattr(backbone, name), (float, int, bool))
-            }
-        otf_graph = graph.get("otf_graph")
-        r_edges = settings.external_graph_gen is True or otf_graph is False
-        if settings.external_graph_gen is True and otf_graph is True:
-            raise ValueError(
-                "external_graph_gen=True conflicts with backbone otf_graph=True"
-            )
-        radius = graph.get("cutoff", 6.0) if r_edges else 6.0
-        max_neigh = graph.get("max_neighbors", 300) if r_edges else None
-
-        a2g_kwargs = {
-            "task_name": self.task_name,
-            "r_edges": r_edges,
-            "r_data_keys": ["spin", "charge"],
-            "max_neigh": max_neigh,
-            "radius": radius,
-            "enforce_max_neighbors_strictly": graph.get(
-                "enforce_max_neighbors_strictly", True
-            ),
-            "target_dtype": predict_unit.inference_settings.base_precision_dtype,
-        }
-
-        self.a2g = partial(AtomicData.from_ase, **a2g_kwargs)
+        self.a2g = partial(
+            AtomicData.from_ase,
+            task_name=self.task_name,
+            r_data_keys=["spin", "charge"],
+            **_predictor_graph_options(predict_unit),
+        )
 
     @property
     def task_name(self) -> str:
@@ -278,8 +328,8 @@ class FAIRChemCalculator(Calculator):
             list: A list of changes detected in the system.
         """
         state = super().check_state(atoms, tol=tol)
-        if not state and not _metadata_equal(self.atoms.info, atoms.info):
-            state.append("info")
+        if not state:
+            state = _model_input_changes(self.atoms, atoms)
         return state
 
     def get_property(self, name, atoms=None, allow_calculation=True):
@@ -341,7 +391,20 @@ class FAIRChemCalculator(Calculator):
         if np.all(np.asarray(atoms.pbc)) and np.allclose(atoms.cell, 0):
             raise AllZeroUnitCellError
 
-        # Validate input data
+        # AtomicData completes missing cell vectors for nonperiodic molecules.
+        # Only the original physical volume can normalize a stress.
+        output_properties = self.implemented_properties
+        if "stress" in properties or "stress" in output_properties:
+            volume = atoms.cell.volume
+            if not np.isfinite(volume) or volume <= 0:
+                if "stress" in properties:
+                    raise ValueError(
+                        "Stress requires a cell with finite nonzero volume"
+                    )
+                output_properties = [
+                    name for name in output_properties if name != "stress"
+                ]
+
         self.predictor.validate_atoms_data(atoms, self.task_name)
 
         # Standard call to check system_changes etc
@@ -372,12 +435,7 @@ class FAIRChemCalculator(Calculator):
                 requested.update(
                     {"energy", "forces"}.intersection(self.implemented_properties)
                 )
-                volume = atoms.cell.volume
-                if (
-                    "stress" in self.implemented_properties
-                    and np.isfinite(volume)
-                    and volume > 0
-                ):
+                if "stress" in output_properties:
                     requested.add("stress")
             pred = self.predictor.predict(
                 data, requested_properties=tuple(sorted(requested))
@@ -386,9 +444,7 @@ class FAIRChemCalculator(Calculator):
             pred = self.predictor.predict(data)
 
         results = {} if system_changes else dict(self.results)
-        results.update(
-            _calculator_predictions(pred, self.implemented_properties, len(atoms))
-        )
+        results.update(_calculator_predictions(pred, output_properties, len(atoms)))
         self.results = results
 
     def _check_atoms_pbc(self, atoms) -> None:
@@ -431,6 +487,7 @@ class FormationEnergyCalculator(Calculator):
                 raise ValueError("element_references must be provided")
         self.element_references = copy.deepcopy(element_references)
         self._reference_snapshot = None
+        self._child_snapshot = None
 
         if apply_corrections is True:
             if isinstance(calculator, FAIRChemCalculator):
@@ -459,10 +516,14 @@ class FormationEnergyCalculator(Calculator):
         if hasattr(calculator, "implemented_properties"):
             self.implemented_properties = list(calculator.implemented_properties)
 
+    def reset(self):
+        super().reset()
+        self._child_snapshot = self._reference_snapshot = None
+
     def check_state(self, atoms, tol=1e-15):
         state = super().check_state(atoms, tol=tol)
-        if not state and not _metadata_equal(self.atoms.info, atoms.info):
-            state.append("info")
+        if not state:
+            state = _model_input_changes(self.atoms, atoms)
         configuration = (
             self.element_references,
             self.apply_corrections,
@@ -470,7 +531,9 @@ class FormationEnergyCalculator(Calculator):
         )
         if not state and not _metadata_equal(self._reference_snapshot, configuration):
             state.append("parameters")
-        return state
+        return state or _child_cache_changes(
+            self.calculator, self._child_snapshot, atoms, tol
+        )
 
     def calculate(
         self,
@@ -502,9 +565,18 @@ class FormationEnergyCalculator(Calculator):
 
         results = copy.deepcopy(self.calculator.results)
 
-        if "energy" in results:
-            total_energy = results["energy"]
-
+        energy_names = [name for name in ("energy", "free_energy") if name in results]
+        if energy_names:
+            element_counts = Counter(atoms.get_chemical_symbols())
+            missing_elements = element_counts.keys() - self.element_references.keys()
+            if missing_elements:
+                raise ValueError(
+                    f"Missing reference energies for elements: {missing_elements}"
+                )
+            reference = sum(
+                self.element_references[element] * count
+                for element, count in element_counts.items()
+            )
             if self.apply_corrections:
                 try:
                     from fairchem.data.omat.entries.compatibility import (
@@ -514,33 +586,16 @@ class FormationEnergyCalculator(Calculator):
                     raise ImportError(
                         "fairchem.data.omat is required to apply MP style corrections. Please install it."
                     ) from err
-                total_energy = apply_mp_style_corrections(
-                    total_energy, atoms, correction_type=self._correction_type
+                # MP corrections depend on composition and structure and are additive.
+                correction = apply_mp_style_corrections(
+                    0.0, atoms, correction_type=self._correction_type
                 )
-
-            element_symbols = atoms.get_chemical_symbols()
-            element_counts = Counter(element_symbols)
-
-            missing_elements = set(element_symbols) - set(
-                self.element_references.keys()
-            )
-            if missing_elements:
-                raise ValueError(
-                    f"Missing reference energies for elements: {missing_elements}"
-                )
-
-            total_ref_energy = sum(
-                self.element_references[element] * count
-                for element, count in element_counts.items()
-            )
-
-            formation_energy = total_energy - total_ref_energy
-
-            results["energy"] = formation_energy
-
-            if "free_energy" in results:
-                results["free_energy"] = formation_energy
+            else:
+                correction = 0.0
+            for name in energy_names:
+                results[name] = (results[name] + correction) - reference
         self.results = results
+        self._child_snapshot = _child_cache_snapshot(self.calculator)
         self._reference_snapshot = copy.deepcopy(
             (self.element_references, self.apply_corrections, self._correction_type)
         )

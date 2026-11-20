@@ -139,6 +139,8 @@ def _details(result: Mapping[str, Any]) -> list[str]:
     if result["qualification"] is not None:
         tier = result["qualification"]["tightest_tier"] or "BEYOND_TF32"
         lines.append(f"Tightest tier: {tier}")
+        if required := result["qualification"].get("minimum_tier"):
+            lines.append(f"Required tier: {required}")
     lines.append(f"Wall time: {result['elapsed_seconds']:.1f} s")
     return lines
 

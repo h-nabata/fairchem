@@ -13,10 +13,14 @@ import logging
 import math
 import time
 from collections import OrderedDict, defaultdict, deque
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from multiprocessing import cpu_count
 from numbers import Integral, Real
+from statistics import median
+from threading import Lock, RLock
 from typing import TYPE_CHECKING, Any
+from weakref import WeakValueDictionary
 
 import numpy as np
 import torch
@@ -70,6 +74,7 @@ __all__ = [
     "ModelSpec",
     "ModelSpecNotRegisteredError",
     "MultiplexedBatchPredictServer",
+    "delete_batch_predict_server",
     "get_app_handle_with_retry",
     "get_ray_connection_info",
     "probe_optimal_batch_size",
@@ -367,13 +372,13 @@ class BatchPredictServerMixin:
             requested = _normalize_requested_properties(
                 current[0].get("_requested_properties", None)
             )
-            batch = atomicdata_list_to_batch(
-                current, exclude_keys=["_requested_properties"]
-            )
             predict_kwargs = (
                 {} if requested is None else {"requested_properties": requested}
             )
             try:
+                batch = atomicdata_list_to_batch(
+                    current, exclude_keys=["_requested_properties"]
+                )
                 predict = getattr(
                     predict_unit, "_predict_owned_batch", predict_unit.predict
                 )
@@ -407,7 +412,9 @@ class BatchPredictServerMixin:
                 )
 
                 _clear_exception_tracebacks(err)
-                device = torch.device(getattr(predict_unit, "device", batch.pos.device))
+                device = torch.device(
+                    getattr(predict_unit, "device", current[0].pos.device)
+                )
             finally:
                 # Split results own CPU storage. Do not keep the failed or
                 # completed collated tensors alive during allocator cleanup or
@@ -1148,11 +1155,50 @@ class _DeployedApp:
     bind_kwargs: dict[str, Any]
     route_prefix: str
     batch_config: BatchConfig
+    owner: object = field(default_factory=object)
 
 
 # Process-local: only the process that deployed an app can redeploy it, since
 # redeploying requires the bound arguments (e.g. the predict unit ObjectRef).
 _DEPLOYED_APPS: dict[str, _DeployedApp] = {}
+
+
+_DEPLOYMENT_LOCKS = WeakValueDictionary()
+_REGISTRY_LOCK = Lock()
+
+
+def _deployment_lock(name):
+    # Waiters keep a strong reference until they exit their critical section.
+    # Unrelated deployments proceed independently, including slow serve.run calls.
+    with _REGISTRY_LOCK:
+        lock = _DEPLOYMENT_LOCKS.get(name)
+        if lock is None:
+            lock = RLock()
+            _DEPLOYMENT_LOCKS[name] = lock
+        return lock
+
+
+@contextmanager
+def _owned_deployment(name, owner):
+    with _deployment_lock(name):
+        record = _DEPLOYED_APPS.get(name)
+        if owner is not None and (record is None or record.owner is not owner):
+            raise RuntimeError(f"The client no longer owns deployment {name!r}")
+        yield
+
+
+@requires(ray_installed, message="Requires `ray[serve]` to be installed")
+def delete_batch_predict_server(deployment_name: str, *, owner=None) -> None:
+    """Delete a Serve app and release its local model reference after success."""
+    with _deployment_lock(deployment_name):
+        record = _DEPLOYED_APPS.get(deployment_name)
+        if owner is not None and (record is None or record.owner is not owner):
+            # A client for a superseded generation no longer owns this name.
+            return
+        if not ray.is_initialized():
+            raise RuntimeError("Reconnect to Ray before deleting the deployment")
+        serve.delete(deployment_name)
+        _DEPLOYED_APPS.pop(deployment_name, None)
 
 
 def _deploy_app(
@@ -1163,6 +1209,7 @@ def _deploy_app(
     batch_config: BatchConfig,
     deployment_name: str,
     route_prefix: str,
+    owner=None,
 ) -> serve.handle.DeploymentHandle:
     """
     Deploy (or redeploy) an app with batching pushed through ``user_config``.
@@ -1171,26 +1218,28 @@ def _deploy_app(
     kwargs so that Ray Serve applies them to every replica via ``reconfigure``,
     including replicas that autoscaling adds later.
     """
-    merged_options = {
-        **options_kwargs,
-        "user_config": {
-            **(options_kwargs.get("user_config") or {}),
-            **batch_config.to_user_config(),
-        },
-    }
-    app = deployment.options(**merged_options).bind(*bind_args, **bind_kwargs)
-    # ``serve.run`` blocks until the app reaches RUNNING, so a failed update
-    # raises here instead of being silently dropped.
-    handle = serve.run(app, name=deployment_name, route_prefix=route_prefix)
-    _DEPLOYED_APPS[deployment_name] = _DeployedApp(
-        deployment=deployment,
-        options_kwargs=options_kwargs,
-        bind_args=bind_args,
-        bind_kwargs=bind_kwargs,
-        route_prefix=route_prefix,
-        batch_config=batch_config,
-    )
-    return handle
+    with _deployment_lock(deployment_name):
+        merged_options = {
+            **options_kwargs,
+            "user_config": {
+                **(options_kwargs.get("user_config") or {}),
+                **batch_config.to_user_config(),
+            },
+        }
+        app = deployment.options(**merged_options).bind(*bind_args, **bind_kwargs)
+        # ``serve.run`` blocks until the app reaches RUNNING, so a failed update
+        # raises here instead of being silently dropped.
+        handle = serve.run(app, name=deployment_name, route_prefix=route_prefix)
+        _DEPLOYED_APPS[deployment_name] = _DeployedApp(
+            deployment=deployment,
+            options_kwargs=options_kwargs,
+            bind_args=bind_args,
+            bind_kwargs=bind_kwargs,
+            route_prefix=route_prefix,
+            batch_config=batch_config,
+            owner=object() if owner is None else owner,
+        )
+        return handle
 
 
 @requires(ray_installed, message="Requires `ray[serve]` to be installed")
@@ -1221,29 +1270,31 @@ def update_batch_config(
     if not isinstance(batch_config, BatchConfig):
         batch_config = BatchConfig(**(batch_config or {}))
 
-    record = _DEPLOYED_APPS.get(deployment_name)
-    if record is None:
-        raise KeyError(
-            f"No deployment named {deployment_name!r} was created by this "
-            "process, so its batching config cannot be updated. Batch config "
-            "updates must be issued from the process that called "
-            "setup_batch_predict_server / setup_multiplexed_batch_predict_server."
-        )
+    with _deployment_lock(deployment_name):
+        record = _DEPLOYED_APPS.get(deployment_name)
+        if record is None:
+            raise KeyError(
+                f"No deployment named {deployment_name!r} was created by this "
+                "process, so its batching config cannot be updated. Batch config "
+                "updates must be issued from the process that called "
+                "setup_batch_predict_server / setup_multiplexed_batch_predict_server."
+            )
 
-    _deploy_app(
-        deployment=record.deployment,
-        options_kwargs=record.options_kwargs,
-        bind_args=record.bind_args,
-        bind_kwargs=record.bind_kwargs,
-        batch_config=batch_config,
-        deployment_name=deployment_name,
-        route_prefix=record.route_prefix,
-    )
-    logging.info(
-        f"Broadcast batch config to all replicas of {deployment_name!r}: "
-        f"{batch_config}"
-    )
-    return batch_config
+        _deploy_app(
+            deployment=record.deployment,
+            options_kwargs=record.options_kwargs,
+            bind_args=record.bind_args,
+            bind_kwargs=record.bind_kwargs,
+            batch_config=batch_config,
+            deployment_name=deployment_name,
+            route_prefix=record.route_prefix,
+            owner=record.owner,
+        )
+        logging.info(
+            f"Broadcast batch config to all replicas of {deployment_name!r}: "
+            f"{batch_config}"
+        )
+        return batch_config
 
 
 @requires(ray_installed, message="Requires `ray[serve]` to be installed")
@@ -1266,29 +1317,33 @@ def update_served_predict_unit(
     Raises:
         KeyError: If ``deployment_name`` was not deployed from this process.
     """
-    record = _DEPLOYED_APPS.get(deployment_name)
-    if record is None:
-        raise KeyError(
-            f"No deployment named {deployment_name!r} was created by this "
-            "process, so its checkpoint cannot be updated."
-        )
+    with _deployment_lock(deployment_name):
+        record = _DEPLOYED_APPS.get(deployment_name)
+        if record is None:
+            raise KeyError(
+                f"No deployment named {deployment_name!r} was created by this "
+                "process, so its checkpoint cannot be updated."
+            )
 
-    _check_predict_unit_device(
-        predict_unit,
-        record.options_kwargs.get("ray_actor_options", {}).get("num_gpus", 0),
-    )
-    predict_unit_ref = ray.put(predict_unit)
-    _deploy_app(
-        deployment=record.deployment,
-        options_kwargs=record.options_kwargs,
-        # The predict unit ref is the first bound positional argument.
-        bind_args=(predict_unit_ref, *record.bind_args[1:]),
-        bind_kwargs=record.bind_kwargs,
-        batch_config=record.batch_config,
-        deployment_name=deployment_name,
-        route_prefix=record.route_prefix,
-    )
-    logging.info(f"Rolled new predict unit out to all replicas of {deployment_name!r}")
+        _check_predict_unit_device(
+            predict_unit,
+            record.options_kwargs.get("ray_actor_options", {}).get("num_gpus", 0),
+        )
+        predict_unit_ref = ray.put(predict_unit)
+        _deploy_app(
+            deployment=record.deployment,
+            options_kwargs=record.options_kwargs,
+            # The predict unit ref is the first bound positional argument.
+            bind_args=(predict_unit_ref, *record.bind_args[1:]),
+            bind_kwargs=record.bind_kwargs,
+            batch_config=record.batch_config,
+            deployment_name=deployment_name,
+            route_prefix=record.route_prefix,
+            owner=record.owner,
+        )
+        logging.info(
+            f"Rolled new predict unit out to all replicas of {deployment_name!r}"
+        )
 
 
 @requires(ray_installed, message="Requires `ray[serve]` to be installed")
@@ -1299,6 +1354,8 @@ def setup_batch_predict_server(
     deployment_name: str = "predict-server",
     route_prefix: str = "/predict",
     num_gpus: float | None = None,
+    *,
+    _owner=None,
 ) -> serve.handle.DeploymentHandle:
     """
     Deploy a ``BatchPredictServer`` that serves a single pre-loaded model.
@@ -1352,6 +1409,7 @@ def setup_batch_predict_server(
         batch_config=batch_config,
         deployment_name=deployment_name,
         route_prefix=route_prefix,
+        owner=_owner,
     )
     logging.info(f"BatchPredictServer deployed: name={deployment_name}")
     return handle
@@ -1455,6 +1513,29 @@ class AutobatchConfig:
     timeout_latency_multiplier: float = 2.0
     warmup_steps: int = 2
 
+    def __post_init__(self):
+        for name in (
+            "min_batch_size",
+            "max_batch_size_cap",
+            "probe_steps",
+            "warmup_steps",
+        ):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, Integral)
+                or value < (0 if name == "warmup_steps" else 1)
+            ):
+                raise ValueError(f"Invalid autobatch {name}: {value!r}")
+        if self.max_batch_size_cap < self.min_batch_size:
+            raise ValueError("max_batch_size_cap must be at least min_batch_size")
+        if not 0 < self.backoff_factor <= 1:
+            raise ValueError("backoff_factor must be in (0, 1]")
+        if not (0 <= self.timeout_floor_s <= self.timeout_ceil_s < math.inf):
+            raise ValueError("Invalid autobatch timeout bounds")
+        if not (0 <= self.timeout_latency_multiplier < math.inf):
+            raise ValueError("Invalid timeout_latency_multiplier")
+
 
 @dataclass
 class AutobatchResult:
@@ -1465,13 +1546,13 @@ class AutobatchResult:
         max_batch_size: Optimal maximum batch size in atoms.
         batch_wait_timeout_s: Optimal batch wait timeout in seconds.
         median_latency_s: Median single-request inference latency observed during
-            probing (the basis for ``batch_wait_timeout_s``).
+            probing (the basis for ``batch_wait_timeout_s``), or None for CPU defaults.
         probe_timestamp: Unix timestamp when probing was performed.
     """
 
     max_batch_size: int
     batch_wait_timeout_s: float
-    median_latency_s: float
+    median_latency_s: float | None
     probe_timestamp: float = field(default_factory=time.time)
 
 
@@ -1491,18 +1572,15 @@ def _expand_probe_data(
     if not data_list:
         raise ValueError("data_list cannot be empty")
 
-    base_num_atoms = sum(data.natoms.sum().item() for data in data_list)
+    base_num_atoms = sum(data.num_nodes for data in data_list)
+    if base_num_atoms == 0:
+        raise ValueError("probe data must contain atoms")
 
     if base_num_atoms >= target_num_atoms:
         return data_list
 
     num_repeats = (target_num_atoms + base_num_atoms - 1) // base_num_atoms
-
-    expanded_list = []
-    for _ in range(num_repeats):
-        expanded_list.extend(data_list)
-
-    return expanded_list
+    return data_list * num_repeats
 
 
 @requires(ray_installed, message="Requires `ray[serve]` to be installed")
@@ -1534,134 +1612,91 @@ def probe_optimal_batch_size(
     if not probe_data:
         raise ValueError("probe_data cannot be empty")
 
-    device = predict_unit.device
-
-    if torch.device(device).type == "xpu":
+    device = torch.device(predict_unit.device)
+    if device.type == "xpu":
         raise ValueError(
             "Automatic batch-size probing is implemented only for CUDA GPUs. "
             "XPU performance must be measured with explicit synchronized timings; "
             "the CPU defaults are not XPU measurements."
         )
-    if "cuda" not in str(device):
+    if device.type == "cpu":
         logging.info("Autobatch probing skipped for CPU device, using defaults")
         return AutobatchResult(
             max_batch_size=config.min_batch_size,
             batch_wait_timeout_s=config.timeout_ceil_s,
-            median_latency_s=0.1,
+            median_latency_s=None,
+        )
+    if device.type != "cuda":
+        raise ValueError(f"Unsupported device for autobatching: {device}")
+    if device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+
+    # Some allocator operations (empty_cache) act on the current ordinal.
+    with torch.cuda.device(device):
+        free_mem, total_mem = torch.cuda.mem_get_info(device)
+        free_mem += torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(
+            device
+        )
+        logging.info(
+            "GPU %s: %.2fGB free / %.2fGB total",
+            device,
+            free_mem / 1e9,
+            total_mem / 1e9,
         )
 
-    logging.info("Starting autobatch probing...")
-
-    free_hardware, total_mem = (
-        (0, 0) if not torch.cuda.is_available() else torch.cuda.mem_get_info()
-    )
-    torch_unused_cache = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
-    free_mem = free_hardware + torch_unused_cache
-
-    logging.info(
-        f"GPU memory: {free_mem / 1e9:.2f}GB free / {total_mem / 1e9:.2f}GB total"
-    )
-
-    logging.info(f"Running {config.warmup_steps} warmup steps...")
-    warmup_batch = atomicdata_list_to_batch(probe_data)
-    for _ in range(config.warmup_steps):
-        try:
-            predict_unit.predict(warmup_batch, undo_element_references=False)
-        except Exception as exc:
-            logging.warning(f"Warmup step failed: {exc}")
-    torch.cuda.empty_cache()
-
-    # Measure single-request latency (the probe data as-is, unexpanded). The
-    # batch_wait_timeout must track how long a *single* request takes so that
-    # requests arriving close together get batched without a lone request
-    # waiting an eternity. Deriving it from the large probed batches instead
-    # (which can be seconds) would saturate ``timeout_ceil_s`` and make every
-    # sub-batch-filling request wait that long -- crippling low-concurrency
-    # throughput.
-    single_request_latencies: list[float] = []
-    for step in range(config.probe_steps):
-        try:
-            torch.cuda.synchronize()
+        def measure(items):
+            # Keep batch and model temporaries inside this frame so an OOM
+            # unwinds them before the allocator is cleared or the next trial starts.
+            batch = atomicdata_list_to_batch(items)
+            torch.cuda.synchronize(device)
             start = time.perf_counter()
-            predict_unit.predict(warmup_batch, undo_element_references=False)
-            torch.cuda.synchronize()
-            elapsed = time.perf_counter() - start
-            single_request_latencies.append(elapsed)
-            logging.debug(f"  Single-request step {step + 1}: {elapsed:.4f}s")
-        except Exception as exc:
-            logging.warning(f"  Single-request latency probe failed: {exc}")
-    torch.cuda.empty_cache()
+            predict_unit.predict(batch, undo_element_references=False)
+            torch.cuda.synchronize(device)
+            return time.perf_counter() - start
 
-    # Binary search for optimal batch size. Only success/OOM matters here;
-    # the timeout is derived separately from the single-request latency above.
-    low = config.min_batch_size
-    high = config.max_batch_size_cap
-    best_batch_size = low
-
-    logging.info(f"Probing batch sizes in range [{low}, {high}]...")
-
-    while low <= high:
-        mid = (low + high) // 2
-        success = True
-
-        logging.debug(f"Testing batch size: {mid} atoms")
-
-        for step in range(config.probe_steps):
+        def trial(items):
             try:
-                expanded_data = _expand_probe_data(probe_data, mid)
-                batch = atomicdata_list_to_batch(expanded_data)
-
-                torch.cuda.synchronize()
-                start = time.perf_counter()
-                predict_unit.predict(batch, undo_element_references=False)
-                torch.cuda.synchronize()
-                elapsed = time.perf_counter() - start
-
-                logging.debug(f"  Step {step + 1}: {elapsed:.4f}s")
+                return measure(items)
             except torch.OutOfMemoryError:
-                logging.debug(f"  OOM at batch size {mid}")
-                success = False
-                torch.cuda.empty_cache()
-                break
-            except Exception as exc:
-                logging.warning(f"  Probe failed at batch size {mid}: {exc}")
-                success = False
-                break
+                pass
+            torch.cuda.empty_cache()
+            return None
 
-        if success:
-            best_batch_size = mid
-            low = mid + 1
-            logging.debug(f"  Success at {mid}, trying larger...")
-        else:
-            high = mid - 1
-            logging.debug(f"  Failed at {mid}, trying smaller...")
+        for _ in range(config.warmup_steps):
+            trial(probe_data)
+        latencies = [
+            elapsed
+            for _ in range(config.probe_steps)
+            if (elapsed := trial(probe_data)) is not None
+        ]
+        if not latencies:
+            raise torch.OutOfMemoryError(
+                f"No single-request probe succeeded on {device}"
+            )
 
-    final_batch_size = int(best_batch_size * config.backoff_factor)
-    final_batch_size = max(final_batch_size, config.min_batch_size)
+        low, high = config.min_batch_size, config.max_batch_size_cap
+        best_batch_size = None
+        while low <= high:
+            mid = (low + high) // 2
+            expanded = _expand_probe_data(probe_data, mid)
+            if all(trial(expanded) is not None for _ in range(config.probe_steps)):
+                best_batch_size = mid
+                low = mid + 1
+            else:
+                high = mid - 1
+        if best_batch_size is None:
+            raise torch.OutOfMemoryError(
+                f"No batch within the configured probe range fit on {device}"
+            )
 
-    # Compute timeout from the single-request latency, not the large probed
-    # batches. The timeout is how long the server lingers to accumulate a
-    # batch; keying it to one request's latency keeps a lone request from
-    # stalling while still letting near-simultaneous requests coalesce.
-    if single_request_latencies:
-        sorted_latencies = sorted(single_request_latencies)
-        median_latency = sorted_latencies[len(sorted_latencies) // 2]
-        timeout = median_latency * config.timeout_latency_multiplier
-        timeout = max(config.timeout_floor_s, min(timeout, config.timeout_ceil_s))
-    else:
-        median_latency = 0.1
-        timeout = config.timeout_ceil_s
-
-    result = AutobatchResult(
-        max_batch_size=final_batch_size,
-        batch_wait_timeout_s=timeout,
-        median_latency_s=median_latency,
+    latency = median(latencies)
+    return AutobatchResult(
+        max_batch_size=max(
+            config.min_batch_size, int(best_batch_size * config.backoff_factor)
+        ),
+        batch_wait_timeout_s=max(
+            config.timeout_floor_s,
+            min(config.timeout_ceil_s, latency * config.timeout_latency_multiplier),
+        ),
+        median_latency_s=latency,
     )
-
-    logging.info(
-        f"Autobatch probing complete: max_batch_size={result.max_batch_size}, "
-        f"timeout={result.batch_wait_timeout_s:.4f}s, "
-        f"median_latency={result.median_latency_s:.4f}s"
-    )
-
-    return result

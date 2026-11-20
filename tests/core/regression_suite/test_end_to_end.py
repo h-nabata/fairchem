@@ -39,7 +39,6 @@ pytestmark = pytest.mark.serial
 
 # Workers record this commit only if they read it from the snapshot marker.
 _SNAPSHOT_COMMIT = "e2e0" * 10
-_PASSING = {"PASS", "PASS@FP32", "PASS@TF32"}
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
@@ -290,16 +289,14 @@ def test_fast_fp32_smoke_passes_at_fp32(tiny, capsys):
     )
 
 
-def test_full_fails_a_model_with_different_weights(tiny):
+def test_full_rejects_changed_weights_before_inference(tiny, capsys):
     changed = write_tiny_checkpoint(tiny.checkpoint.with_name("changed.pt"), seed=1)
+    before = set(tiny.root.glob("candidates/*"))
+    command = ["full", "fp32", "--baseline", str(tiny.sealed), "--no-wandb"]
 
-    code, _candidate, report_dir = _full(tiny, "fp32", changed)
-
-    assert code == 1
-    statuses = {
-        suite["status"] for suite in load_json(report_dir / "report.json")["suites"]
-    }
-    assert statuses - _PASSING
+    assert cli.main([*command, *_model(changed)]) == 1
+    assert "checkpoint SHA-256 differs" in capsys.readouterr().err
+    assert set(tiny.root.glob("candidates/*")) == before
 
 
 def test_report_json_output_parses_despite_output_while_building(

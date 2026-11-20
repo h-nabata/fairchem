@@ -123,7 +123,9 @@ def test_cross_device_qualification_keeps_launch_identity_and_archived_settings(
         "execution_environment": {"device_type": "xpu"},
         "case_count": 1,
     }
-    monkeypatch.setattr(report, "qualify_suite", lambda *_: {"status": "validated"})
+    monkeypatch.setattr(
+        report, "qualify_suite", lambda *_, **_kwargs: {"status": "validated"}
+    )
 
     def qualify(data, **kwargs):
         return report._qualify_candidate(
@@ -198,3 +200,10 @@ def test_runner_stops_before_cases_if_loading_changed_profile(monkeypatch, tmp_p
     with pytest.raises(RegressionSchemaError, match="merge_mole"):
         runner.run_suite({"checkpoint": "synthetic"})
     assert not (tmp_path / "out").exists()
+
+
+def test_regression_rejects_wrapped_ordinal_before_submission():
+    from fairchem.core.regression_suite.spec.schema import CommandError
+
+    with pytest.raises(CommandError, match="Invalid accelerator device 'xpu:256'"):
+        settings_module.resolve_device("xpu:256", "slurm")
