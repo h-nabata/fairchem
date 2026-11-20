@@ -20,6 +20,6 @@
 | A1–A5 | 回帰プロファイルの精度条件、封入済み基準、重みのSHA-256、逐次予測との物性差、同位体質量を検査 | `tests/core/regression_suite/test_xe_acceptance.py`、`test_end_to_end.py` |
 | A6–A10 | 回転検査で運動量・拘束を扱い、XPUのコンパイルキャッシュ、同時実行の保存先、CPUの性能比較条件、ワーカーのエラー伝播を修正 | 同上、`test_settings.py` |
 | I1–I4 | 部分グループの人数・通信相手を使用。明示デバイス番号の桁あふれを拒否。チェックポイント本体と参照エネルギーに同じキャッシュ指定を渡す | `tests/core/common/test_distributed_subgroup_audit.py`、`test_xpu_distutils.py`、`tests/core/calculate/test_xpu_pretrained.py` |
-| I5–I8 | sdistにREADMEを収録し、Intel wheelにローカルバージョン識別子を付与。Git管理外のwheelからローカル回帰を実行可能にし、日本語導入手順をIntel専用lockに統一 | `uv build packages/fairchem-core`、`uv build packages/fairchem-core-xpu`、`tests/core/scripts/test_xpu_package_metadata.py` |
+| I5–I8 | sdistにREADMEを収録し、Intel版とNumPy 1.26版のwheelに個別のローカルバージョン識別子を付与。Git管理外のwheelからローカル回帰を実行可能にし、日本語導入手順をIntel専用lockに統一 | `uv build packages/fairchem-core`、`uv build packages/fairchem-core-xpu`、`tests/core/scripts/test_xpu_package_metadata.py` |
 
 精度等級を比較するときは、同じ重みと構造を使い、エネルギー、力、応力を個別に比較する。グラフの誤りや古いラベルを修正した入力では従来版との一致は合格条件にならない。CPUの回帰試験とIntel実機の測定条件は[検証手順](intel_xpu_validation.md)に記載している。

@@ -61,11 +61,9 @@ home = "https://opencatalystproject.org/"
 documentation = "https://facebookresearch.github.io/fairchem/"
 
 [tool.hatch.version]
-source = "vcs"
-
-[tool.hatch.version.raw-options]
-root = "../../"
-git_describe_command = 'git describe --tags --match fairchem_core-*'
+source = "code"
+path = "numpy126_version.py"
+expression = "variant_version('numpy126')"
 
 [tool.hatch.build]
 directory = "../../dist-core"
@@ -75,6 +73,7 @@ only-include = ["src/fairchem/core", "src/fairchem/experimental"]
 
 [tool.hatch.build.targets.sdist.force-include]
 "../../README.md" = "README.md"
+"../build_variant.py" = "numpy126_version.py"
 
 [tool.hatch.build.targets.wheel]
 sources = ["src"]

@@ -78,15 +78,17 @@ explicit = true
 [tool.hatch.version]
 source = "code"
 path = "xpu_version.py"
+expression = "variant_version('xpu')"
 
 [tool.hatch.build]
 directory = "../../dist-core-xpu"
 
 [tool.hatch.build.targets.sdist]
-only-include = ["src/fairchem/core", "src/fairchem/experimental", "xpu_version.py"]
+only-include = ["src/fairchem/core", "src/fairchem/experimental"]
 
 [tool.hatch.build.targets.sdist.force-include]
 "../../README.md" = "README.md"
+"../build_variant.py" = "xpu_version.py"
 
 [tool.hatch.build.targets.wheel]
 sources = ["src"]

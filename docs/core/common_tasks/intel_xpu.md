@@ -28,8 +28,8 @@ UV_PROJECT_ENVIRONMENT="$PWD/.venv-xpu" uv sync --locked --project packages/fair
 The Intel-only package uses the same source tree and import names as
 `fairchem-core`. Its metadata pins the XPU build of PyTorch and moves CUDA
 graph v3, NVIDIA D3 and Nitro dependencies into the optional `nvidia` extra.
-The Intel wheel carries an `xpu` PEP 440 local version identifier, so both
-variants can share a wheelhouse. Specify the exact local version or wheel path
+The Intel and NumPy 1.26 wheels carry `xpu` and `numpy126` PEP 440 local
+version identifiers. All three dependency variants can share a wheelhouse. Specify the exact local version or wheel path
 when selecting between artifacts from that directory. Regression CLI outputs
 can be redirected with `FAIRCHEM_REGRESSION_ROOT`. Installed wheels outside
 a checkout default to `$XDG_STATE_HOME/fairchem/regression` (normally
