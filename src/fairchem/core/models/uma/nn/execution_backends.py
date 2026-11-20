@@ -385,10 +385,12 @@ class UMASFastPortableBackend(UMASFastPytorchBackend):
         UMASFastPytorchBackend.prepare_model_for_inference(model)
         if (
             model.use_quaternion_wigner
-            and isinstance(model.distance_expansion, GaussianSmearing)
-            and isinstance(model.envelope, PolynomialEnvelope)
+            and type(model.distance_expansion) is GaussianSmearing
+            and type(model.envelope) is PolynomialEnvelope
         ):
-            model._portable_geometry = PortableGeometry(model)
+            model._portable_geometry = PortableGeometry(model, standalone=False)
+        elif hasattr(model, "_portable_geometry"):
+            del model._portable_geometry
 
     @staticmethod
     def compute_geometry(
@@ -398,7 +400,11 @@ class UMASFastPortableBackend(UMASFastPytorchBackend):
         if geometry is None:
             return None
         return geometry(
-            edge_vectors, distance=distance, fold_envelope=fold_envelope, valid=valid
+            edge_vectors,
+            distance=distance,
+            fold_envelope=fold_envelope,
+            valid=valid,
+            model=model,
         )
 
     @staticmethod

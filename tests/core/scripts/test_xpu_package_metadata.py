@@ -36,3 +36,17 @@ def test_intel_only_distribution_matches_standard_core():
     lock = tomllib.loads((packages / "fairchem-core-xpu/uv.lock").read_text())
     torch = next(pkg for pkg in lock["package"] if pkg["name"] == "torch")
     assert torch["version"] == "2.15.0+xpu"
+
+
+def test_variant_builds_embed_their_version_source_in_sdist():
+    packages = Path(__file__).resolve().parents[3] / "packages"
+    for variant in ("xpu", "numpy126"):
+        project = packages / f"fairchem-core-{variant}"
+        hatch = tomllib.loads((project / "pyproject.toml").read_text())["tool"]["hatch"]
+        path = hatch["version"]["path"]
+        assert (project / path).resolve() == packages / "build_variant.py"
+        assert hatch["version"]["expression"] == f"variant_version('{variant}')"
+        assert (
+            hatch["build"]["targets"]["sdist"]["force-include"]["../build_variant.py"]
+            == path
+        )

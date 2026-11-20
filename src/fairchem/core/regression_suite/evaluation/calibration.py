@@ -149,6 +149,7 @@ def _campaign_fields(identity: Mapping[str, Any]) -> dict[str, Any]:
     """
     return {
         "checkpoint": identity["checkpoint"],
+        "checkpoint_sha256": identity.get("checkpoint_sha256"),
         "seed": identity["seed"],
         "device": identity["device"],
         "scope": run_scope(identity),

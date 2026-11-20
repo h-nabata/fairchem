@@ -150,3 +150,8 @@ def test_kernel_benchmark_rejects_unsafe_precision_or_shape_before_import(
     with pytest.raises(ValueError, match=message):
         benchmark(hidden=513 if condition == "hidden" else 128)
     assert torch.backends.mkldnn.allow_tf32 == (condition == "tf32")
+
+
+def test_wigner_benchmark_rejects_ordinal_before_torch_truncates_it():
+    with pytest.raises(ValueError, match="Invalid xpu device index '256'"):
+        benchmark(device="xpu:256")

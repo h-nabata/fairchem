@@ -10,6 +10,7 @@ dynamic = ["version", "readme"]
 # NumPy 1.26 supports Python through 3.12; keep the core package's lower bound.
 requires-python = ">=3.11, <3.13"
 dependencies = [
+    "filelock",
     "torch>=2.13.0,<2.16",
     "numpy>=1.26.4,<2",
     "scipy>=1.15.0",
@@ -60,17 +61,19 @@ home = "https://opencatalystproject.org/"
 documentation = "https://facebookresearch.github.io/fairchem/"
 
 [tool.hatch.version]
-source = "vcs"
-
-[tool.hatch.version.raw-options]
-root = "../../"
-git_describe_command = 'git describe --tags --match fairchem_core-*'
+source = "code"
+path = "numpy126_version.py"
+expression = "variant_version('numpy126')"
 
 [tool.hatch.build]
 directory = "../../dist-core"
 
 [tool.hatch.build.targets.sdist]
 only-include = ["src/fairchem/core", "src/fairchem/experimental"]
+
+[tool.hatch.build.targets.sdist.force-include]
+"../../README.md" = "README.md"
+"../build_variant.py" = "numpy126_version.py"
 
 [tool.hatch.build.targets.wheel]
 sources = ["src"]

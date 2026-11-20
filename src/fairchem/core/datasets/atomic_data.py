@@ -12,8 +12,9 @@ from __future__ import annotations
 import copy
 import logging
 import types
+import warnings
+from collections import deque
 from collections.abc import Sequence
-from dataclasses import fields, is_dataclass
 from numbers import Integral
 from typing import Union
 
@@ -29,6 +30,8 @@ from ase.stress import full_3x3_to_voigt_6_stress, voigt_6_to_full_3x3_stress
 from monty.dev import requires
 
 from fairchem.core.common.utils import StrEnum
+from fairchem.core.graph.compute import canonicalize_external_edges
+from fairchem.core.graph.radius_graph_pbc import get_max_neighbors_mask
 
 try:
     from pymatgen.io.ase import AseAtomsAdaptor
@@ -68,50 +71,76 @@ _REQUIRED_KEYS = [
 _OPTIONAL_KEYS = ["energy", "forces", "stress", "dataset"]
 
 
-def _clone_tensor_tree(value, tensor_transform=None, memo=None):
-    """
-    Deep-copy nested data with differentiable clones of all referenced tensors.
-    """
-    memo = {} if memo is None else memo
-    visited = set()
+def _tensors(value, path=(), seen=None, *, strict=False):
+    """Yield each distinct tensor in Python metadata, including keys and slots.
 
-    def remember(item):
-        if id(item) in visited or id(item) in memo:
-            return
-        visited.add(id(item))
-        if torch.is_tensor(item):
-            memo[id(item)] = (
-                item.clone() if tensor_transform is None else tensor_transform(item)
+    Paths identify reusable buffers without retaining caller-owned objects.
+    Strict consumers require inspectable metadata to account for tensor storage.
+    """
+    if seen is None:
+        seen = set()
+    if id(value) in seen:
+        return
+    seen.add(id(value))
+    if torch.is_tensor(value):
+        yield path, value
+        return
+    if value is None or isinstance(
+        value, (str, bytes, int, float, complex, range, torch.dtype, torch.device)
+    ):
+        return
+    if isinstance(value, (np.ndarray, np.generic)):
+        if strict and value.dtype.hasobject:
+            raise TypeError(
+                "Object arrays are not supported in tensor staging metadata"
             )
-        elif isinstance(item, dict):
-            for child in item:
-                remember(child)
-            for child in item.values():
-                remember(child)
-        elif isinstance(item, (tuple, list)):
-            for child in item:
-                remember(child)
-        elif is_dataclass(item) and not isinstance(item, type):
-            for field in fields(item):
-                remember(getattr(item, field.name))
-            if hasattr(item, "__dict__"):
-                remember(vars(item))
-        elif (
-            hasattr(item, "__dict__")
-            and not isinstance(item, (type, types.ModuleType))
-            and not callable(item)
-        ):
-            remember(vars(item))
+        return
 
-    try:
-        remember(value.__dict__ if isinstance(value, AtomicData) else value)
-        return copy.deepcopy(value, memo)
-    finally:
-        # A recursive closure captures its own function cell. Without breaking
-        # that cycle, its memo retains every cloned tensor until cyclic GC runs,
-        # even after a completed prediction or streamed example is released.
-        # Do not clear memo: a caller may still need its aliases and backrefs.
-        remember = None
+    inspected = False
+    if isinstance(value, dict):
+        inspected = True
+        for i, (key, child) in enumerate(value.items()):
+            yield from _tensors(key, (*path, ("key", i)), seen, strict=strict)
+            yield from _tensors(child, (*path, ("value", i)), seen, strict=strict)
+    elif isinstance(value, (tuple, list, set, frozenset, deque)):
+        inspected = True
+        for i, child in enumerate(value):
+            yield from _tensors(child, (*path, ("item", i)), seen, strict=strict)
+    if type(value) in (list, tuple, set, frozenset, dict, deque):
+        return
+    if not isinstance(
+        value, (type, types.ModuleType, types.FunctionType, types.MethodType)
+    ):
+        if hasattr(value, "__dict__"):
+            inspected = True
+            yield from _tensors(vars(value), (*path, "attributes"), seen, strict=strict)
+        # Read the actual descriptor, including inherited/private slots. An
+        # instance can declare both a __dict__ and slots, or leave slots unset.
+        for depth, cls in enumerate(type(value).__mro__):
+            if "__slots__" not in vars(cls):
+                continue
+            inspected = True
+            for name, descriptor in vars(cls).items():
+                if isinstance(descriptor, types.MemberDescriptorType):
+                    try:
+                        child = descriptor.__get__(value)
+                    except AttributeError:
+                        continue
+                    yield from _tensors(
+                        child, (*path, ("slot", depth, name)), seen, strict=strict
+                    )
+    if strict and not inspected:
+        raise TypeError(f"Unsupported tensor staging metadata: {type(value).__name__}")
+
+
+def _clone_tensor_tree(value, tensor_transform=None, memo=None):
+    """Deep-copy nested data with differentiable clones of all referenced tensors."""
+    memo = {} if memo is None else memo
+    for _, tensor in _tensors(value, seen=set(memo)):
+        memo[id(tensor)] = (
+            tensor.clone() if tensor_transform is None else tensor_transform(tensor)
+        )
+    return copy.deepcopy(value, memo)
 
 
 # TODO: potential future keys
@@ -157,41 +186,65 @@ def size_repr(key: str, item: torch.Tensor, indent=0) -> str:
 
 @requires(pmg_installed, message="Requires `pymatgen` to be installed")
 def get_neighbors_pymatgen(
-    atoms: ase.Atoms, cutoff, max_neigh, enforce_max_neighbors_strictly=None
+    atoms: ase.Atoms,
+    cutoff,
+    max_neigh,
+    enforce_max_neighbors_strictly=None,
+    *,
+    target_dtype=torch.float64,
 ):
     """Performs nearest neighbor search and returns edge index, distances,
     and cell offsets"""
     struct = AseAtomsAdaptor.get_structure(atoms)
 
-    # tol of 1e-8 should remove all self loops
-    _c_index, _n_index, _offsets, n_distance = struct.get_neighbor_list(
-        r=cutoff, numerical_tol=1e-8, exclude_self=True
+    # Pymatgen searches in double precision. Obtain a superset and apply the
+    # same squared-distance predicate and shell cap as graph v2 in model dtype.
+    pos = torch.as_tensor(atoms.get_positions(), dtype=target_dtype)
+    cell = torch.as_tensor(np.asarray(atoms.cell), dtype=target_dtype)
+    eps = torch.finfo(target_dtype).eps
+    scale = cutoff + (float(pos.abs().max()) if atoms.pbc.any() and len(pos) else 0)
+    _c_index, _n_index, _offsets, _ = struct.get_neighbor_list(
+        r=cutoff + 16 * eps * (1 + scale), numerical_tol=1e-8, exclude_self=False
     )
-    # Group rows once rather than scanning every edge for each atom. Stable
-    # grouping preserves the original argsort tie order within each center.
-    by_center = np.argsort(_c_index, kind="stable")
-    starts = np.cumsum(np.bincount(_c_index, minlength=len(atoms)))[:-1]
-    selected = []
-    for center_edges in np.split(by_center, starts):
-        row = center_edges[np.argsort(n_distance[center_edges])]
-        if enforce_max_neighbors_strictly is None:
-            row = row[:max_neigh]  # Original standalone converter semantics.
-        elif max_neigh > 0 and len(row) > max_neigh:
-            if enforce_max_neighbors_strictly:
-                row = row[:max_neigh]
-            else:
-                # UMA uses squared-distance tolerance against the (k+1)th
-                # neighbor, keeping a degenerate shell intact.
-                squared = np.square(n_distance[row])
-                row = row[squared <= squared[max_neigh] + 0.01]
-        selected.append(row)
-    _nonmax_idx = np.concatenate(selected)
-
-    _c_index = _c_index[_nonmax_idx]
-    _n_index = _n_index[_nonmax_idx]
-    n_distance = n_distance[_nonmax_idx]
-    _offsets = _offsets[_nonmax_idx]
-
+    order = np.argsort(_c_index, kind="stable")
+    _c_index, _n_index, _offsets = _c_index[order], _n_index[order], _offsets[order]
+    shifts = torch.as_tensor(_offsets, dtype=target_dtype) @ cell
+    squared = (pos[_c_index] - (pos[_n_index] + shifts)).square().sum(-1)
+    selected = torch.where((squared > 0) & (squared <= cutoff * cutoff))[0]
+    centers = torch.as_tensor(_c_index)[selected].long()
+    squared = squared[selected]
+    if enforce_max_neighbors_strictly is None:
+        # The original standalone converter uses Python slicing, including for
+        # nonpositive caps, and exposes distance-sorted edges for each center.
+        by_center = selected.numpy()
+        starts = np.cumsum(np.bincount(centers.numpy(), minlength=len(atoms)))[:-1]
+        d2 = squared.numpy()
+        ranked = [
+            row[np.argsort(d2[row])][:max_neigh]
+            for row in np.split(np.arange(len(d2)), starts)
+        ]
+        kept = np.concatenate(ranked)
+        indices = by_center[kept]
+        n_distance = np.sqrt(d2[kept])
+    else:
+        keep, _ = get_max_neighbors_mask(
+            torch.tensor([len(atoms)]),
+            centers,
+            squared,
+            max_neigh,
+            enforce_max_strictly=enforce_max_neighbors_strictly,
+        )
+        # Public converter output has always been distance-sorted within centers.
+        kept = torch.where(keep)[0]
+        kept = kept[squared[kept].argsort(stable=True)]
+        kept = kept[centers[kept].argsort(stable=True)]
+        indices = selected[kept].numpy()
+        n_distance = squared[kept].sqrt().numpy()
+    _c_index, _n_index, _offsets = (
+        _c_index[indices],
+        _n_index[indices],
+        _offsets[indices],
+    )
     return _c_index, _n_index, n_distance, _offsets
 
 
@@ -208,10 +261,8 @@ def reshape_features(
     edge_distances = torch.tensor(n_distance, dtype=target_dtype, device="cpu")
     cell_offsets = torch.tensor(offsets, dtype=target_dtype, device="cpu")
 
-    # remove distances smaller than a tolerance ~ 0. The small tolerance is
-    # needed to correct for pymatgen's neighbor_list returning self atoms
-    # in a few edge cases.
-    nonzero = torch.where(edge_distances >= 1e-8)[0]
+    # Neighbor search and model geometry exclude exact zero-distance edges.
+    nonzero = torch.where(edge_distances > 0)[0]
     edge_index = edge_index[:, nonzero]
     cell_offsets = cell_offsets[nonzero]
 
@@ -256,7 +307,6 @@ class AtomicData:
         self.spin = spin
         self.fixed = fixed
         self.tags = tags
-        self.sid = sid if sid is not None else [""]
 
         # Always normalize dataset to a list for consistent batching
         if dataset is not None:
@@ -284,12 +334,16 @@ class AtomicData:
             self.batch = torch.zeros_like(self.atomic_numbers)
 
         # id
-        if isinstance(sid, str):
-            self.sid = [sid]
-        elif isinstance(sid, list):
-            self.sid = sid
+        if sid is None:
+            self.sid = [""] * self.num_graphs
+        elif isinstance(sid, (str, Integral)):
+            self.sid = [str(sid)]
+        elif isinstance(sid, list) and all(
+            isinstance(value, (str, Integral)) for value in sid
+        ):
+            self.sid = [str(value) for value in sid]
         else:
-            self.sid = [""]
+            raise TypeError("sid must be an integer, string or list of identifiers")
 
         self.__slices__ = None
         self.__cumsum__ = None
@@ -310,10 +364,22 @@ class AtomicData:
 
     @property
     def masses(self) -> torch.Tensor:
-        masses = torch.as_tensor(
-            atomic_masses, dtype=self.pos.dtype, device=self.atomic_numbers.device
+        options = {"dtype": self.pos.dtype, "device": self.pos.device}
+        explicit = self.get("atomic_masses")
+        if torch.is_tensor(explicit):  # serialized tensor overrides
+            return explicit.to(**options)
+        if explicit is not None and None not in explicit:
+            return torch.tensor(explicit, **options)
+        defaults = torch.as_tensor(atomic_masses, **options)[self.atomic_numbers]
+        if explicit is None:
+            return defaults
+        mask = torch.tensor(
+            [mass is not None for mass in explicit], device=self.pos.device
         )
-        return masses[self.atomic_numbers]
+        values = torch.tensor(
+            [0 if mass is None else mass for mass in explicit], **options
+        )
+        return torch.where(mask, values, defaults)
 
     def assign_batch_stats(self, slices, cumsum, cat_dims, natoms_list):
         self.__slices__ = slices
@@ -346,15 +412,9 @@ class AtomicData:
         assert self.pbc.shape[1] == 3
         assert self.edge_index.shape[0] == 2
         assert self.cell_offsets.shape[0] == self.edge_index.shape[1]
-        assert self.nedges.sum().item() == self.edge_index.shape[1]
         assert self.fixed.shape[0] == self.pos.shape[0]
         assert self.tags.shape[0] == self.pos.shape[0]
         assert self.batch.shape == self.atomic_numbers.shape
-        assert int(self.batch.max()) + 1 == self.num_graphs
-        assert bool((self.batch >= 0).all()), "batch indices must be nonnegative"
-        assert torch.equal(
-            torch.bincount(self.batch, minlength=self.num_graphs), self.natoms
-        ), "natoms must match batch membership"
         assert len(self.sid) == self.num_graphs
 
         if "dataset" in self.__keys__:
@@ -362,9 +422,11 @@ class AtomicData:
             assert len(self.dataset) == self.num_graphs
 
         # dtype checks
-        assert (
-            self.pos.dtype == self.cell.dtype == self.cell_offsets.dtype
-        ), "Positions, cell, cell_offsets are all expected to be same. Check data going into AtomicData is correct dtype"
+        assert self.cell.dtype == self.pos.dtype
+        assert self.cell_offsets.dtype in (
+            self.pos.dtype,
+            torch.long,
+        ), "Cell offsets must use the position dtype or exact int64 image IDs"
         assert self.pos.dtype in (
             torch.float32,
             torch.float64,
@@ -374,13 +436,6 @@ class AtomicData:
         assert self.pbc.dtype == torch.bool
         assert self.fixed.dtype == self.tags.dtype == torch.long
         assert self.batch.dtype == torch.long
-        if not torch.equal(
-            self.batch,
-            torch.repeat_interleave(
-                torch.arange(self.num_graphs, device=self.batch.device), self.natoms
-            ),
-        ):
-            raise ValueError("Batch atoms must be grouped contiguously in system order")
         for name in _REQUIRED_KEYS:
             if getattr(self, name).device != self.pos.device:
                 raise ValueError(
@@ -392,6 +447,24 @@ class AtomicData:
             assert value.shape == (
                 self.num_graphs,
             ), f"{name} must have one entry per system"
+        if self.num_graphs == 1:
+            grouped = not bool(self.batch.any())
+        elif self.batch.device.type == "cpu":
+            ids = np.repeat(np.arange(self.num_graphs), self.natoms.numpy())
+            grouped = np.array_equal(self.batch.numpy(), ids)
+        else:
+            ids = torch.arange(self.num_graphs, device=self.batch.device)
+            grouped = torch.equal(
+                self.batch,
+                ids.repeat_interleave(self.natoms, output_size=self.num_nodes),
+            )
+        if not grouped:
+            raise ValueError(
+                "Batch atoms must be grouped contiguously in system order according to natoms"
+            )
+        self.edge_index, self.cell_offsets = canonicalize_external_edges(
+            self.batch, self.edge_index, self.cell_offsets, self.nedges
+        )
         assert isinstance(self.num_nodes, int)
         assert isinstance(self.num_graphs, int)
 
@@ -451,28 +524,23 @@ class AtomicData:
             # create a molecule box with the molecule centered on it if specified
             atoms.center(vacuum=(molecule_cell_size))
             atoms.pbc = np.array([True, True, True])
-        elif np.all(~np.asarray(atoms.pbc)):
-            pass  # This is fine
-        elif not np.all(np.asarray(atoms.pbc)) and atoms.cell.volume < 0.1:
-            raise ValueError(
-                "atoms must either have a cell or have a cell created by setting <molecule_cell_size>."
-            )
-
         atomic_numbers = np.array(atoms.get_atomic_numbers(), copy=True)
         pos = np.array(atoms.get_positions(), copy=True)
         pbc = np.array(atoms.pbc, copy=True)
-        cell = np.array(atoms.get_cell(complete=True), copy=True)
-        pos = wrap_positions(pos, cell, pbc=pbc, eps=0)
-
-        if r_edges:
-            # Only external graph construction needs updated ASE coordinates.
-            # Do not reapply optimizer/MD constraints: FixAtoms would restore
-            # unwrapped positions, unlike the model coordinates above.
-            atoms.set_positions(pos, apply_constraint=False)
-            # Pymatgen needs an invertible cell even for nonperiodic molecules.
-            # Use the same completed cell as the model, on our owned copy;
-            # retaining PBC flags prevents artificial periodic neighbors.
-            atoms.set_cell(cell, apply_constraint=False)
+        physical_cell = atoms.cell.copy()
+        if pbc.any() and np.linalg.matrix_rank(physical_cell.array[pbc]) < pbc.sum():
+            raise ValueError(
+                "Periodic lattice vectors must span a nonsingular subspace"
+            )
+        search_cell = physical_cell.copy()
+        if pbc.any() and physical_cell.volume == 0:
+            search_cell[~pbc] = 0
+        search_cell = search_cell.complete()
+        pos = wrap_positions(pos, search_cell, pbc=pbc, eps=0)
+        # Keep the supplied physical volume for slabs/chains. A cell-less
+        # nonperiodic molecule retains its historical completed model cell;
+        # that completion has no physical molecular volume.
+        cell = np.array(physical_cell if pbc.any() else search_cell, copy=True)
 
         atomic_numbers = torch.from_numpy(atomic_numbers).long()
         pos = torch.from_numpy(pos)
@@ -491,9 +559,20 @@ class AtomicData:
                 max_neigh is not None
             ), "max_neigh must be specified for cpu graph construction."
 
+            # Promote model-rounded coordinates back to ASE's double container.
+            # Constraints must not restore the original unwrapped geometry.
+            atoms.set_positions(pos.numpy(), apply_constraint=False)
+            atoms.set_cell(
+                torch.as_tensor(np.asarray(search_cell)).to(target_dtype).numpy(),
+                apply_constraint=False,
+            )
             if external_graph_method == ExternalGraphMethod.PYMATGEN:
                 split_idx_dist = get_neighbors_pymatgen(
-                    atoms, radius, max_neigh, enforce_max_neighbors_strictly
+                    atoms,
+                    radius,
+                    max_neigh,
+                    enforce_max_neighbors_strictly,
+                    target_dtype=target_dtype,
                 )
             elif external_graph_method == ExternalGraphMethod.NVIDIA:
                 from fairchem.core.graph.radius_graph_pbc_nvidia import (
@@ -501,7 +580,11 @@ class AtomicData:
                 )
 
                 split_idx_dist = get_neighbors_nvidia_atoms(
-                    atoms, radius, max_neigh, target_dtype=target_dtype
+                    atoms,
+                    radius,
+                    max_neigh,
+                    target_dtype=target_dtype,
+                    enforce_max_neighbors_strictly=enforce_max_neighbors_strictly,
                 )
             else:
                 raise ValueError(
@@ -527,63 +610,59 @@ class AtomicData:
                 if isinstance(constraint, FixAtoms):
                     fixed[constraint.index] = 1
 
+        # Explicit info labels take precedence. Validate only calculator labels
+        # actually read, against the original ASE geometry (before wrapping).
+        results = {}
         if isinstance(calc, (SinglePointCalculator, SinglePointDFTCalculator)):
-            results = calc.results
-            energy = (
-                torch.tensor(
-                    [results["energy"]], dtype=target_dtype, device="cpu"
-                ).view(1)
-                if "energy" in results
-                else None
-            )
-            forces = (
-                torch.tensor(results["forces"], dtype=target_dtype, device="cpu").view(
-                    -1, 3
+            requested = {"energy"}
+            if r_forces:
+                requested.add("forces")
+            if r_stress:
+                requested.add("stress")
+            keys = (requested & calc.results.keys()) - atoms.info.keys()
+            if keys and (changes := calc.check_state(input_atoms)):
+                raise ValueError(
+                    f"Stale single-point labels after changes to {', '.join(changes)}"
                 )
-                if r_forces and "forces" in results
-                else None
-            )
-            stress = results.get("stress", None)
-            if stress is not None and r_stress:
-                if stress.shape == (6,):
-                    stress = torch.tensor(
-                        voigt_6_to_full_3x3_stress(stress),
-                        dtype=target_dtype,
-                        device="cpu",
-                    ).view(1, 3, 3)
-                elif stress.shape in ((3, 3), (9,)):
-                    stress = torch.tensor(
-                        stress, dtype=target_dtype, device="cpu"
-                    ).view(1, 3, 3)
-                else:
-                    raise ValueError(f"Unknown stress shape, {stress.shape}")
-            else:
-                stress = None
-        else:
-            energy = None
-            forces = None
-            stress = None
-
+            results.update({key: calc.results[key] for key in keys})
+        for key in ("energy", "forces", "stress"):
+            if key in atoms.info:
+                results[key] = atoms.info[key]
         energy = (
-            torch.tensor([atoms.info["energy"]], dtype=target_dtype, device="cpu")
-            if "energy" in atoms.info
-            else energy
+            torch.tensor(results["energy"], dtype=target_dtype, device="cpu").reshape(1)
+            if results.get("energy") is not None
+            else None
         )
         forces = (
-            torch.tensor(atoms.info["forces"], dtype=target_dtype, device="cpu")
-            if r_forces and "forces" in atoms.info
-            else forces
+            torch.tensor(results["forces"], dtype=target_dtype, device="cpu").reshape(
+                -1, 3
+            )
+            if r_forces and results.get("forces") is not None
+            else None
         )
-        stress = (
-            torch.tensor(atoms.info["stress"], dtype=target_dtype, device="cpu").view(
+        stress = None
+        if r_stress and results.get("stress") is not None:
+            values = np.asarray(results["stress"])
+            if values.shape == (6,):
+                values = voigt_6_to_full_3x3_stress(values)
+            elif values.shape not in ((3, 3), (9,)):
+                raise ValueError(f"Unknown stress shape, {values.shape}")
+            stress = torch.tensor(values, dtype=target_dtype, device="cpu").reshape(
                 1, 3, 3
             )
-            if r_stress and "stress" in atoms.info
-            else stress
-        )
 
         # TODO another way to specify this is to specify a key. maybe total_charge
         def integer_metadata(name):
+            if (
+                name in atoms.info
+                and (r_data_keys is None or name not in r_data_keys)
+                and not np.array_equal(atoms.info[name], 0)
+            ):
+                warnings.warn(
+                    f"Discarding nonzero ASE {name}; include {name!r} in r_data_keys to retain it",
+                    UserWarning,
+                    stacklevel=3,
+                )
             value = (
                 atoms.info.get(name, 0)
                 if r_data_keys is not None and name in r_data_keys
@@ -614,15 +693,24 @@ class AtomicData:
             energy=energy,
             forces=forces,
             stress=stress,
-            sid=[sid] if isinstance(sid, str) else sid,
+            sid=atoms.info.get("sid") if sid is None else sid,
             dataset=task_name,
         )
 
+        if atoms.has("masses"):
+            # Keep ASE's double-precision isotope values as host metadata even
+            # when all model tensors are converted to FP32 or moved to a GPU.
+            data["atomic_masses"] = tuple(atoms.get_masses().tolist())
         return data
 
     def to_ase_single(self) -> ase.Atoms:
         assert self.num_graphs == 1, "Data object must contain a single graph."
 
+        masses = self.get("atomic_masses")
+        if torch.is_tensor(masses):
+            masses = masses.detach().cpu().tolist()
+        if masses is not None and all(value is None for value in masses):
+            masses = None  # preserve the original absence of an ASE masses array
         atoms = ase.Atoms(
             numbers=self.atomic_numbers.cpu().numpy(),
             positions=self.pos.detach().cpu().numpy(),
@@ -630,6 +718,7 @@ class AtomicData:
             pbc=self.pbc.squeeze().tolist(),
             constraint=FixAtoms(mask=self.fixed.bool().tolist()),
             tags=self.tags.cpu().numpy(),
+            masses=masses,
         )
 
         if self.__keys__.intersection(["energy", "forces", "stress"]):
@@ -691,7 +780,9 @@ class AtomicData:
 
         # TODO: may require validation for them in the future
         # assign extra keys in dict...
-        for key in set(dictionary.keys()) - set(_REQUIRED_KEYS + _OPTIONAL_KEYS):
+        for key in dictionary.keys() - set(
+            _REQUIRED_KEYS + _OPTIONAL_KEYS + ["sid", "batch"]
+        ):
             data[key] = dictionary[key]
 
         return data
@@ -821,32 +912,11 @@ class AtomicData:
             return memo[id(item)]
         if torch.is_tensor(item):
             result = func(item)
-        elif isinstance(item, list):
-            result = []
             memo[id(item)] = result
-            result.extend(self.__apply__(v, func, memo) for v in item)
-        elif isinstance(item, tuple):
-            values = [self.__apply__(v, func, memo) for v in item]
-            # A mutable child may have recursively completed this same tuple.
-            if id(item) in memo:
-                return memo[id(item)]
-            result = type(item)(*values) if hasattr(item, "_fields") else tuple(values)
-        elif isinstance(item, dict):
-            result = {}
-            memo[id(item)] = result
-            result.update((k, self.__apply__(v, func, memo)) for k, v in item.items())
-        elif (is_dataclass(item) and not isinstance(item, type)) or (
-            hasattr(item, "__dict__")
-            and not isinstance(item, (type, types.ModuleType))
-            and not callable(item)
-        ):
-            # Match clone's job metadata traversal, including frozen/slotted
-            # dataclasses. Keep cycles and aliases across the conversion.
-            result = _clone_tensor_tree(item, tensor_transform=func, memo=memo)
-        else:
+            return result
+        if isinstance(item, (str, bytes, int, float, complex)) or item is None:
             return item
-        memo[id(item)] = result
-        return result
+        return _clone_tensor_tree(item, tensor_transform=func, memo=memo)
 
     def apply(self, func):
         r"""Applies the function :obj:`func` to all tensor attributes"""
@@ -1030,12 +1100,26 @@ class AtomicData:
         Returns:
             AtomicData: The updated batch object.
         """
-        self.edge_index = edge_index
-        self.cell_offsets = cell_offsets
-        self.nedges = nedges
-        edge_slices = [0] + torch.cumsum(nedges, dim=0).tolist()
-        self.__slices__["edge_index"] = edge_slices
-        self.__slices__["cell_offsets"] = edge_slices
+        if nedges.shape != self.natoms.shape or cell_offsets.dtype not in (
+            self.pos.dtype,
+            torch.long,
+        ):
+            raise ValueError("Invalid edge count shape or cell offset dtype")
+        edge_index, cell_offsets = canonicalize_external_edges(
+            self.batch, edge_index, cell_offsets, nedges
+        )
+        if self.__slices__ is not None:
+            edge_slices = [0, *nedges.cumsum(0).tolist()]
+            self.__slices__ = {
+                **self.__slices__,
+                "edge_index": edge_slices,
+                "cell_offsets": edge_slices,
+            }
+        self.edge_index, self.cell_offsets, self.nedges = (
+            edge_index,
+            cell_offsets,
+            nedges,
+        )
         return self
 
 
@@ -1055,6 +1139,39 @@ def atomicdata_list_to_batch(
     excluded = set(exclude_keys or ())
     if excluded.intersection(_REQUIRED_KEYS + ["batch", "sid"]):
         raise ValueError("Cannot exclude required AtomicData fields")
+    if "atomic_masses" not in excluded and any(
+        "atomic_masses" in item for item in data_list
+    ):
+        normalized = []
+        for source in data_list:
+            item = source
+            values = source.get("atomic_masses")
+            if not isinstance(values, tuple):
+                item = copy.copy(source)
+                item.__keys__ = set(item.__keys__)
+                if torch.is_tensor(values):
+                    values = values.detach().cpu().tolist()
+                item["atomic_masses"] = (
+                    (None,) * item.num_nodes if values is None else tuple(values)
+                )
+            normalized.append(item)
+        data_list = normalized
+    if any(item.cell_offsets.dtype == torch.long for item in data_list):
+        # Preserve large integer image IDs when collating them with ordinary
+        # floating-point offsets. Keep each caller-owned sample unchanged.
+        normalized = []
+        for source in data_list:
+            item = source
+            if item.cell_offsets.is_floating_point():
+                images = item.cell_offsets.long()
+                if not torch.equal(images.to(item.cell_offsets), item.cell_offsets):
+                    raise ValueError(
+                        "Cannot batch fractional cell offsets with exact integer images"
+                    )
+                item = copy.copy(source)
+                item.cell_offsets = images
+            normalized.append(item)
+        data_list = normalized
     keys = sorted(set(data_list[0].keys()) - excluded)
     for index, data in enumerate(data_list):
         if set(data.keys()) - excluded != set(keys):

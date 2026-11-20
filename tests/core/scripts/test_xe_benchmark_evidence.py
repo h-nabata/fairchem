@@ -201,8 +201,8 @@ def test_counted_predictor_tracks_shared_call_after_replica_serialization():
 
     from fairchem.core.scripts.benchmark_batch_server import (
         _CountedPredictor,
-        _RequestObservation,
         _request_metrics,
+        _RequestObservation,
     )
 
     class Local:
@@ -257,3 +257,19 @@ def test_missing_runtime_execution_fails_requested_feature():
     runtime.capture_count = 1
     runtime.replay_count = 2
     assert validate_xpu._execution_report(predictor, settings, 0)["passed"]
+
+
+@pytest.mark.parametrize("module", [validate_xpu, benchmark_md])
+def test_benchmark_rejects_wrapped_device_before_torch_discovery(module, tmp_path):
+    output = tmp_path / "report.json"
+    assert module.main(["--device", "xpu:256", "--output", str(output)]) == 1
+    error = json.loads(output.read_text())["error"]
+    message = error["message"] if isinstance(error, dict) else error
+    assert "Invalid xpu device index '256'" in message
+
+
+def test_series_b_comparison_rejects_wrapped_device_before_loading():
+    with pytest.raises(ValueError, match="Invalid cuda device index '257'"):
+        compare_series_b.run_comparison(
+            "unused.pt", molecule("H2O"), task="omol", device="cuda:257", series_b={}
+        )

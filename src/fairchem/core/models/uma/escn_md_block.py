@@ -8,6 +8,7 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 import copy
+from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
 import torch
@@ -27,7 +28,12 @@ from fairchem.core.models.uma.nn.activation import (
 from fairchem.core.models.uma.nn.layer_norm import (
     get_normalization_layer,
 )
-from fairchem.core.models.uma.nn.mole import MOLE
+from fairchem.core.models.uma.nn.mole import (
+    MOLE,
+    MOLEDGL,
+    MOLEGlobals,
+    checkpoint_routes,
+)
 from fairchem.core.models.uma.nn.so2_layers import SO2_Convolution
 from fairchem.core.models.uma.nn.so3_layers import SO3_Linear
 from fairchem.core.models.uma.nn.unified_radial import RadialProjection
@@ -37,18 +43,32 @@ if TYPE_CHECKING:
     from fairchem.core.models.uma.nn.execution_backends import ExecutionBackend
 
 
-def set_mole_ac_start_index(module: nn.Module, index: int) -> None:
-    if not hasattr(module, "_chunk_mole_states"):
-        # Initialize legacy serialized modules and directly constructed blocks.
-        module._chunk_mole_states = tuple(
+def _mole_states(module: nn.Module):
+    if not hasattr(module, "_checkpoint_mole_states"):
+        # Rediscover from actual layers in legacy modules: their old state cache
+        # omitted DGL experts.
+        module._checkpoint_mole_states = tuple(
             {
                 id(m.global_mole_tensors): m.global_mole_tensors
                 for m in module.modules()
-                if isinstance(m, MOLE)
+                if isinstance(m, (MOLE, MOLEDGL))
             }.values()
         )
-    for state in module._chunk_mole_states:
+    return module._checkpoint_mole_states
+
+
+def set_mole_ac_start_index(module: nn.Module, index: int) -> None:
+    for state in _mole_states(module):
         state.ac_start_idx = index
+
+
+def _checkpoint_routes_for(module: nn.Module, start: int):
+    return {
+        id(state): MOLEGlobals(
+            state.expert_mixing_coefficients, state.mole_sizes, start
+        )
+        for state in _mole_states(module)
+    }
 
 
 class Edgewise(torch.nn.Module):
@@ -203,7 +223,7 @@ class Edgewise(torch.nn.Module):
                 wigner_partitions[idx],
                 wigner_inv_partitions[idx],
                 scatter_target_partitions[idx],
-                ac_mole_start_idx,
+                routes=_checkpoint_routes_for(self, ac_mole_start_idx),
                 use_reentrant=False,
             )
             # Addition backward does not save its operands. This releases
@@ -229,47 +249,45 @@ class Edgewise(torch.nn.Module):
         scatter_target: torch.Tensor | None = None,
         ac_mole_start_idx: int = 0,
         residual: torch.Tensor | None = None,
+        *,
+        routes=None,
     ):
         if scatter_target is None:
             scatter_target = edge_index[1]
-        # here we need to update the ac_start_idx of the mole layers
-        # under here for this chunking to work properly with MoLE
-        set_mole_ac_start_index(self, ac_mole_start_idx)
-
-        try:
-            with record_function("SO2Conv"):
-                # Both paths scatter via the caller-provided ``scatter_target``,
-                # which the outer forward() pre-remaps for whichever GP mode is
-                # active (A2A, allgather, or no GP). That keeps the fused fast
-                # path usable in every configuration.
-                if getattr(self.backend, "supports_fused_edgewise", False):
-                    new_embedding = self._forward_chunk_fused(
-                        x_full,
-                        x_original_shape,
-                        x_edge,
-                        edge_index,
-                        wigner,
-                        wigner_inv_envelope,
-                        scatter_target,
-                        residual,
-                    )
-                else:
-                    x_message = self.backend.node_to_edge_wigner_permute(
-                        x_full, edge_index, wigner
-                    )
-                    x_message, x_0_gating = self.so2_conv_1(x_message, x_edge)
-                    x_message = self.act(x_0_gating, x_message)
-                    x_message = self.so2_conv_2(x_message)
-                    new_embedding = self.backend.permute_wigner_inv_edge_to_node(
-                        x_message,
-                        wigner_inv_envelope,
-                        scatter_target,
-                        x_original_shape,
-                    )
-                    if residual is not None:
-                        new_embedding = new_embedding + residual
-        finally:
-            set_mole_ac_start_index(self, 0)
+        if routes is None and ac_mole_start_idx:
+            routes = _checkpoint_routes_for(self, ac_mole_start_idx)
+        routing = checkpoint_routes(routes) if routes else nullcontext()
+        with routing, record_function("SO2Conv"):
+            # Both paths scatter via the caller-provided ``scatter_target``,
+            # which the outer forward() pre-remaps for whichever GP mode is
+            # active (A2A, allgather, or no GP). That keeps the fused fast
+            # path usable in every configuration.
+            if getattr(self.backend, "supports_fused_edgewise", False):
+                new_embedding = self._forward_chunk_fused(
+                    x_full,
+                    x_original_shape,
+                    x_edge,
+                    edge_index,
+                    wigner,
+                    wigner_inv_envelope,
+                    scatter_target,
+                    residual,
+                )
+            else:
+                x_message = self.backend.node_to_edge_wigner_permute(
+                    x_full, edge_index, wigner
+                )
+                x_message, x_0_gating = self.so2_conv_1(x_message, x_edge)
+                x_message = self.act(x_0_gating, x_message)
+                x_message = self.so2_conv_2(x_message)
+                new_embedding = self.backend.permute_wigner_inv_edge_to_node(
+                    x_message,
+                    wigner_inv_envelope,
+                    scatter_target,
+                    x_original_shape,
+                )
+                if residual is not None:
+                    new_embedding = new_embedding + residual
         return new_embedding
 
     def _forward_chunk_fused(

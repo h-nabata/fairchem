@@ -28,6 +28,14 @@ UV_PROJECT_ENVIRONMENT="$PWD/.venv-xpu" uv sync --locked --project packages/fair
 The Intel-only package uses the same source tree and import names as
 `fairchem-core`. Its metadata pins the XPU build of PyTorch and moves CUDA
 graph v3, NVIDIA D3 and Nitro dependencies into the optional `nvidia` extra.
+The Intel and NumPy 1.26 wheels carry `xpu` and `numpy126` PEP 440 local
+version identifiers. All three dependency variants can share a wheelhouse. Specify the exact local version or wheel path
+when selecting between artifacts from that directory. Regression CLI outputs
+can be redirected with `FAIRCHEM_REGRESSION_ROOT`. Installed wheels outside
+a checkout default to `$XDG_STATE_HOME/fairchem/regression` (normally
+`~/.local/state/fairchem/regression`); Git-based Slurm campaigns still require
+a checkout.
+
 Use a separate environment for each build. The regular package still installs
 its CUDA dependencies. Its default uv group remains `cu130`; select
 `--no-default-groups --group xpu` on the regular project if you also need
@@ -165,9 +173,8 @@ error before optional-backend import or parameter download.
 Portable UMA model registration no longer imports Nitro/Triton implementation
 packages. The NVIDIA neighbor-list module and `fairchem_cpp` are loaded only
 when their respective paths are used. This avoids otherwise unrelated CUDA
-binary failures blocking ordinary UMA imports. The CUDA dependencies declared
-by the upstream package remain installed; they have not been removed from
-features that use them.
+binary failures blocking ordinary UMA imports. The regular manifest retains the upstream CUDA dependencies. The Intel manifest
+provides optional NVIDIA packages in the `nvidia` extra.
 
 ## Source-level regression coverage
 

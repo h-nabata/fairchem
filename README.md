@@ -129,20 +129,14 @@ Python 3.12と、Intel GPUを認識するドライバー／ランタイムを用
 ```bash
 git clone --branch intel-xpu-fp32 --single-branch https://github.com/h-nabata/fairchem.git
 cd fairchem
-uv venv --python 3.12 .venv-xpu
+export UV_PROJECT_ENVIRONMENT="$PWD/.venv-xpu"
+uv sync --locked --project packages/fairchem-core-xpu --python 3.12
 source .venv-xpu/bin/activate
-uv pip install --python .venv-xpu/bin/python 'torch==2.15.0' \
-  --index-url https://download.pytorch.org/whl/xpu
-uv pip install --python .venv-xpu/bin/python -e packages/fairchem-core
 uv pip check --python .venv-xpu/bin/python
 ```
 
-このブランチのPyTorch依存範囲は`>=2.13,<2.16`です。
-既存の対応XPU wheelを先に導入すると、そのwheelを利用して依存関係を解決します。
-`uv sync`の既定グループはCUDA向けなので、このXPU導入手順では使用しません。
-Linuxでは共通依存関係としてCUDA／Warp系パッケージも導入されますが、通常のXPU経路では
-Nitro／WarpなどのCUDA専用カーネルを読み込まずに実行します。
-CUDA向けwheelへ入れ替わっていないか、次で確認します。
+Intel専用のロックファイルはLinux x86-64向けで、PyTorch 2.15.0+xpuと依存パッケージの組み合わせを固定します。
+通常版のCUDA環境は別の仮想環境に作成してください。Intel GPUの認識と演算を次のコードで確認できます。
 
 ```bash
 python - <<'PY'
@@ -158,11 +152,9 @@ torch.xpu.synchronize()
 PY
 ```
 
-TorchSimを併用する場合は同じ環境で`uv pip install -e 'packages/fairchem-core[torchsim]'`、
-Pymatgenなどを使う計算レシピは`uv pip install -e 'packages/fairchem-core[extras]'`を追加します。
-NumPy 1.26が必須の既存環境には、Python 3.11／3.12向けの別manifest
-`packages/fairchem-core-numpy126`があります。二つのmanifestを同時にインストールしないでください。
-新規環境では上記の通常版を使用します。
+TorchSimを併用する場合は、上記の`uv sync`に`--extra torchsim`を追加します。
+Pymatgenなどを使う際は`--extra extras`を追加します。複数の追加機能を使う場合は同じコマンドにまとめて指定してください。
+NumPy 1.26が必要な既存環境には、Python 3.11／3.12向けに別構成の`packages/fairchem-core-numpy126`があります。
 
 <a id="fork-fp32"></a>
 

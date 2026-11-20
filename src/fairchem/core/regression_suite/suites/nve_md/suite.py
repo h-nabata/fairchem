@@ -294,6 +294,7 @@ class NVEMDSuite(Suite):
     """
 
     name = "nve-md"
+    mass_dependent = True
     plan_hash = "4dc278b1ac629f1d59ce8045733c0ab988965f05c163b642bcbef56947d44e82"
     smoke_case_ids = tuple(
         f"nve-md/{system.dataset}/{system.name}/seed-0" for system in SYSTEMS
@@ -365,7 +366,8 @@ class NVEMDSuite(Suite):
             dataset = DATASETS[system.dataset]
             structure = dataset.structure_pattern.format(system.name)
             structure_hash = atoms_hash(
-                ase.io.read(Path(__file__).parent / "structures" / structure)
+                ase.io.read(Path(__file__).parent / "structures" / structure),
+                mass_dependent=self.mass_dependent,
             )
             for seed_index in range(_SEEDS_PER_SYSTEM):
                 seed = 42 + index + 100 * seed_index

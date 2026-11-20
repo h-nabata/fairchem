@@ -12,6 +12,8 @@ import gc
 import math
 import operator
 import os
+import subprocess
+import sys
 import tempfile
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
@@ -152,6 +154,8 @@ class _ShardedSamples(Sequence):
         self._directory = tempfile.TemporaryDirectory(
             dir=directory, prefix="fairchem-labels-"
         )
+        self._root = Path(self._directory.name)
+        self._cached = (None, None)
         self._shard_size = shard_size
         self._count = 0
         shard = []
@@ -168,8 +172,12 @@ class _ShardedSamples(Sequence):
             self._directory.cleanup()
             raise
 
+    def __getstate__(self):
+        # The parent owns the temporary directory until its worker returns.
+        return {**vars(self), "_directory": None, "_cached": (None, None)}
+
     def _path(self, number):
-        return Path(self._directory.name) / f"{number}.pt"
+        return self._root / f"{number}.pt"
 
     def _read(self, number):
         # Only read data written into this instance's private temporary directory.
@@ -191,7 +199,11 @@ class _ShardedSamples(Sequence):
         if not 0 <= index < len(self):
             raise IndexError("distillation sample index out of range")
         shard, offset = divmod(index, self._shard_size)
-        return self._read(shard)[offset]
+        cached_number, entries = self._cached
+        if cached_number != shard:
+            entries = self._read(shard)
+            self._cached = (shard, entries)
+        return copy.deepcopy(entries[offset])
 
 
 @dataclass(frozen=True)
@@ -408,6 +420,32 @@ class DistillationResult:
     provenance: dict
 
 
+def _run_distillation_worker(request_path, result_path):
+    # Only called with a private request file produced by the parent process.
+    request = torch.load(request_path, weights_only=False)
+    torch.save(distill_student(**request), result_path)
+
+
+def _distill_in_process(request):
+    # Disk transport avoids sharing accelerator tensors or the parent's global
+    # RNG/locks. Sharded data stays on disk for the lifetime of this call.
+    with tempfile.TemporaryDirectory(prefix="fairchem-distill-") as temp:
+        request_path, result_path = Path(temp) / "input.pt", Path(temp) / "result.pt"
+        torch.save(request, request_path)
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from fairchem.core.calculate.series_b_distillation import "
+                "_run_distillation_worker as run; import sys; run(*sys.argv[1:])",
+                str(request_path),
+                str(result_path),
+            ],
+            check=True,
+        )
+        return torch.load(result_path, weights_only=False)
+
+
 @_release_failed_workflow
 @torch.inference_mode(False)
 def distill_student(
@@ -419,6 +457,7 @@ def distill_student(
     weights: DistillationWeights | None = None,
     output_adapter: Callable | None = None,
     seed: int = 0,
+    execution: str = "local",
 ) -> DistillationResult:
     """
     Train an independent student copy with differentiable E/F/stress losses.
@@ -432,6 +471,9 @@ def distill_student(
     Training mode retains force/stress derivative graphs for weight gradients.
     Seeded sampling and the selected device's PyTorch RNG are scoped/restored;
     unrelated threads using global random generators need caller coordination.
+    Use execution="process" for independent concurrent jobs. The worker owns
+    its RNG and model locks. The student and adapter must be importable and
+    pickleable, and private temporary disk space must fit the request/result.
     The returned model is in evaluation mode; its weights remain trainable.
     Loss history is training loss, not a held-out accuracy or speed guarantee.
     """
@@ -452,6 +494,20 @@ def distill_student(
     weights = DistillationWeights() if weights is None else weights
     if not isinstance(weights, DistillationWeights):
         raise TypeError("weights must be DistillationWeights")
+    if execution == "process":
+        return _distill_in_process(
+            dict(
+                student=student,
+                dataset=dataset,
+                steps=steps,
+                learning_rate=learning_rate,
+                weights=weights,
+                output_adapter=output_adapter,
+                seed=seed,
+            )
+        )
+    if execution != "local":
+        raise ValueError("execution must be 'local' or 'process'")
     # Revalidate/copy so a caller's post-construction edits cannot inject bad
     # values midway through a job or alias the training examples.
     if isinstance(dataset.samples, _ShardedSamples):

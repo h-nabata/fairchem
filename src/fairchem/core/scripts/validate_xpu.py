@@ -35,6 +35,8 @@ from ase.calculators.calculator import all_changes
 from ase.io import iread
 from ase.stress import full_3x3_to_voigt_6_stress
 
+from fairchem.core.common.distutils import parse_device
+
 
 def validate_prediction(prediction, natoms, stress=False):
     """Reject malformed outputs before NumPy broadcasting can hide an error."""
@@ -949,7 +951,7 @@ def main(argv=None):
             )
         ):
             raise ValueError("Finite-difference step and tolerances must be positive")
-        device = torch.device(args.device)
+        device = parse_device(args.device)
         if device.type != "xpu":
             raise ValueError("--device must be an XPU device, such as xpu:0")
         if not torch.xpu.is_available():

@@ -14,11 +14,24 @@ import shutil
 import time
 from abc import ABC, ABCMeta, abstractmethod
 from pathlib import Path
+from tempfile import mkdtemp
 from typing import Any
+from uuid import uuid4
 
+from filelock import FileLock
 from omegaconf import DictConfig, OmegaConf
 
 from fairchem.core.components.utils import ManagedAttribute
+
+
+def _sync_directory(path: Path) -> None:
+    """Persist directory entries after publishing a file or a checkpoint."""
+    if os.name == "posix":
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
 
 class Runner(metaclass=ABCMeta):
@@ -118,6 +131,10 @@ class PreemptableMixin(ABC):
     - load_state(): delegates to load_simulation_state()
     """
 
+    # Array jobs share a checkpoint directory. These immutable files from
+    # independent shards are carried forward when another shard publishes.
+    checkpoint_shard_pattern: str | None = None
+
     @property
     def stopfair_path(self) -> Path:
         """
@@ -137,46 +154,83 @@ class PreemptableMixin(ABC):
         """
         save_path = self.job_config.metadata.preemption_checkpoint_dir
         logging.info(f"STOPFAIR detected, saving state to {save_path}")
-        if self.save_state(save_path, is_preemption=True):
-            self.stopfair_path.unlink(missing_ok=True)
+        if not self.save_state(save_path, is_preemption=True):
+            raise OSError(f"Failed to save STOPFAIR checkpoint to {save_path}")
+        self.stopfair_path.unlink(missing_ok=True)
         raise StopfairDetected
 
     def save_state(self, checkpoint_location: str, is_preemption: bool = False) -> bool:
-        """
-        Atomically save checkpoint: domain state + preemption configs.
-
-        Writes to a temporary directory first, then swaps it into place so
-        that a crash mid-write never leaves a corrupt checkpoint.
-
-        Args:
-            checkpoint_location: Directory to save checkpoint files.
-            is_preemption: Whether this save is due to preemption.
-
-        Returns:
-            True if state was successfully saved.
-        """
-        checkpoint_dir = Path(checkpoint_location)
-        tmp_dir = checkpoint_dir.with_name(checkpoint_dir.name + ".tmp")
-
+        """Publish a durable generation and retain the preceding complete snapshot."""
+        root = Path(checkpoint_location).absolute()
+        generations = root / ".generations"
+        current = root / ".current"
         try:
-            if tmp_dir.exists():
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-            tmp_dir.mkdir(parents=True, exist_ok=True)
-
-            # Subclass saves its domain-specific state
-            self.save_simulation_state(tmp_dir, is_preemption)
-
-            # Mixin saves portable + resume configs
-            self._save_preemption_configs(tmp_dir, checkpoint_location)
-
-            if checkpoint_dir.exists():
-                shutil.rmtree(checkpoint_dir, ignore_errors=True)
-            tmp_dir.rename(checkpoint_dir)
+            generations.mkdir(parents=True, exist_ok=True)
+            with FileLock(root / ".checkpoint.lock"):
+                previous = (
+                    current.resolve(strict=True) if current.is_symlink() else None
+                )
+                if previous is None:
+                    legacy = [
+                        path
+                        for path in root.iterdir()
+                        if path.is_file()
+                        and not path.is_symlink()
+                        and not path.name.startswith(".")
+                    ]
+                    if legacy:
+                        previous = Path(
+                            mkdtemp(prefix="state-", dir=generations)
+                        ).resolve()
+                        for path in legacy:
+                            os.link(path, previous / path.name)
+                        _sync_directory(previous)
+                        _sync_directory(generations)
+                generation = Path(mkdtemp(prefix="state-", dir=generations))
+                pointer = root / f".pointer-{uuid4().hex}"
+                published = False
+                try:
+                    self.save_simulation_state(generation, is_preemption)
+                    self._save_preemption_configs(generation, str(root))
+                    if previous is not None and self.checkpoint_shard_pattern:
+                        for shard in previous.glob(self.checkpoint_shard_pattern):
+                            if not (generation / shard.name).exists():
+                                os.link(shard, generation / shard.name)
+                    for path in generation.iterdir():
+                        with path.open("rb") as file:
+                            os.fsync(file.fileno())
+                        # Flat aliases retain compatibility with external tools and
+                        # portable configs. Existing flat legacy files stay readable
+                        # until the new snapshot has been published.
+                        alias = root / path.name
+                        if not alias.exists() and not alias.is_symlink():
+                            alias.symlink_to(Path(".current") / path.name)
+                    _sync_directory(generation)
+                    _sync_directory(generations)
+                    pointer.symlink_to(
+                        generation.relative_to(root), target_is_directory=True
+                    )
+                    os.replace(pointer, current)
+                    published = True
+                    _sync_directory(root)
+                    _sync_directory(root.parent)
+                    for path in generation.iterdir():
+                        alias = root / path.name
+                        if not alias.is_symlink():
+                            pointer.symlink_to(Path(".current") / path.name)
+                            os.replace(pointer, alias)
+                    _sync_directory(root)
+                    # Readers hold the same lock until they have loaded every file.
+                    for old in generations.glob("state-*"):
+                        if old != generation and old.resolve() != previous:
+                            shutil.rmtree(old, ignore_errors=True)
+                finally:
+                    pointer.unlink(missing_ok=True)
+                    if not published:
+                        shutil.rmtree(generation, ignore_errors=True)
             return True
-        except Exception as e:
-            if tmp_dir.exists():
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-            logging.exception(f"Failed to save checkpoint: {e}")
+        except Exception:
+            logging.exception("Failed to save checkpoint to %s", root)
             return False
 
     @abstractmethod
@@ -242,7 +296,22 @@ class PreemptableMixin(ABC):
         """
         if checkpoint_location is None:
             return
-        self.load_simulation_state(Path(checkpoint_location).absolute())
+        root = Path(checkpoint_location).absolute()
+        if not root.is_dir():
+            self.load_simulation_state(root)
+            return
+        # A portable copy can live on read-only media. A writable checkpoint is
+        # locked even on its first migration from the legacy flat layout.
+        current = root / ".current"
+        if os.access(root, os.W_OK):
+            with FileLock(root / ".checkpoint.lock"):
+                snapshot = (
+                    current.resolve(strict=True) if current.is_symlink() else root
+                )
+                self.load_simulation_state(snapshot)
+        else:
+            snapshot = current.resolve(strict=True) if current.is_symlink() else root
+            self.load_simulation_state(snapshot)
 
     @abstractmethod
     def load_simulation_state(self, checkpoint_dir: Path) -> None:

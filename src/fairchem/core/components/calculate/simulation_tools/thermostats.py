@@ -8,7 +8,7 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -48,6 +48,13 @@ class Thermostat(ABC):
         Returns:
             An ASE MolecularDynamics object.
         """
+
+    def build_for_restart(
+        self, atoms: Atoms, timestep_fs: float, state: dict
+    ) -> MolecularDynamics:
+        dyn = self.build(atoms, timestep_fs)
+        self.restore_state(dyn, state)
+        return dyn
 
     @abstractmethod
     def save_state(self, dyn: MolecularDynamics) -> dict[str, Any]:
@@ -121,6 +128,33 @@ class NoseHooverNVT(Thermostat):
         thermostat._p_eta = np.array(state["p_eta"])
 
 
+def _save_rng(rng: np.random.RandomState) -> dict:
+    algorithm, keys, pos, has_gauss, cached_gaussian = rng.get_state()
+    return {
+        "version": 1,
+        "algorithm": algorithm,
+        "keys": keys.tolist(),
+        "pos": pos,
+        "has_gauss": has_gauss,
+        "cached_gaussian": cached_gaussian,
+    }
+
+
+def _restore_rng(rng: np.random.RandomState, state: dict) -> None:
+    # The pre-versioned format stored the same five MT19937 fields.
+    if state.get("version", 1) != 1:
+        raise ValueError("Unsupported thermostat RNG state version")
+    rng.set_state(
+        (
+            state["algorithm"],
+            np.array(state["keys"], dtype=np.uint32),
+            state["pos"],
+            state["has_gauss"],
+            state["cached_gaussian"],
+        )
+    )
+
+
 @dataclass
 class BussiThermostat(Thermostat):
     """
@@ -129,6 +163,7 @@ class BussiThermostat(Thermostat):
 
     temperature_K: float  # Kelvin
     taut_fs: float  # femtoseconds
+    thermostat_seed: int | None = None
 
     def build(self, atoms: Atoms, timestep_fs: float) -> MolecularDynamics:
         return Bussi(
@@ -136,35 +171,18 @@ class BussiThermostat(Thermostat):
             timestep=timestep_fs * units.fs,
             temperature_K=self.temperature_K,
             taut=self.taut_fs * units.fs,
+            rng=np.random.RandomState(self.thermostat_seed),
         )
 
     def save_state(self, dyn: MolecularDynamics) -> dict[str, Any]:
-        rng_state = dyn.rng.get_state()
-        return jsanitize(
-            {
-                "class_name": "BussiThermostat",
-                "rng_state": {
-                    "algorithm": rng_state[0],
-                    "keys": rng_state[1],
-                    "pos": rng_state[2],
-                    "has_gauss": rng_state[3],
-                    "cached_gaussian": rng_state[4],
-                },
-                "transferred_energy": dyn.transferred_energy,
-            }
-        )
+        return {
+            "class_name": "BussiThermostat",
+            "rng_state": _save_rng(dyn.rng),
+            "transferred_energy": float(dyn.transferred_energy),
+        }
 
     def restore_state(self, dyn: MolecularDynamics, state: dict[str, Any]) -> None:
-        rng = state["rng_state"]
-        dyn.rng.set_state(
-            (
-                rng["algorithm"],
-                np.array(rng["keys"], dtype=np.uint32),
-                rng["pos"],
-                rng["has_gauss"],
-                rng["cached_gaussian"],
-            )
-        )
+        _restore_rng(dyn.rng, state["rng_state"])
         if "transferred_energy" in state:
             dyn.transferred_energy = state["transferred_energy"]
 
@@ -177,12 +195,13 @@ class LangevinThermostat(Thermostat):
 
     temperature_K: float  # Kelvin
     friction_per_fs: float  # 1/femtoseconds
-    use_fix_com_constraint: bool = False
+    # None selects FixCom for new runs and the original behavior for legacy restarts.
+    use_fix_com_constraint: bool | None = None
+    thermostat_seed: int | None = None
 
     def build(self, atoms: Atoms, timestep_fs: float) -> MolecularDynamics:
-        if self.use_fix_com_constraint and not any(
-            isinstance(constraint, FixCom) for constraint in atoms.constraints
-        ):
+        use_constraint = self.use_fix_com_constraint is not False
+        if use_constraint:
             mobile = np.ones(len(atoms), dtype=bool)
             for constraint in atoms.constraints:
                 if isinstance(constraint, FixAtoms):
@@ -191,47 +210,57 @@ class LangevinThermostat(Thermostat):
                 raise ValueError(
                     "FixCom requires at least two mobile atoms in Langevin dynamics."
                 )
-            fix_com = (
-                FixCom()
-                if mobile.all()
-                else FixSubsetCom(indices=np.flatnonzero(mobile))
-            )
-            atoms.set_constraint([*atoms.constraints, fix_com])
+            com_constraints = [c for c in atoms.constraints if isinstance(c, FixCom)]
+            if not com_constraints:
+                fix_com = (
+                    FixCom()
+                    if mobile.all()
+                    else FixSubsetCom(indices=np.flatnonzero(mobile))
+                )
+                atoms.set_constraint([*atoms.constraints, fix_com])
+            elif not mobile.all():
+                constraints = []
+                for constraint in atoms.constraints:
+                    selected = constraint
+                    if isinstance(constraint, FixSubsetCom):
+                        indices = constraint.get_indices()
+                        if len(indices) < 2 or not mobile[indices].all():
+                            raise ValueError(
+                                "FixSubsetCom requires at least two mobile atoms and no fixed atoms"
+                            )
+                    elif isinstance(constraint, FixCom):
+                        selected = FixSubsetCom(indices=np.flatnonzero(mobile))
+                    constraints.append(selected)
+                atoms.set_constraint(constraints)
+            if atoms.get_number_of_degrees_of_freedom() <= 0:
+                raise ValueError(
+                    "No unconstrained degrees of freedom remain for Langevin dynamics"
+                )
 
         return Langevin(
             atoms=atoms,
             timestep=timestep_fs * units.fs,
             temperature_K=self.temperature_K,
             friction=self.friction_per_fs / units.fs,
-            fixcm=not self.use_fix_com_constraint,
+            fixcm=not use_constraint,
+            rng=np.random.RandomState(self.thermostat_seed),
         )
+
+    def build_for_restart(self, atoms, timestep_fs, state):
+        mode = state.get("use_fix_com_constraint", bool(self.use_fix_com_constraint))
+        dyn = replace(self, use_fix_com_constraint=mode).build(atoms, timestep_fs)
+        self.restore_state(dyn, state)
+        return dyn
 
     def save_state(self, dyn: MolecularDynamics) -> dict[str, Any]:
-        rng_state = dyn.rng.get_state()
-        return jsanitize(
-            {
-                "class_name": "LangevinThermostat",
-                "rng_state": {
-                    "algorithm": rng_state[0],
-                    "keys": rng_state[1],
-                    "pos": rng_state[2],
-                    "has_gauss": rng_state[3],
-                    "cached_gaussian": rng_state[4],
-                },
-            }
-        )
+        return {
+            "class_name": "LangevinThermostat",
+            "rng_state": _save_rng(dyn.rng),
+            "use_fix_com_constraint": not dyn.fix_com,
+        }
 
     def restore_state(self, dyn: MolecularDynamics, state: dict[str, Any]) -> None:
-        rng = state["rng_state"]
-        dyn.rng.set_state(
-            (
-                rng["algorithm"],
-                np.array(rng["keys"], dtype=np.uint32),
-                rng["pos"],
-                rng["has_gauss"],
-                rng["cached_gaussian"],
-            )
-        )
+        _restore_rng(dyn.rng, state["rng_state"])
 
 
 @dataclass

@@ -42,6 +42,22 @@ runner = MicrobatchPredictor(
 predictions = runner.predict_many(structures)
 ```
 
+Legacy `moe_expert_coefficient_norm="pnorm"` weights use the number of systems
+in a model call to normalize each row of expert coefficients. Independent requests
+to the microbatch predictor, device pool and batch server therefore run one system
+per forward for these weights. Directly batched model calls and training retain the
+checkpoint formula. For new training runs, `"pnorm_per_system"` divides the
+smoothing constant by the number of experts, so coefficients are independent of
+batch size. Changing the normalizer on trained weights changes their predictions.
+
+Conservative three-dimensional stress is the symmetric virial divided by the
+absolute cell volume. For a slab or chain, supply a finite three-dimensional
+cell, including the vacuum region, to define that volume. A rank-deficient
+partial-periodic cell can be used for energy and forces. For compatibility,
+`AtomicData.from_ase` completes missing cell vectors for nonperiodic molecules.
+Any stress calculated directly with that model cell refers to the completed
+volume, which need not correspond to a physical volume of the molecule.
+
 An input larger than a budget is rejected before prediction. These limits never
 truncate model neighbors. `max_edges` can additionally limit graph size:
 
@@ -119,7 +135,8 @@ lifetimes; no work may use the leased input after release.
 ## Independent device workers
 
 Each `IndependentDevicePool` worker creates one predictor lazily and serializes
-its jobs. Inputs are distributed by queued atom/edge work. Device ordinals are
+its jobs. Scheduling combines queued atom/edge work with measured time per work
+unit for each device and property mix. Input locality breaks ties. Device ordinals are
 explicit and remain associated with their worker. The pool does not use Ray,
 NCCL, a distributed process group or model sharding.
 
@@ -146,7 +163,16 @@ Outputs remain on the worker's device. Two 32 GB devices do not become one 64 GB
 allocation. For asynchronous jobs, use `future = pool.submit(structures)` and
 `future.result()`. Submission takes an owned snapshot of coordinates, tensors
 and metadata before returning; later caller edits cannot alter a queued job.
-Queued snapshots consume memory, so callers should bound outstanding futures.
+The pool reserves capacity before copying. The defaults admit two outstanding
+jobs per device and 1 GiB of snapshot tensor payload across the pool. Set
+`max_pending_jobs` and `max_pending_bytes` to change either limit. Submission
+blocks for capacity. Pass `timeout=0` to fail immediately, or a timeout in seconds.
+Individual oversized jobs raise `ValueError`. Returned predictions and Python
+metadata have separate lifetimes outside this tensor budget. Staging and pool
+admission inspect tensor keys and values in Python containers, instance
+attributes, and inherited slots. Custom metadata copy methods must honor the
+provided tensor memo. Opaque containers and object-dtype NumPy arrays cannot
+be staged.
 Worker completion waits for its GPU event, so returned tensors are
 ready even when the caller selects another stream. Different devices still
 compute concurrently. Exceptions propagate to the caller; cancelled queued jobs release

@@ -7,3 +7,4 @@ inference_settings:
   execution_mode: general
   merge_mole: false
   activation_checkpointing: false
+minimum_tier: FP32

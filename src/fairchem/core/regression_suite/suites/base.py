@@ -81,6 +81,7 @@ class Suite(ABC):
     plan_hash: ClassVar[str]
     observables: ClassVar[Mapping[str, ObservableSpec]]
     smoke_case_ids: ClassVar[tuple[str, ...]]
+    mass_dependent: ClassVar[bool] = False
     structures_directory: ClassVar[str] = "structures"
     inference_settings_overrides: ClassVar[Mapping[str, Any]] = {}
     slurm_case_parallel: ClassVar[bool] = False
@@ -142,9 +143,15 @@ class Suite(ABC):
         """
         if self.generated_frames is None:
             directory = Path(inspect.getfile(type(self))).parent
-            return load_source_atoms(case, directory / self.structures_directory)
+            return load_source_atoms(
+                case,
+                directory / self.structures_directory,
+                mass_dependent=self.mass_dependent,
+            )
         return check_source_atoms(
-            self.generated_frames()[case.structure_index].copy(), case
+            self.generated_frames()[case.structure_index].copy(),
+            case,
+            mass_dependent=self.mass_dependent,
         )
 
     def predictor_group(self, case: CaseSpec) -> Hashable:

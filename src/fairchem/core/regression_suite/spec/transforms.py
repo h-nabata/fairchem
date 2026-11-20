@@ -11,6 +11,14 @@ import copy
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+from ase.constraints import (
+    FixAtoms,
+    FixBondLengths,
+    FixCom,
+    FixedLine,
+    FixedPlane,
+    FixScaled,
+)
 
 from fairchem.core.regression_suite.spec.hashing import stable_hash
 from fairchem.core.regression_suite.spec.schema import (
@@ -41,7 +49,29 @@ def apply_case_transform(atoms: Atoms, case: CaseSpec) -> SuiteCase:
     transformed.info = copy.deepcopy(atoms.info)
     matrix = np.asarray(case.transform.matrix, dtype=np.float64)
     transformed.positions[:] = transformed.positions @ matrix.T
-    transformed.set_cell(np.asarray(transformed.cell) @ matrix.T, scale_atoms=False)
+    transformed.set_cell(
+        np.asarray(transformed.cell) @ matrix.T,
+        scale_atoms=False,
+        apply_constraint=False,
+    )
+    if transformed.has("momenta"):
+        transformed.set_momenta(atoms.get_momenta() @ matrix.T, apply_constraint=False)
+    if transformed.has("initial_magmoms"):
+        moments = atoms.get_initial_magnetic_moments()
+        if moments.ndim == 2:
+            transformed.set_initial_magnetic_moments(moments @ matrix.T)
+    if not np.array_equal(matrix, np.eye(3)):
+        # Indexed atoms, bond distances, COM and directions relative to the
+        # co-rotating cell are invariant under proper rotation.
+        for constraint in transformed.constraints:
+            if isinstance(constraint, (FixedLine, FixedPlane)):
+                constraint.dir = constraint.dir @ matrix.T
+            elif not isinstance(
+                constraint, (FixAtoms, FixBondLengths, FixCom, FixScaled)
+            ):
+                raise RegressionSchemaError(
+                    f"rotation is undefined for ASE constraint {type(constraint).__name__}"
+                )
     return SuiteCase(spec=case, transformed_atoms=transformed)
 
 

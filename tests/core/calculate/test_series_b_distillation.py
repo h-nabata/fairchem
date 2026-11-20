@@ -298,3 +298,27 @@ def test_sharded_training_keeps_file_samples_independent_and_matches_resident(tm
         distill_student(HarmonicStudent(), dataset, steps=6).loss_history
         == distill_student(HarmonicStudent(), resident, steps=6).loss_history
     )
+
+
+def test_process_training_with_shards_preserves_parent_rng(tmp_path):
+    # Import through its qualified module name so a fresh interpreter can
+    # reconstruct this example exactly as it would a user's packaged student.
+    from tests.core.calculate.test_series_b_distillation import (
+        HarmonicStudent as Student,
+    )
+    from fairchem.core.common._model_state import MODEL_STATE_LOCK
+
+    dataset = collect_teacher_labels(
+        Teacher(Student(2.0)),
+        [_data()],
+        teacher_id="test",
+        properties=("energy", "forces"),
+        shard_directory=tmp_path,
+        shard_size=1,
+    )
+    rng = torch.get_rng_state()
+    with MODEL_STATE_LOCK:
+        isolated = distill_student(Student(), dataset, steps=2, execution="process")
+    reference = distill_student(Student(), dataset, steps=2)
+    assert isolated.loss_history == reference.loss_history
+    torch.testing.assert_close(torch.get_rng_state(), rng)

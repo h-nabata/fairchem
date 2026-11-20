@@ -53,3 +53,22 @@ def test_pretrained_xpu_keeps_ordinal_resolved_before_io(monkeypatch):
     monkeypatch.setattr(pretrained_mlip, "load_predict_unit", loader)
     pretrained_mlip.get_predict_unit("uma-s-1p2p1", device="xpu")
     assert loader.call_args.args[3] == "xpu:1"
+
+
+def test_checkpoint_and_reference_energies_share_custom_cache(monkeypatch, tmp_path):
+    import json
+    from fairchem.core.calculate import pretrained_mlip as pretrained
+
+    calls = []
+
+    def download(**kwargs):
+        calls.append(kwargs)
+        path = tmp_path / kwargs["filename"]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"refs": {}}))
+        return str(path)
+
+    monkeypatch.setattr(pretrained, "hf_hub_download", download)
+    pretrained.resolve_checkpoint("uma-s-1p2p1", cache_dir=str(tmp_path))
+    assert len(calls) == 3
+    assert all(call["cache_dir"] == str(tmp_path) for call in calls)

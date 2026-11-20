@@ -80,7 +80,9 @@ def test_cached_partition_accepts_the_same_index_containers_as_fresh_graph(kind)
 
 @pytest.mark.parametrize("cached", [False, True])
 @pytest.mark.parametrize("method", ["cell", "all_pairs", "bvh"])
-def test_periodic_cancellation_keeps_filtered_topology_metadata_aligned(cached, method):
+def test_periodic_cancellation_preserves_short_edges_and_aligned_topology(
+    cached, method
+):
     data = AtomicData.from_ase(
         Atoms(
             "H2",
@@ -105,15 +107,19 @@ def test_periodic_cancellation_keeps_filtered_topology_metadata_aligned(cached, 
             neighbor_cache=cache,
             graph_search_method=method,
         )
-        assert graph["edge_index"].shape == (2, 0)
-        for key in (
-            "cell_offsets",
-            "offset_distances",
-            "edge_distance",
-            "edge_distance_vec",
-        ):
-            assert len(graph[key]) == 0
-        assert graph["neighbors"].tolist() == [0]
+        assert graph["edge_index"].shape == (2, 2)
+        assert graph["neighbors"].tolist() == [2]
+        assert set(map(tuple, graph["edge_index"].T.tolist())) == {(0, 1), (1, 0)}
+        torch.testing.assert_close(
+            graph["edge_distance"], torch.full((2,), 1e-8), atol=0, rtol=1e-6
+        )
+        torch.testing.assert_close(
+            graph["edge_distance_vec"].abs()[:, 0], graph["edge_distance"]
+        )
+        torch.testing.assert_close(graph["cell_offsets"].abs()[:, 0], torch.ones(2))
+        torch.testing.assert_close(
+            graph["offset_distances"].abs()[:, 0], torch.full((2,), 2.0)
+        )
 
 
 def test_zero_edge_filter_preserves_batch_counts_and_second_derivatives():

@@ -9,6 +9,7 @@ license = {text = "MIT License"}
 dynamic = ["version", "readme"]
 requires-python = ">=3.11, <3.15"
 dependencies = [
+    "filelock",
     "torch==2.15.0+xpu",
     "triton-xpu>=3.9,<3.10.dev0; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "numpy>=2.0,<2.5",
@@ -75,17 +76,19 @@ url = "https://download.pytorch.org/whl/xpu"
 explicit = true
 
 [tool.hatch.version]
-source = "vcs"
-
-[tool.hatch.version.raw-options]
-root = "../../"
-git_describe_command = 'git describe --tags --match fairchem_core-*'
+source = "code"
+path = "xpu_version.py"
+expression = "variant_version('xpu')"
 
 [tool.hatch.build]
 directory = "../../dist-core-xpu"
 
 [tool.hatch.build.targets.sdist]
 only-include = ["src/fairchem/core", "src/fairchem/experimental"]
+
+[tool.hatch.build.targets.sdist.force-include]
+"../../README.md" = "README.md"
+"../build_variant.py" = "xpu_version.py"
 
 [tool.hatch.build.targets.wheel]
 sources = ["src"]

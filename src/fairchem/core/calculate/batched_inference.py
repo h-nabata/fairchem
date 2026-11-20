@@ -8,13 +8,14 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 import copy
+import math
 import sys
 from collections import OrderedDict
 from collections.abc import Collection, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
-from numbers import Integral
-from threading import Lock
+from numbers import Integral, Real
+from threading import Condition, Lock
 from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
@@ -22,10 +23,14 @@ import torch
 
 from fairchem.core.calculate.device_buffers import (
     DeviceBatchStager,
-    _tensors,
     device_scope,
 )
-from fairchem.core.datasets.atomic_data import AtomicData, atomicdata_list_to_batch
+from fairchem.core.common.distutils import parse_device
+from fairchem.core.datasets.atomic_data import (
+    AtomicData,
+    _tensors,
+    atomicdata_list_to_batch,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -133,36 +138,60 @@ def plan_microbatches(
             raise ValueError(f"Structure {index} exceeds the microbatch limits")
         costs.append((atoms, edges))
 
+    order = sorted(
+        range(len(structures)), key=lambda i: (-costs[i][1], -costs[i][0], i)
+    )
+    if limits.max_systems == 1:
+        for i in order:
+            _normalize_requested_properties(
+                structures[i].get("_requested_properties", None)
+            )
+        return [[i] for i in order]
+
     bins = []
     open_bins = {}
-    for index in sorted(
-        range(len(structures)), key=lambda i: (-costs[i][1], -costs[i][0], i)
-    ):
+    for index in order:
         atoms, edges = costs[index]
-        if limits.max_systems == 1:
-            _normalize_requested_properties(
-                structures[index].get("_requested_properties", None)
-            )
-            bins.append([index])
-            continue
-        compatible = open_bins.setdefault(_compatibility_key(structures[index]), {})
-        for bin_index, entry in compatible.items():
-            members, used_atoms, used_edges = entry
-            if used_atoms + atoms <= limits.max_atoms and (
-                limits.max_edges is None or used_edges + edges <= limits.max_edges
+        signature = _compatibility_key(structures[index])
+        if signature not in open_bins:
+            open_bins[signature] = OrderedDict(), 0, 0
+        compatible, max_free_atoms, max_free_edges = open_bins[signature]
+        # The maxima are conservative: a recently filled bin may have lowered
+        # the true maximum. An impossible fit can skip the whole group. A full
+        # unsuccessful scan refreshes both bounds for the next input.
+        possible = atoms <= max_free_atoms and (
+            limits.max_edges is None or edges <= max_free_edges
+        )
+        scanned_atoms = scanned_edges = 0
+        candidates = compatible.items() if possible else ()
+        for bin_index, entry in candidates:
+            free_atoms, free_edges = entry[1:]
+            if atoms <= free_atoms and (
+                limits.max_edges is None or edges <= free_edges
             ):
-                key = bin_index
+                key, members = bin_index, entry[0]
                 break
+            scanned_atoms = max(scanned_atoms, free_atoms)
+            scanned_edges = max(scanned_edges, free_edges)
         else:
+            if possible:
+                max_free_atoms, max_free_edges = scanned_atoms, scanned_edges
             key = len(bins)
-            members, used_atoms, used_edges = [], 0, 0
+            members = []
             bins.append(members)
+            free_atoms, free_edges = limits.max_atoms, limits.max_edges or 0
+
         members.append(index)
-        used_atoms += atoms
-        if len(members) == limits.max_systems or used_atoms == limits.max_atoms:
+        free_atoms -= atoms
+        if limits.max_edges is not None:
+            free_edges -= edges
+        if len(members) == limits.max_systems or free_atoms == 0:
             compatible.pop(key, None)
         else:
-            compatible[key] = members, used_atoms, used_edges + edges
+            compatible[key] = members, free_atoms, free_edges
+            max_free_atoms = max(max_free_atoms, free_atoms)
+            max_free_edges = max(max_free_edges, free_edges)
+        open_bins[signature] = compatible, max_free_atoms, max_free_edges
     return bins
 
 
@@ -187,6 +216,9 @@ def _requires_single_system(predictor, data, requested):
     if getattr(settings, "nitro", False):
         return True
     module = getattr(getattr(predictor, "model", None), "module", None)
+    backbone = getattr(module, "backbone", None)
+    if getattr(backbone, "_mole_batch_size_dependent", False) is True:
+        return True
     if (
         not getattr(
             module,
@@ -419,8 +451,10 @@ class IndependentDevicePool:
         property_levels: Mapping[str, str] | None = None,
         stager_factory: Callable[[torch.device], DeviceBatchStager] | None = None,
         requested_properties: Sequence[str] | None = None,
+        max_pending_jobs: int | None = None,
+        max_pending_bytes: int = 1024**3,
     ) -> None:
-        self.devices = tuple(torch.device(device) for device in devices)
+        self.devices = tuple(parse_device(device) for device in devices)
         if not self.devices or len(set(self.devices)) != len(self.devices):
             raise ValueError("Supply distinct devices")
         for device in self.devices:
@@ -435,15 +469,29 @@ class IndependentDevicePool:
         self._requested_properties = _normalize_requested_properties(
             requested_properties
         )
+        self.max_pending_jobs = (
+            2 * len(self.devices) if max_pending_jobs is None else max_pending_jobs
+        )
+        self.max_pending_bytes = max_pending_bytes
+        if any(
+            isinstance(n, bool) or not isinstance(n, Integral) or n < 1
+            for n in (self.max_pending_jobs, self.max_pending_bytes)
+        ):
+            raise ValueError(
+                "max_pending_jobs and max_pending_bytes must be positive integers"
+            )
+        self._reserved_jobs = 0
+        self._reserved_bytes = 0
         self._workers = [None] * len(self.devices)
         self._executors = [
             ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"fairchem-{device}")
             for device in self.devices
         ]
         self._pending = [0] * len(self.devices)
-        self._rates = OrderedDict()
+        self._rates = [OrderedDict() for _ in self.devices]
+        self._device_rates = [None] * len(self.devices)
         self._default_rate = None
-        self._lock = Lock()
+        self._lock = Condition()
         self._closed = False
 
     def _run(self, worker, structures, plan, ready_events, profile, units):
@@ -456,7 +504,7 @@ class IndependentDevicePool:
                     event.synchronize()
             recorded = set()
             for data in structures:
-                for _, tensor in _tensors(vars(data)):
+                for _, tensor in _tensors(data):
                     if (
                         tensor.device.type in {"cuda", "xpu"}
                         and id(tensor) not in recorded
@@ -505,11 +553,13 @@ class IndependentDevicePool:
                 completed.synchronize()
             rate = max(1e-9, perf_counter() - start) / units
             with self._lock:
-                previous_rate = self._rates.get(profile, rate)
-                self._rates[profile] = 0.75 * previous_rate + 0.25 * rate
-                self._rates.move_to_end(profile)
-                if len(self._rates) > 128:
-                    self._rates.popitem(last=False)
+                rates = self._rates[worker]
+                rates[profile] = 0.75 * rates.get(profile, rate) + 0.25 * rate
+                rates.move_to_end(profile)
+                if len(rates) > 128:
+                    rates.popitem(last=False)
+                prior = self._device_rates[worker] or rate
+                self._device_rates[worker] = 0.75 * prior + 0.25 * rate
                 if self._default_rate is None:
                     self._default_rate = rate
             return results
@@ -519,9 +569,13 @@ class IndependentDevicePool:
         structures: Sequence[AtomicData],
         *,
         edge_counts: Sequence[int] | None = None,
+        timeout: float | None = None,
     ) -> Future:
         """
-        Queue an owned snapshot; later caller mutations cannot change this job.
+        Queue an owned snapshot, waiting for job and payload capacity before cloning.
+
+        timeout bounds the wait for capacity in seconds (zero for nonblocking).
+        An individual snapshot larger than max_pending_bytes raises ValueError.
         """
         with self._lock:
             if self._closed:
@@ -529,16 +583,63 @@ class IndependentDevicePool:
         inputs = list(structures)
         counts = list(edge_counts) if edge_counts is not None else None
         plan = plan_microbatches(inputs, self.limits, edge_counts=counts)
-        return self._submit_plan(inputs, counts, plan)
+        return self._submit_plan(inputs, counts, plan, timeout)
 
-    def _submit_plan(self, inputs, counts, plan):
-        inputs = [data.clone() for data in inputs]
-        devices = {
-            tensor.device
+    def _submit_plan(self, inputs, counts, plan, timeout=None):
+        if timeout is not None and (
+            not isinstance(timeout, Real) or not math.isfinite(timeout) or timeout < 0
+        ):
+            raise ValueError("timeout must be a finite nonnegative number")
+        # Each structure is cloned independently, including repeated input
+        # objects. Count aliases once per snapshot, as AtomicData.clone does.
+        payload = sum(
+            t.numel() * t.element_size()
             for data in inputs
-            for _, tensor in _tensors(vars(data))
-            if tensor.device.type in {"cuda", "xpu"}
-        }
+            for _, t in _tensors(data, strict=True)
+        )
+        if payload > self.max_pending_bytes:
+            raise ValueError("Job tensor payload exceeds max_pending_bytes")
+        with self._lock:
+            available = self._lock.wait_for(
+                lambda: (
+                    self._closed
+                    or (
+                        self._reserved_jobs < self.max_pending_jobs
+                        and self._reserved_bytes + payload <= self.max_pending_bytes
+                    )
+                ),
+                timeout=timeout,
+            )
+            if self._closed:
+                raise RuntimeError("The device pool is closed")
+            if not available:
+                raise TimeoutError("Timed out waiting for device pool capacity")
+            self._reserved_jobs += 1
+            self._reserved_bytes += payload
+        try:
+            return self._enqueue(
+                [data.clone() for data in inputs], counts, plan, payload
+            )
+        except BaseException:
+            with self._lock:
+                self._release_capacity(payload)
+            raise
+
+    def _release_capacity(self, payload):
+        self._reserved_jobs -= 1
+        self._reserved_bytes -= payload
+        self._lock.notify_all()
+
+    def _enqueue(self, inputs, counts, plan, payload):
+        devices = set()
+        copied_bytes = 0
+        for data in inputs:
+            for _, tensor in _tensors(data, strict=True):
+                copied_bytes += tensor.numel() * tensor.element_size()
+                if tensor.device.type in {"cuda", "xpu"}:
+                    devices.add(tensor.device)
+        if copied_bytes > payload:
+            raise ValueError("Metadata copy exceeded the reserved tensor payload")
         ready_events = []
         for device in devices:
             with device_scope(device):
@@ -549,15 +650,6 @@ class IndependentDevicePool:
         with self._lock:
             if self._closed:
                 raise RuntimeError("The device pool is closed")
-            worker = min(
-                range(len(self.devices)),
-                key=lambda index: (
-                    self._pending[index],
-                    self.devices[index] not in devices,
-                ),
-            )
-            # Learn a wall-time-per-work-unit estimate for each property mix.
-            # Include actual external edges or the caller's conservative graph counts.
             profile = frozenset(
                 self._requested_properties
                 or _normalize_requested_properties(
@@ -576,27 +668,56 @@ class IndependentDevicePool:
             # User estimates are arbitrary Python integers. Bound scheduling
             # arithmetic independently of admission (which retains exact counts).
             units = min(units, 2**53)
-            rate = self._rates.get(profile, self._default_rate)
-            relative_rate = (
-                1 if self._default_rate is None else rate / self._default_rate
-            )
-            cost = max(1, round(units * relative_rate))
-            self._pending[worker] += cost
-            try:
-                future = self._executors[worker].submit(
-                    self._run, worker, inputs, plan, ready_events, profile, units
+            baseline = self._default_rate or 1.0
+            costs = [
+                max(
+                    1,
+                    round(
+                        units
+                        * 1024
+                        * rates.get(profile, default or baseline)
+                        / baseline
+                    ),
                 )
-            except Exception:
+                for rates, default in zip(self._rates, self._device_rates, strict=True)
+            ]
+            worker = min(
+                range(len(self.devices)),
+                key=lambda i: (
+                    self._pending[i] + costs[i],
+                    self.devices[i] not in devices,
+                    self._device_rates[i] is not None,
+                ),
+            )
+            cost = costs[worker]
+            self._pending[worker] += cost
+
+            def release():
+                # The executor may keep a cancelled work item behind a blocked
+                # job. Free its payload before the next producer is admitted.
+                inputs.clear()
+                with self._lock:
+                    self._pending[worker] -= cost
+                    self._release_capacity(payload)
+
+            def run():
+                try:
+                    return self._run(worker, inputs, plan, ready_events, profile, units)
+                finally:
+                    # Make the capacity available before publishing the result.
+                    release()
+
+            try:
+                future = self._executors[worker].submit(run)
+            except BaseException:
                 self._pending[worker] -= cost
                 raise
 
-        def completed(_future):
-            # A cancelled queued job never enters _run, but must release its
-            # scheduling load just like a completed or failed prediction.
-            with self._lock:
-                self._pending[worker] -= cost
+        def on_cancel(done):
+            if done.cancelled():
+                release()
 
-        future.add_done_callback(completed)
+        future.add_done_callback(on_cancel)
         return future
 
     def predict_many(
@@ -640,6 +761,7 @@ class IndependentDevicePool:
     def close(self) -> None:
         with self._lock:
             self._closed = True
+            self._lock.notify_all()
         for executor in self._executors:
             executor.shutdown(wait=True)
         cleanup_error = None

@@ -16,6 +16,7 @@ import time
 
 import torch
 
+from fairchem.core.common.distutils import parse_device
 from fairchem.core.common.precision import onednn_matmul_policy
 from fairchem.core.models.uma.nn.portable_wigner import (
     CSRTopologyCache,
@@ -47,7 +48,7 @@ def benchmark(
     Every autotune consumer invocation overwrites its output; no candidate can
     accumulate twice into a residual. Peak memory uses PyTorch allocator counters.
     """
-    device = torch.device(device)
+    device = parse_device(device)
     if device.type != "xpu" or not torch.xpu.is_available():
         raise ValueError("benchmark requires an available Intel XPU")
     if min(atoms, edges, channels, hidden, repeats) <= 0:

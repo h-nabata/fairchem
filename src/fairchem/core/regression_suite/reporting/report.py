@@ -155,6 +155,7 @@ def _qualify_candidate(
     expectation: Mapping[str, Any],
     role: str,
     launch_identity: Mapping[str, Any] | None = None,
+    minimum_tier: str | None = None,
 ) -> dict[str, Any]:
     baseline_suite = baseline["suites"][suite]
     if role == "verification":
@@ -189,6 +190,11 @@ def _qualify_candidate(
             "plan_hash": baseline_suite["plan_hash"],
             "suite_contract_hash": baseline_suite["suite_contract_hash"],
             "checkpoint": baseline["checkpoint"],
+            **(
+                {"checkpoint_sha256": baseline["checkpoint_sha256"]}
+                if baseline.get("checkpoint_sha256")
+                else {}
+            ),
             "seed": baseline["seed"],
             "git_dirty": False,
             **run_fields,
@@ -199,7 +205,7 @@ def _qualify_candidate(
         },
         label=f"{suite} candidate",
     )
-    return qualify_suite(summary, baseline_suite)
+    return qualify_suite(summary, baseline_suite, minimum_tier=minimum_tier)
 
 
 def _cluster_values(
@@ -420,7 +426,7 @@ def _item_key(cluster_id: str) -> str:
     """
     Return the case of a cluster, without its orientation.
     """
-    return re.sub(r"/orientation-\d+$", "", cluster_id.split("::")[0])
+    return re.sub(r"/orientation-\d+$", "", cluster_id.split("::", maxsplit=1)[0])
 
 
 def _systems(definition: Suite) -> dict[str, dict[str, Any]]:
@@ -615,6 +621,7 @@ def build_candidate_report(
     baseline = load_baseline(baseline_root / "baseline.json")
     profile = candidate_profile.replace("_", "-")
     config = profile_config(profile.replace("-", "_"))
+    minimum_tier = config.get("minimum_tier", "TF32")
     unsupported = unsupported_suites_for_profile(profile)
     requested = None if suites is None else {s.replace("_", "-") for s in suites}
     selected_suites = tuple(
@@ -635,6 +642,7 @@ def build_candidate_report(
                 records_path,
                 (baseline_root / baseline_suite["reference"]["manifest"]).parent,
                 definition,
+                reference_hash=baseline_suite["reference"]["reference_hash"],
             )
             qualification = _qualify_candidate(
                 summary,
@@ -644,12 +652,16 @@ def build_candidate_report(
                 expectation=suite_expectation(suite, config),
                 role=role,
                 launch_identity=launch_identity,
+                minimum_tier=minimum_tier,
             )
             if candidate_runs and role == "comparison":
                 first = candidate_runs[0][1]
                 validate_identity(
                     summary["identity"],
-                    {key: first[key] for key in ("git_commit", "device")},
+                    {
+                        key: first.get(key)
+                        for key in ("git_commit", "device", "checkpoint_sha256")
+                    },
                     label="candidate campaign",
                 )
             candidate_runs.append((suite, summary["identity"]))
@@ -722,6 +734,7 @@ def build_candidate_report(
             {
                 "suite": suite,
                 "status": qualification["status"],
+                "minimum_tier": minimum_tier,
                 "completion": dict(summary["completion"]),
                 "population": {
                     "clusters": len(
@@ -762,11 +775,13 @@ def build_candidate_report(
             for key in (
                 "profile",
                 "checkpoint",
+                "checkpoint_sha256",
                 "seed",
                 "git_commit",
                 "git_dirty",
                 "device",
             )
+            if key in identity
         },
         "executions": _execution_environment_rows(
             baseline, selected_suites, candidate_runs, role

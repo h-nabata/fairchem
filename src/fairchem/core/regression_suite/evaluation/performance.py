@@ -32,11 +32,18 @@ COMPARABILITY_IDENTITY_FIELDS = (
     "suite",
     "plan_hash",
     "checkpoint",
+    "checkpoint_sha256",
     "suite_contract_hash",
 )
 HARDWARE_FIELDS = (
     "device_type",
     "cpu_architecture",
+    "cpu_model",
+    "cpu_count",
+    "torch_num_threads",
+    "torch_num_interop_threads",
+    "omp_num_threads",
+    "mkl_num_threads",
     "accelerator_name",
     "compute_capability",
 )

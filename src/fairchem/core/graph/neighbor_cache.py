@@ -15,9 +15,12 @@ import torch
 
 from fairchem.core.graph.radius_graph_pbc import (
     get_counts,
+    periodic_search_frame,
+    public_image_offsets,
     radius_graph_pbc_v2,
     sum_partitions,
     system_pbc_flags,
+    validate_graph_geometry,
     validate_graph_parameters,
 )
 
@@ -151,7 +154,15 @@ class VerletNeighborCache:
 
     @torch.no_grad()
     def get_graph(
-        self, data, cutoff, max_neighbors, strict=False, *, pbc=None, method="cell"
+        self,
+        data,
+        cutoff,
+        max_neighbors,
+        strict=False,
+        *,
+        pbc=None,
+        method="cell",
+        _frame=None,
     ):
         """
         Return the current graph, rebuilding the outer list when required.
@@ -162,6 +173,10 @@ class VerletNeighborCache:
             cutoff, max_neighbors, strict, method
         )
         pbc = system_pbc_flags(data, pbc)
+        internal_frame = _frame is not None
+        if _frame is None and bool(pbc.any()):
+            validate_graph_geometry(data)
+            _frame = periodic_search_frame(data, pbc)
         with self._lock:
             if not math.isfinite(self.skin) or self.skin <= 0:
                 raise ValueError("neighbor skin must be finite and positive")
@@ -210,6 +225,7 @@ class VerletNeighborCache:
                     pbc=pbc,
                     method=method,
                     include_zero_distance=True,
+                    _frame=_frame,
                 )
                 entry = {
                     "key": key,
@@ -253,11 +269,14 @@ class VerletNeighborCache:
                 self.hits += 1
                 self._entry = entry
         edges, cells = entry["edges"], entry["cells"]
-        shifts = edge_cell_offsets(data.cell, cells, entry["counts"])
-        # Advanced indexing owns these endpoint buffers. Reuse them for the
-        # roundoff bound instead of gathering both coordinates a second time.
-        source_pos = data.pos[edges[0]]
-        target_pos = data.pos[edges[1]]
+        pos = data.pos
+        local_cells = cells
+        if _frame is not None:
+            pos, images, _ = _frame
+            local_cells = cells + (images[edges[0]] - images[edges[1]])
+        shifts = edge_cell_offsets(data.cell, local_cells, entry["counts"])
+        source_pos = pos[edges[0]]
+        target_pos = pos[edges[1]]
         # Match graph-v2's subtraction order, not get_pbc_distances' order.
         distance2 = (target_pos - (source_pos + shifts)).square().sum(-1)
         # Last-bit differences between batched offset products must not
@@ -275,12 +294,18 @@ class VerletNeighborCache:
         # Wrapped search and original-frame arithmetic can also disagree
         # at zero for translated atoms. Self loops in the primary image
         # are exactly zero in both frames.
-        ambiguous |= (distance2 <= distance_error) & cells.ne(0).any(-1)
+        ambiguous |= (distance2 <= distance_error) & local_cells.ne(0).any(-1)
         if bool(ambiguous.any()):
             with self._lock:
                 self.boundary_fallbacks += 1
             return radius_graph_pbc_v2(
-                data, cutoff, max_neighbors, strict, pbc=pbc, method=method
+                data,
+                cutoff,
+                max_neighbors,
+                strict,
+                pbc=pbc,
+                method=method,
+                _frame=_frame if internal_frame else None,
             )
         keep = (distance2 <= cutoff * cutoff) & (distance2 != 0)
         edges, cells, distance2 = edges[:, keep], cells[keep], distance2[keep]
@@ -324,7 +349,13 @@ class VerletNeighborCache:
                         self.cap_fallbacks += 1
                         self.tie_fallbacks += int(strict)
                     return radius_graph_pbc_v2(
-                        data, cutoff, max_neighbors, strict, pbc=pbc, method=method
+                        data,
+                        cutoff,
+                        max_neighbors,
+                        strict,
+                        pbc=pbc,
+                        method=method,
+                        _frame=_frame if internal_frame else None,
                     )
                 # The guarded sort already identified each atom's cutoff.
                 # Distances at a strict selection boundary are separated,
@@ -343,4 +374,8 @@ class VerletNeighborCache:
         if valid:
             with self._lock:
                 self.reused_graphs += 1
-        return edges, cells, counts
+        return (
+            edges,
+            cells if internal_frame else public_image_offsets(cells, data.cell.dtype),
+            counts,
+        )

@@ -217,6 +217,10 @@ class HydraInterfaceMixin:
         Called before each prediction for any per-prediction checks.
         """
         self.backbone.on_predict_check(data)
+        for head in self.output_heads.values():
+            check = getattr(head, "on_predict_check", None)
+            if check is not None:
+                check(data)
 
     def validate_atoms_data(self, atoms: Atoms, task_name: str) -> None:
         """

@@ -38,6 +38,7 @@ from fairchem.core.regression_suite.evaluation.identity import (
 from fairchem.core.regression_suite.execution.executors import EXECUTORS, Rerunnable
 from fairchem.core.regression_suite.execution.runner import (
     ROLES,
+    checkpoint_digest,
     merge_suite_shards,
     resolve_baseline_checkpoint,
     resolve_checkpoint,
@@ -131,6 +132,7 @@ def _run_task(
     merge: bool = False,
     baseline: str | None = None,
     baseline_id: str | None = None,
+    checkpoint_sha256: str | None = None,
 ) -> str:
     """
     Run one task, or merge one run's case shards, and return its run ID.
@@ -139,11 +141,13 @@ def _run_task(
     node, so an inaccessible baseline stops the run before any GPU work.
     """
     if baseline is not None:
-        check_baseline(baseline, baseline_id)
+        index = check_baseline(baseline, baseline_id)
+        checkpoint_sha256 = index.get("checkpoint_sha256") or checkpoint_sha256
     shard_root = Path(staging_dir) / task.role / task.suite / task.profile
     values = {
         "checkpoint": checkpoint,
         "checkpoint_id": checkpoint_id,
+        "checkpoint_sha256": checkpoint_sha256,
         "output_dir": artifact_dir,
         "run_id": _slurm_run_id(task.role),
         "device": device,
@@ -323,6 +327,7 @@ def baseline_status(
                 ),
                 "baseline_id": payload["baseline_id"],
                 "checkpoint": payload["checkpoint"],
+                "checkpoint_sha256": payload.get("checkpoint_sha256"),
                 "seed": payload["seed"],
                 "device": payload["device"],
                 "scope": payload["scope"],
@@ -423,6 +428,7 @@ def _launch(
         artifact_dir=str(root),
         checkpoint=fields["checkpoint"],
         checkpoint_id=fields["checkpoint_id"],
+        checkpoint_sha256=fields.get("checkpoint_sha256"),
         seed=int(fields["seed"]),
         device=fields["device"],
         scope=fields["scope"],
@@ -522,6 +528,9 @@ def launch_baseline(
     """
     commit = clean_commit(repo_dir, "baseline")
     checkpoint, checkpoint_id = resolve_checkpoint(checkpoint, checkpoint_id)
+    # A submission host need not have the registered model cached. Workers
+    # always hash their local weights, and finalization compares their digests.
+    digest = checkpoint_digest(checkpoint) if Path(checkpoint).is_file() else None
     root = Path(artifact_dir).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
     status = baseline_status(root, campaign, scope)
@@ -533,6 +542,8 @@ def launch_baseline(
             "device": device,
             "scope": scope,
         }
+        if baseline.get("checkpoint_sha256") and digest:
+            requested["checkpoint_sha256"] = digest
         mismatches = [key for key, value in requested.items() if baseline[key] != value]
         if mismatches:
             raise RegressionSchemaError(
@@ -566,6 +577,11 @@ def launch_baseline(
         if (
             identity.get("git_dirty") is not False
             or identity.get("checkpoint") != checkpoint_id
+            or (
+                identity.get("checkpoint_sha256")
+                and digest
+                and identity["checkpoint_sha256"] != digest
+            )
             or identity.get("seed") != _BASELINE_SEED
             or identity.get("device") != device
         ):
@@ -605,6 +621,18 @@ def launch_baseline(
             scope,
         )
     ]
+    if any(phase.tasks for phase in phases) and (
+        (baseline["state"] == "partial" and not baseline.get("checkpoint_sha256"))
+        or any(
+            state["state"] == "complete"
+            and not state["identity"].get("checkpoint_sha256")
+            for state in fragments.values()
+        )
+    ):
+        raise RegressionSchemaError(
+            "cannot add runs to legacy fragments without a checkpoint SHA-256; "
+            "choose a new baseline name to record all runs with verified weights"
+        )
     if submit:
         job_ids = {
             job_id
@@ -635,6 +663,7 @@ def launch_baseline(
             "artifact_dir": str(root),
             "checkpoint": checkpoint,
             "checkpoint_id": checkpoint_id,
+            "checkpoint_sha256": digest,
             "seed": _BASELINE_SEED,
         },
         submit=submit and has_work,
@@ -728,6 +757,7 @@ def launch_candidate(
             "report_dir": str(reports),
             "checkpoint": checkpoint,
             "checkpoint_id": checkpoint_id,
+            "checkpoint_sha256": baseline.get("checkpoint_sha256"),
             "seed": baseline["seed"],
             "profile": label,
             "profile_config": profile,

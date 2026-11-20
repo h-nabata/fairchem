@@ -387,3 +387,67 @@ def test_explicitly_disabled_ase_labels_are_not_read(name, source):
     data = AtomicData.from_ase(atoms, **{f"r_{name}": False})
 
     assert name not in data
+
+
+def test_ase_isotope_roundtrip_mixed_batch_and_stale_labels():
+    from ase import Atoms
+    from ase.calculators.singlepoint import SinglePointCalculator
+    from ase.stress import voigt_6_to_full_3x3_stress
+
+    heavy = Atoms("H", masses=[2.014], info={"stress": list(range(6)), "sid": 42})
+    native = AtomicData.from_ase(Atoms("H"))
+    isotope = AtomicData.from_ase(heavy, target_dtype=native.pos.dtype)
+    torch.testing.assert_close(
+        isotope.stress[0],
+        torch.as_tensor(voigt_6_to_full_3x3_stress(list(range(6)))).to(isotope.pos),
+    )
+    assert isotope.sid == ["42"]
+    batch = atomicdata_list_to_batch([native, isotope], exclude_keys=["stress"])
+    assert batch.masses.tolist() == pytest.approx([1.008, 2.014])
+    assert [a.get_masses()[0] for a in batch.to_ase()] == pytest.approx([1.008, 2.014])
+    assert "atomic_masses" not in native
+    heavy.calc = SinglePointCalculator(heavy, energy=3)
+    heavy.positions[0, 0] += 1
+    with pytest.raises(ValueError, match="Stale"):
+        AtomicData.from_ase(heavy)
+
+
+def test_invalid_graph_replacement_is_atomic():
+    from ase import Atoms
+
+    data = AtomicData.from_ase(Atoms("HH"))
+    edges = torch.tensor([[0, 1], [1, 0]])
+    offsets = data.pos.new_zeros(2, 3)
+    data.update_batch_edges(edges, offsets, torch.tensor([2]))
+    with pytest.raises(ValueError):
+        data.update_batch_edges(edges + 1, offsets, torch.tensor([2]))
+    assert data.edge_index is edges and data.cell_offsets is offsets
+    assert data.nedges.tolist() == [2]
+
+
+def test_from_dict_preserves_normalized_sid_and_batch():
+    from ase import Atoms
+
+    data = AtomicData.from_ase(Atoms("H")).to_dict()
+    rebuilt = AtomicData.from_dict({**data, "sid": 12, "batch": None})
+    assert rebuilt.sid == ["12"]
+    torch.testing.assert_close(rebuilt.batch, torch.tensor([0]))
+    fields = atomicdata_list_to_batch([rebuilt, rebuilt]).to_dict()
+    assert AtomicData.from_dict({**fields, "sid": None}).sid == ["", ""]
+
+
+def test_ase_isotope_bits_and_implicit_masses_survive_model_dtype_changes():
+    from ase import Atoms
+
+    natural = Atoms("HO")
+    heavy = Atoms("HO", masses=[2.01410177812, 17.99915961286])
+    data = atomicdata_list_to_batch([AtomicData.from_ase(a) for a in (natural, heavy)])
+    for dtype in (torch.float64, torch.float32, torch.float64):
+        data.to(dtype=dtype)
+        expected = np.concatenate((natural.get_masses(), heavy.get_masses()))
+        torch.testing.assert_close(
+            data.masses, torch.tensor(expected, dtype=dtype), rtol=0, atol=0
+        )
+        for restored, original in zip(data.to_ase(), (natural, heavy), strict=True):
+            assert restored.has("masses") == original.has("masses")
+            np.testing.assert_array_equal(restored.get_masses(), original.get_masses())

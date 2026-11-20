@@ -252,6 +252,8 @@ class CSRTopologyCache:
             if t is not None
         )
 
+    @torch.inference_mode(False)
+    @torch.no_grad()
     def get(self, target, num_nodes):
         if target.ndim != 1 or target.dtype not in (torch.int32, torch.int64):
             raise ValueError("scatter targets must be a one-dimensional integer tensor")
@@ -286,7 +288,11 @@ class CSRTopologyCache:
             return topology
         with self._lock:
             self.misses += 1
-        source = target.detach().clone() if target.device.type == "cpu" else target
+        source = (
+            target.detach().clone()
+            if target.device.type == "cpu" or target.is_inference()
+            else target
+        )
         if source.numel() and not bool(((source >= 0) & (source < num_nodes)).all()):
             raise ValueError("scatter target is outside [0,num_nodes)")
         order = torch.argsort(source, stable=True)
@@ -297,7 +303,7 @@ class CSRTopologyCache:
             order = order.to(torch.int32)
             offsets = offsets.to(torch.int32)
         topology = CSRTopology(target, order, lengths, offsets, index32)
-        if target.device.type == "cpu":
+        if source is not target:
             topology.owner_snapshot = source
         if target.device.type in {"cuda", "xpu"}:
             accelerator = getattr(torch, target.device.type)
@@ -636,8 +642,10 @@ def _producer_edge_adjoint(g0, g1, g2, x, edge_index, wigner, radial, channels, 
 
 
 def _accumulate_node_gradient(dx, dx_edge, index, channels):
-    dx = dx.index_add(0, index[0], dx_edge[:, :, :channels])
-    return dx.index_add(0, index[1], dx_edge[:, :, channels:])
+    # The destination belongs exclusively to this adjoint. index_add_ backward
+    # saves the index, so subsequent chunks can update it through double backward.
+    dx.index_add_(0, index[0], dx_edge[:, :, :channels])
+    return dx.index_add_(0, index[1], dx_edge[:, :, channels:])
 
 
 def producer_adjoint(
@@ -647,7 +655,9 @@ def producer_adjoint(
         g0, g1, g2, x, edge_index, wigner, radial, channels, needs
     )
     dx = (
-        _accumulate_node_gradient(torch.zeros_like(x), dx_edge, edge_index, channels)
+        _accumulate_node_gradient(
+            dx_edge.new_zeros(x.shape), dx_edge, edge_index, channels
+        )
         if needs[0]
         else None
     )
@@ -675,7 +685,7 @@ def producer_projected_adjoint(
     # Bound each [chunk, 12*C] radial temporary to about 4 MiB in FP32.
     if chunk_edges is None:
         chunk_edges = max(1, (4 << 20) // (12 * channels * x.element_size()))
-    dx = torch.zeros_like(x) if need_x else None
+    dx = None
     dweight = dbias = None
     dw_chunks, dh_chunks = [], []
     # Include an empty slice to preserve shape, dtype and derivative connectivity.
@@ -698,6 +708,10 @@ def producer_projected_adjoint(
             (need_x, need_w, need_r),
         )
         if need_x:
+            if dx is None:
+                # A vmapped incoming gradient carries a batch dimension even
+                # when the primal x is shared across all tangent directions.
+                dx = dx_edge.new_zeros(x.shape)
             dx = _accumulate_node_gradient(dx, dx_edge, index, channels)
         if need_w:
             dw_chunks.append(dw)

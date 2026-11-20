@@ -180,6 +180,8 @@ def summarize_run(
     records_dir: str | Path,
     reference_dir: str | Path,
     suite: Suite,
+    *,
+    reference_hash: str | None = None,
 ) -> dict[str, Any]:
     """
     Pair one run's saved records with its FP64 reference and summarize them.
@@ -198,7 +200,9 @@ def summarize_run(
         The comparison summary, whose identity also names the reference.
     """
     manifest, records = load_reference(records_dir)
-    reference_manifest, reference_records = load_reference(reference_dir)
+    reference_manifest, reference_records = load_reference(
+        reference_dir, expected_hash=reference_hash
+    )
     identity = manifest["identity"]
     reference_identity = reference_manifest["identity"]
     if identity.get("run_id") == reference_identity.get("run_id"):
@@ -208,6 +212,13 @@ def summarize_run(
     for field in ("suite", "checkpoint", "seed", "plan_hash", "suite_contract_hash"):
         if identity.get(field) != reference_identity.get(field):
             raise RegressionSchemaError(f"run {field} differs from the FP64 reference")
+    if (
+        "checkpoint_sha256" in reference_identity
+        and identity.get("checkpoint_sha256") != reference_identity["checkpoint_sha256"]
+    ):
+        raise RegressionSchemaError(
+            "checkpoint SHA-256 differs from the FP64 reference"
+        )
     if identity.get("scope") == "smoke":
         selected = {
             (case["case_id"], case["transform_id"])

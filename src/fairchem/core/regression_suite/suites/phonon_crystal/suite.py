@@ -20,7 +20,11 @@ from fairchem.core.components.calculate.recipes.phonons import (
 )
 from fairchem.core.regression_suite.spec.hashing import json_value, stable_hash
 from fairchem.core.regression_suite.spec.plan import unrotated_case
-from fairchem.core.regression_suite.spec.schema import HistogramSpec, ObservableSpec
+from fairchem.core.regression_suite.spec.schema import (
+    HistogramSpec,
+    ObservableSpec,
+    RegressionSchemaError,
+)
 from fairchem.core.regression_suite.spec.structures import atoms_hash
 from fairchem.core.regression_suite.suites.base import (
     ObservableDescription,
@@ -199,6 +203,11 @@ class PhononCrystalSuite(Suite):
 
     def evaluate(self, calculator, case: SuiteCase) -> dict[str, np.ndarray]:
         metadata = case.spec.metadata
+        masses = case.transformed_atoms.get_masses().tolist()
+        if stable_hash(masses) != metadata["masses_hash"]:
+            raise RegressionSchemaError(
+                f"phonon masses differ from the plan for {case.spec.case_id}"
+            )
         displacement = float(metadata["displacement_angstrom"])
         symprec = float(metadata["symprec"])
         phonon = get_phonopy_object(

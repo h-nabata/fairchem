@@ -31,6 +31,7 @@ class FiniteDifferenceFrequenciesSuite(Suite):
     """
 
     name = "finite-difference-frequencies"
+    mass_dependent = True
     explanation = (
         (
             "What it checks",

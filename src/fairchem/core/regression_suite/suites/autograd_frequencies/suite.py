@@ -31,6 +31,7 @@ class AutogradFrequenciesSuite(Suite):
     """
 
     name = "autograd-frequencies"
+    mass_dependent = True
     explanation = (
         (
             "What it checks",

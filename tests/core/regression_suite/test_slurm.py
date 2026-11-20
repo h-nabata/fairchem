@@ -7,6 +7,7 @@ LICENSE file in the root directory of this source tree.
 
 from __future__ import annotations
 
+import hashlib
 import signal
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,7 +22,10 @@ from fairchem.core.regression_suite.execution.campaign import (
     launch_baseline,
     launch_candidate,
 )
-from fairchem.core.regression_suite.spec.schema import CommandError
+from fairchem.core.regression_suite.spec.schema import (
+    CommandError,
+    RegressionSchemaError,
+)
 from fairchem.core.regression_suite.suites import SUITES
 
 _CAMPAIGN = "fairchem.core.regression_suite.execution.campaign"
@@ -131,6 +135,23 @@ def test_baseline_phases_chain_and_seal_only_after_every_phase_succeeds(
     assert {executor.submitted.args[0] for executor in slurm.executors} == {source}
 
 
+def test_legacy_baseline_extension_is_rejected_before_launch(
+    tmp_path, slurm, monkeypatch
+):
+    status = baseline_status(tmp_path / "artifacts", "full")
+    status["baseline"] = {
+        "state": "partial",
+        "checkpoint": "checkpoint-id",
+        "device": "cuda",
+        "scope": "full",
+        "seed": 42,
+    }
+    monkeypatch.setattr(f"{_CAMPAIGN}.baseline_status", lambda *_: status)
+    with pytest.raises(RegressionSchemaError, match="cannot add runs to legacy"):
+        _launch(tmp_path)
+    assert not slurm.calls
+
+
 def test_resume_submits_only_missing_runs(tmp_path, slurm, monkeypatch):
     status = baseline_status(tmp_path / "artifacts", "full")
     complete = {
@@ -139,6 +160,7 @@ def test_resume_submits_only_missing_runs(tmp_path, slurm, monkeypatch):
             "git_commit": "commit",
             "git_dirty": False,
             "checkpoint": "checkpoint-id",
+            "checkpoint_sha256": hashlib.sha256(b"").hexdigest(),
             "seed": 42,
             "device": "cuda",
         },

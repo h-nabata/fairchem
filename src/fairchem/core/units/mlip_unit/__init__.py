@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from fairchem.core.common.distutils import parse_device
 from fairchem.core.units.mlip_unit.api.inference import (
     InferenceSettings,
     guess_inference_settings,
@@ -68,7 +69,7 @@ def load_predict_unit(
             device = "cpu"
         logging.warning(f"device was not explicitly set, using {device=}.")
 
-    if torch.device(device).type == "xpu":
+    if parse_device(device).type == "xpu":
         if workers != 1 or gp_config is not None:
             raise ValueError(
                 "XPU inference supports workers=1 without graph parallelism. "

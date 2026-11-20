@@ -12,9 +12,14 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from fairchem.core.graph.portable_search import morton_keys
 from fairchem.core.graph.radius_graph_pbc import (
+    periodic_search_frame,
+    public_image_offsets,
     radius_graph_pbc,
     radius_graph_pbc_v2,
+    system_pbc_flags,
+    validate_graph_geometry,
     validate_graph_parameters,
 )
 
@@ -90,12 +95,7 @@ def spatially_order_graph(data, graph):
         coordinates = (
             ((data.pos - lower[systems]) / extent[systems] * 1023).clamp(0, 1023).long()
         )
-        # Vectorized bit spreading avoids thirty per-coordinate/per-bit loops.
-        spread = (coordinates | (coordinates << 16)) & 0x030000FF
-        spread = (spread | (spread << 8)) & 0x0300F00F
-        spread = (spread | (spread << 4)) & 0x030C30C3
-        spread = (spread | (spread << 2)) & 0x09249249
-        morton = spread[:, 0] | (spread[:, 1] << 1) | (spread[:, 2] << 2)
+        morton = morton_keys(coordinates)
         # Morton codes use only 30 bits. Packing target and source gives
         # the same stable lexicographic order in a signed int64.
         pair_key = (morton[edges[1]] << 30) | morton[edges[0]]
@@ -113,6 +113,58 @@ def spatially_order_graph(data, graph):
         if key in result:
             result[key] = result[key][order]
     return result
+
+
+def canonicalize_external_edges(batch, edge_index, cell_offsets, nedges):
+    """Validate edge ownership and group the topology by system, stably."""
+    if (
+        edge_index.dtype != torch.long
+        or edge_index.ndim != 2
+        or edge_index.shape[0] != 2
+        or cell_offsets.shape != (edge_index.shape[1], 3)
+        or nedges.ndim != 1
+        or nedges.dtype != torch.long
+        or any(
+            value.device != batch.device for value in (edge_index, cell_offsets, nedges)
+        )
+    ):
+        raise ValueError(
+            "Invalid external edge indices, cell offsets, counts or device"
+        )
+    if torch.compiler.is_compiling():
+        # Keep external full-graph compilation free of data-dependent Python branches.
+        torch._assert_async(
+            ((edge_index >= 0) & (edge_index < len(batch))).all(), "Invalid edge index"
+        )
+        owners, targets = batch[edge_index]
+        torch._assert_async((owners == targets).all(), "Cross-system external edge")
+        actual = torch.zeros_like(nedges).scatter_add_(
+            0, targets, torch.ones_like(targets)
+        )
+        torch._assert_async((actual == nedges).all(), "Incorrect external edge counts")
+        order = targets.argsort(stable=True)
+        return edge_index[:, order], cell_offsets[order]
+    if edge_index.shape[1] == 0:
+        if bool(nedges.any()):
+            raise ValueError("nedges must match actual edge counts per system")
+        return edge_index, cell_offsets
+    if bool(((edge_index < 0) | (edge_index >= len(batch))).any()):
+        raise ValueError("External edge index outside the atom range")
+    if len(nedges) == 1:
+        if int(nedges[0]) != edge_index.shape[1]:
+            raise ValueError("nedges must match actual edge counts per system")
+        return edge_index, cell_offsets
+    source, target = batch[edge_index]
+    if not torch.equal(source, target):
+        raise ValueError("External edges must connect atoms in the same system")
+    counts = torch.zeros_like(nedges)
+    counts.scatter_add_(0, target, torch.ones_like(target))
+    if not torch.equal(counts, nedges):
+        raise ValueError("nedges must match actual edge counts per system")
+    if bool((target[1:] < target[:-1]).any()):
+        order = torch.argsort(target, stable=True)
+        return edge_index[:, order], cell_offsets[order]
+    return edge_index, cell_offsets
 
 
 def filter_edges_by_node_partition(
@@ -142,12 +194,6 @@ def filter_edges_by_node_partition(
     node_mask[node_partition] = True
     local_edge_mask = node_mask[target_atoms]
 
-    # Create system index for each edge to track which system each edge belongs to
-    num_systems = neighbors.shape[0]
-    edge_system_idx = torch.repeat_interleave(
-        torch.arange(num_systems, device=neighbors.device), neighbors
-    )
-
     # Filter edges
     edge_index = edge_index[:, local_edge_mask]
     cell_offsets = cell_offsets[local_edge_mask]
@@ -155,6 +201,14 @@ def filter_edges_by_node_partition(
         # If there's only one system, we can skip the scatter_add step and just return the count of remaining edges
         new_neighbors = local_edge_mask.sum(dtype=neighbors.dtype).unsqueeze(0)
         return edge_index, cell_offsets, new_neighbors
+
+    # Create system index for each edge to track which system each edge belongs to
+    num_systems = neighbors.shape[0]
+    edge_system_idx = torch.repeat_interleave(
+        torch.arange(num_systems, device=neighbors.device),
+        neighbors,
+        output_size=local_edge_mask.numel(),
+    )
 
     filtered_edge_system_idx = edge_system_idx[local_edge_mask]
 
@@ -171,6 +225,39 @@ def filter_edges_by_node_partition(
     return edge_index, cell_offsets, new_neighbors
 
 
+def external_edge_geometry(pos, edges, cell, cells, counts):
+    """Preserve the local displacement even when an external image offset is large."""
+    if (
+        cells.dtype == torch.long
+        and pos.dtype == torch.float32
+        and (torch.compiler.is_compiling() or bool((cells.abs() >= 2**23).any()))
+    ):
+        # An int64 image outside FP32's exact integer range cannot first be
+        # multiplied into an FP32 Cartesian shift. Cancel before narrowing.
+        device = (
+            pos.device if pos.device.type in {"cpu", "cuda"} else torch.device("cpu")
+        )
+        wide_pos = pos.to(device=device, dtype=torch.float64)
+        row, col = edges.to(device)
+        shifts = edge_cell_offsets(
+            cell.to(device=device, dtype=torch.float64),
+            cells.to(device),
+            counts.to(device),
+        )
+        return (wide_pos[row] - wide_pos[col] + shifts).to(pos), shifts.to(cell)
+    shifts = edge_cell_offsets(cell, cells, counts)
+    source, target = pos[edges[0]], pos[edges[1]]
+    # Keep the original operation order except when the endpoint difference
+    # and image shift cancel to a small residual.
+    direct = source - target + shifts
+    translated = torch.where(
+        source.abs() > target.abs(),
+        (source + shifts) - target,
+        source - (target - shifts),
+    )
+    return torch.where(direct.abs() < shifts.abs() * 0.01, translated, direct), shifts
+
+
 def get_pbc_distances(
     pos,
     edge_index,
@@ -181,14 +268,24 @@ def get_pbc_distances(
     return_distance_vec: bool = False,
     *,
     _owned_topology: bool = False,
+    _frame=None,
 ):
     row, col = edge_index
 
-    distance_vectors = pos[row] - pos[col]
-
-    # correct for pbc
-    offsets = edge_cell_offsets(cell, cell_offsets, neighbors)
-    distance_vectors += offsets
+    if _frame is None:
+        distance_vectors, offsets = external_edge_geometry(
+            pos, edge_index, cell, cell_offsets, neighbors
+        )
+    else:
+        local_pos, images, _ = _frame
+        local_cells = cell_offsets.long() + (images[row] - images[col])
+        local_offsets = edge_cell_offsets(cell, local_cells, neighbors)
+        distance_vectors = (local_pos[row] + local_offsets) - local_pos[col]
+        offsets = (
+            edge_cell_offsets(cell, cell_offsets, neighbors) if return_offsets else None
+        )
+        if not _owned_topology:
+            cell_offsets = public_image_offsets(cell_offsets, cell.dtype)
 
     # compute distances
     distances = distance_vectors.norm(dim=-1)
@@ -221,7 +318,8 @@ def get_pbc_distances(
         # derivative in the graph (0 * NaN). Recompute only surviving norms.
         distance_vectors = distance_vectors[nonzero_idx]
         distances = distance_vectors.norm(dim=-1)
-        offsets = offsets[nonzero_idx]
+        if return_offsets:
+            offsets = offsets[nonzero_idx]
 
     out = {
         "edge_index": edge_index,
@@ -316,6 +414,13 @@ def generate_graph(
     else:
         raise ValueError(f"Invalid radius_pbc version {radius_pbc_version}")
 
+    frame = None
+    if radius_pbc_version in (1, 2):
+        flags = system_pbc_flags(data, pbc)
+        if bool(flags.any()):
+            validate_graph_geometry(data)
+            frame = periodic_search_frame(data, flags)
+
     if neighbor_cache is not None:
         if radius_pbc_version != 2:
             raise ValueError("Verlet caching requires graph version 2")
@@ -326,6 +431,7 @@ def generate_graph(
             enforce_max_neighbors_strictly,
             pbc=pbc,
             method=graph_search_method,
+            _frame=frame,
         )
     elif radius_pbc_version == 2:
         edge_index, cell_offsets, neighbors = radius_graph_pbc_fn(
@@ -335,6 +441,7 @@ def generate_graph(
             enforce_max_neighbors_strictly,
             pbc=pbc,
             method=graph_search_method,
+            _frame=frame,
         )
     else:
         if graph_search_method != "cell":
@@ -345,6 +452,7 @@ def generate_graph(
             max_neighbors,
             enforce_max_neighbors_strictly,
             pbc=pbc,
+            **({"_frame": frame} if radius_pbc_version == 1 else {}),
         )
 
     # for v2 it is still faster right now to not do this post filtering, need to investigate further
@@ -366,6 +474,7 @@ def generate_graph(
         return_offsets=not geometry_only,
         return_distance_vec=True,
         _owned_topology=geometry_only,
+        _frame=frame,
     )
 
     graph = {

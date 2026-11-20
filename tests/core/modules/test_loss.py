@@ -281,3 +281,61 @@ def test_masked_loss_unequal_replica_counts(monkeypatch):
         torch.autograd.grad(out, pred)[0],
         pred.new_tensor([[4 / 9, 8 / 9, 12 / 9], [0.0, 0.0, 0.0]]),
     )
+
+
+@pytest.mark.parametrize("count", [2, 3])
+def test_mask_rows_before_vector_loss_and_differentiation(count):
+    from fairchem.core.modules.loss import DDPMTLoss
+
+    pred = torch.full((count, 3), torch.nan)
+    pred[0] = torch.tensor([1.0, 2.0, 3.0])
+    pred.requires_grad_()
+    mask = torch.arange(count) == 0
+    result = DDPMTLoss(MSELoss())(
+        pred, torch.zeros_like(pred), mask, torch.tensor([count])
+    )
+    torch.testing.assert_close(result, torch.tensor(14 / 3))
+    result.backward()
+    torch.testing.assert_close(pred.grad[0], torch.tensor([2 / 3, 4 / 3, 2.0]))
+    assert torch.all(pred.grad[1:] == 0)
+    with pytest.raises(RuntimeError, match="Nonfinite"):
+        DDPMTLoss(MSELoss())(pred, torch.zeros_like(pred), ~mask, torch.tensor([count]))
+
+
+def test_valid_structure_mean_includes_perfect_predictions():
+    from fairchem.core.modules.loss import DDPMTLoss
+
+    pred = torch.tensor([0.0, 2.0, 8.0])
+    mask = torch.tensor([True, True, False])
+    loss = DDPMTLoss(MSELoss(), reduction="per_valid_structure")
+    assert (
+        loss(pred, torch.zeros_like(pred), mask, torch.ones(3, dtype=torch.long)) == 2
+    )
+
+
+def test_legacy_pickled_multitask_loss_resolves_bound_reducers(tmp_path):
+    from fairchem.core.modules.loss import DDPMTLoss
+
+    loss = DDPMTLoss(MSELoss(), reduction="per_structure")
+    loss.reduction_map = {
+        name: getattr(loss, name) for name in ("mean", "sum", "per_structure")
+    }
+    path = tmp_path / "legacy.pt"
+    torch.save(loss, path)
+    loaded = torch.load(path, weights_only=False)
+    predictions = torch.tensor([1.0, 0.0, 2.0])
+    mask = torch.tensor([True, True, False])
+    natoms = torch.tensor([1, 2])
+    errors = torch.where(mask, predictions.square(), 0)
+    assert (
+        loaded.reduction_map["sum"](predictions, mask, mask.sum(), errors, natoms) == 1
+    )
+    assert (
+        loaded.reduction_map["mean"](predictions, mask, mask.sum(), errors, natoms)
+        == 0.5
+    )
+    assert (
+        loaded.reduction_map["per_structure"](predictions, mask, None, errors, natoms)
+        == 1
+    )
+    assert loaded(predictions, torch.zeros_like(predictions), mask, natoms) == 1

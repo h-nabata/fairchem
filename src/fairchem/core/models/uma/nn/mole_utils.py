@@ -256,11 +256,7 @@ def convert_model_to_MOLE_model(
         raise ValueError(f"Not a valid mole_type {mole_type}")
 
     for block in model.blocks:
-        edgewise = block.edge_wise
-        edgewise._chunk_mole_states = tuple(
-            {
-                id(m.global_mole_tensors): m.global_mole_tensors
-                for m in edgewise.modules()
-                if isinstance(m, MOLE)
-            }.values()
-        )
+        # Existing checkpoints may be converted in place. Refresh the routing
+        # table on the next checkpointed forward after changing the linears.
+        if hasattr(block.edge_wise, "_checkpoint_mole_states"):
+            del block.edge_wise._checkpoint_mole_states

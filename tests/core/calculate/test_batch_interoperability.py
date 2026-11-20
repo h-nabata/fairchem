@@ -29,6 +29,7 @@ from fairchem.core.calculate.batched_inference import (
     run_resident_steps,
 )
 from fairchem.core.calculate.device_buffers import DeviceBatchStager
+from fairchem.core.datasets.collaters.mt_collater import MTCollater
 from fairchem.core.modules.normalization.normalizer import Normalizer
 from fairchem.core.units.mlip_unit.mlip_unit import OutputSpec, Task
 from tests.core.calculate.test_batched_inference import HarmonicPredictor, _structure
@@ -688,3 +689,241 @@ def test_metadata_copy_interruption_does_not_leak_staging_lease(interruption):
     with stager.stage(_structure()) as restored:
         assert restored.pos.shape == (3, 3)
     stager.close()
+
+
+def test_inherited_slots_are_counted_staged_and_converted_with_tensor_keys():
+    class Parent:
+        __slots__ = ("__coordinates",)
+
+        def __init__(self, value):
+            self.__coordinates = value
+
+        @property
+        def coordinates(self):
+            return self.__coordinates
+
+    class Metadata(Parent):
+        __slots__ = ("cycle", "optional")
+
+    data = _structure()
+    tensor = torch.ones(2048)
+    data.extra = {tensor: Metadata(tensor)}
+    data.extra[tensor].cycle = data.extra
+    with pytest.raises(ValueError, match="max_batch_bytes"):
+        DeviceBatchStager("cpu", max_batch_bytes=4096).stage(data)
+    stager = DeviceBatchStager("cpu")
+    with stager.stage(data) as staged:
+        key, metadata = next(iter(staged.extra.items()))
+        assert key is metadata.coordinates
+        assert metadata.cycle is staged.extra
+        assert key.data_ptr() != tensor.data_ptr()
+        assert stager.allocated_bytes >= tensor.numel() * tensor.element_size()
+    stager.close()
+    for converted in (data.clone(), data.to(dtype=torch.float64)):
+        key, metadata = next(iter(converted.extra.items()))
+        assert key is metadata.coordinates
+        assert metadata.cycle is converted.extra
+        assert key is not tensor
+    assert key.dtype == torch.float64
+
+
+@pytest.mark.parametrize("limit", ["count", "bytes"])
+def test_pool_reserves_before_copy_and_cancel_frees_queued_snapshots(
+    monkeypatch, limit
+):
+    entered, release = Event(), Event()
+    clones = []
+    data = _structure()
+    payload = sum(
+        t.numel() * t.element_size() for _, t in batched_inference._tensors(data)
+    )
+    original = type(data).clone
+
+    def clone(source):
+        copy = original(source)
+        clones.append(weakref.ref(copy))
+        return copy
+
+    class Blocked(HarmonicPredictor):
+        def predict(self, batch):
+            entered.set()
+            assert release.wait(timeout=5)
+            return super().predict(batch)
+
+    monkeypatch.setattr(type(data), "clone", clone)
+    kwargs = (
+        {"max_pending_jobs": 2}
+        if limit == "count"
+        else {"max_pending_jobs": 32, "max_pending_bytes": 2 * payload}
+    )
+    with IndependentDevicePool(Blocked, ["cpu"], **kwargs) as pool:
+        try:
+            running = pool.submit([data])
+            assert entered.wait(5)
+            waiting = pool.submit([data])
+            with pytest.raises(TimeoutError):
+                pool.submit([data], timeout=0)
+            assert len(clones) == 2
+            assert waiting.cancel()
+            assert clones[-1]() is None
+            retry = pool.submit([data], timeout=0)
+        finally:
+            release.set()
+        running.result(timeout=5)
+        retry.result(timeout=5)
+        assert pool._reserved_jobs == pool._reserved_bytes == 0
+
+
+def test_pool_close_wakes_producers_before_worker_shutdown():
+    entered, release = Event(), Event()
+    data = _structure()
+
+    class Blocked(HarmonicPredictor):
+        def predict(self, batch):
+            entered.set()
+            assert release.wait(timeout=5)
+            return super().predict(batch)
+
+    pool = IndependentDevicePool(Blocked, ["cpu"], max_pending_jobs=1)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        try:
+            first = pool.submit([data])
+            assert entered.wait(5)
+            blocked = executor.submit(pool.submit, [data])
+            close = executor.submit(pool.close)
+            with pytest.raises(RuntimeError, match="closed"):
+                blocked.result(timeout=2)
+        finally:
+            release.set()
+        first.result(timeout=5)
+        close.result(timeout=5)
+
+
+def test_pool_rejects_oversized_job_before_cloning_and_refunds_copy_failures(
+    monkeypatch,
+):
+    data = _structure()
+    with (
+        IndependentDevicePool(HarmonicPredictor, ["cpu"], max_pending_bytes=1) as pool,
+        pytest.raises(ValueError, match="max_pending_bytes"),
+    ):
+        pool.submit([data])
+    with IndependentDevicePool(HarmonicPredictor, ["cpu"], max_pending_jobs=1) as pool:
+        with monkeypatch.context() as mp:
+
+            def fail(_):
+                raise RuntimeError("copy failed")
+
+            mp.setattr(type(data), "clone", fail)
+            with pytest.raises(RuntimeError, match="copy failed"):
+                pool.submit([data])
+        assert pool.submit([data], timeout=0).result(timeout=5)
+
+
+def test_planner_retires_bins_with_too_little_capacity_for_compatible_inputs():
+    class Limits:
+        max_systems = 32
+        max_edges = None
+        checks = 0
+
+        @property
+        def max_atoms(self):
+            self.checks += 1
+            return 3
+
+    limits = Limits()
+    large = _structure("H2")
+    data = [large] * 256 + [_structure("H", task="omat")]
+    assert plan_microbatches(data, limits) == [[i] for i in range(len(data))]
+    assert limits.checks < 5 * len(data)
+    small = _structure("H")
+    assert plan_microbatches([small, large, large, small], limits) == [[1, 0], [2, 3]]
+
+
+def test_batch_dependent_mole_routing_preserves_independent_request_predictions():
+    class Predictor(HarmonicPredictor):
+        def predict(self, data):
+            prediction = super().predict(data)
+            prediction["energy"] *= data.num_graphs
+            return prediction
+
+    predictor = Predictor()
+    predictor.model = SimpleNamespace(
+        module=SimpleNamespace(
+            backbone=SimpleNamespace(_mole_batch_size_dependent=True)
+        )
+    )
+    data = [_structure(), _structure(offset=2)]
+    outputs = MicrobatchPredictor(predictor).predict_many(data)
+    assert [n for n, *_ in predictor.calls] == [1, 1]
+    for result, item in zip(outputs, data, strict=True):
+        torch.testing.assert_close(result["energy"].sum(), item.pos.square().sum())
+
+
+def test_training_collater_accepts_scalar_and_singleton_dataset_names():
+    first, second = _structure(), _structure()
+    first.dataset = "train_a"
+    first.energy = torch.ones(1)
+    second.dataset = ["train_b"]
+    second.forces = torch.zeros_like(second.pos)
+    tasks = {
+        "energy": {
+            "datasets": ["train_a"],
+            "level": "system",
+            "out_spec": {"dim": [1], "dtype": "float32"},
+        },
+        "forces": {
+            "datasets": ["train_b"],
+            "level": "atom",
+            "out_spec": {"dim": [3], "dtype": "float32"},
+        },
+    }
+    first.pbc[0] = torch.tensor([True, False, True])
+    second.pbc.fill_(True)
+    batch = MTCollater(tasks, ["pbc"])([first, second])
+    torch.testing.assert_close(batch.pbc, torch.cat([first.pbc, second.pbc]))
+    assert batch.dataset == ["train_a", "train_b"]
+    torch.testing.assert_close(batch.energy, torch.tensor([1.0, torch.inf]))
+    assert torch.isinf(batch.forces[: first.num_nodes]).all()
+    torch.testing.assert_close(batch.forces[first.num_nodes :], second.forces)
+    assert first.dataset == "train_a"
+    assert "forces" not in first
+    assert "energy" not in second
+
+
+def test_device_pool_compares_projected_work_for_the_requested_property_mix():
+    created = []
+
+    def factory(device):
+        created.append(device)
+        return HarmonicPredictor(device)
+
+    with IndependentDevicePool(factory, ["cpu:0", "cpu:1"]) as pool:
+        # CPU ordinals select separate serial executors without GPU hardware.
+        # Worker 0 has some queued work, but will still finish this job first.
+        pool._pending[0] = 4 * 1024
+        profile = frozenset([None])
+        pool._default_rate = 1
+        pool._rates[0][profile] = 0.1
+        pool._rates[1][profile] = 10
+        pool.submit([_structure()]).result(timeout=5)
+    assert created == [torch.device("cpu:0")]
+
+
+def test_custom_metadata_copy_must_use_admitted_tensor_views():
+    class Metadata:
+        def __deepcopy__(self, memo):
+            return torch.ones(2)
+
+    data = _structure()
+    data.extra = Metadata()
+    stager = DeviceBatchStager("cpu", slots=1)
+    with pytest.raises(ValueError, match="outside the staged buffers"):
+        stager.stage(data)
+    with stager.stage(_structure()):
+        pass
+    stager.close()
+    with IndependentDevicePool(HarmonicPredictor, ["cpu"], max_pending_jobs=1) as pool:
+        with pytest.raises(ValueError, match="reserved tensor payload"):
+            pool.submit([data])
+        assert pool.submit([_structure()], timeout=0).result(timeout=5)

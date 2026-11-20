@@ -11,10 +11,18 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import ase.io
 import ase.units
+from ase import Atoms
+from ase.constraints import (
+    FixBondLengths,
+    FixInternals,
+    FixLinearTriatomic,
+    dict2constraint,
+)
+from ase.io.jsonio import decode, encode
 from ase.md import MDLogger
 from monty.json import jsanitize
 
@@ -32,7 +40,8 @@ from fairchem.core.components.runner import (
 )
 
 if TYPE_CHECKING:
-    from ase import Atoms
+    from collections.abc import Callable
+
     from ase.calculators.calculator import Calculator
     from ase.md.md import MolecularDynamics
     from omegaconf import DictConfig
@@ -40,6 +49,58 @@ if TYPE_CHECKING:
     from fairchem.core.components.calculate.simulation_tools.thermostats import (
         Thermostat,
     )
+
+
+# ASE builds these arrays from the original bond lengths and masses on the
+# first step. Reinitializing from rounded, constrained positions changes them.
+_TRIATOMIC_ARRAYS = (
+    "bondlengths",
+    "bondlengths_nm",
+    "mass_n",
+    "mass_m",
+    "mass_o",
+    "C1",
+    "C2",
+    "C3",
+    "C4",
+)
+
+
+def _save_atoms(atoms: Atoms, path: Path) -> None:
+    state = atoms.todict()
+    constraints = []
+    for constraint in atoms.constraints:
+        try:
+            descriptor = constraint.todict()
+            if isinstance(constraint, FixBondLengths):
+                # ASE omits the original target lengths, which can differ from
+                # the last constrained positions by the solver tolerance.
+                descriptor["kwargs"]["bondlengths"] = constraint.bondlengths
+            elif (
+                isinstance(constraint, FixLinearTriatomic)
+                and constraint.bondlengths is not None
+            ):
+                descriptor["arrays"] = {
+                    name: getattr(constraint, name) for name in _TRIATOMIC_ARRAYS
+                }
+            elif isinstance(constraint, FixInternals) and constraint.initialized:
+                targets = iter(sub.targetvalue for sub in constraint.constraints)
+                for key in ("bonds", "angles_deg", "dihedrals_deg", "bondcombos"):
+                    descriptor["kwargs"][key] = [
+                        [next(targets), indices]
+                        for _, indices in descriptor["kwargs"][key]
+                    ]
+            # Some ASE constructors (e.g. FixSymmetry) modify their arguments.
+            restored = dict2constraint(decode(encode(descriptor), always_array=False))
+            if type(restored) is not type(constraint):
+                raise ValueError("constraint type changed during serialization")
+        except Exception as exc:
+            raise ValueError(
+                f"Cannot checkpoint constraint {type(constraint).__name__}"
+            ) from exc
+        constraints.append(descriptor)
+    state["constraints"] = constraints
+    path.write_text(encode(state), encoding="utf-8")
 
 
 class MDRunner(PreemptableMixin, CalculateRunner):
@@ -118,6 +179,8 @@ class MDRunner(PreemptableMixin, CalculateRunner):
         self._dyn: MolecularDynamics | None = None
         self._trajectory_writer: ParquetTrajectoryWriter | None = None
         self._start_step = 0
+        self._resuming = False
+        self._trajectory_state: dict | None = None
         self._thermostat_state_to_restore: dict | None = None
         self._elapsed_wall_time: float = 0.0
         self._wall_t0: float = time.monotonic()
@@ -143,9 +206,13 @@ class MDRunner(PreemptableMixin, CalculateRunner):
         results_dir = Path(self.job_config.metadata.results_dir)
         sid = self._atoms.info.get("sid", f"{job_num}_{num_jobs}")
 
-        if self._start_step == 0 and (
-            self.velocity_seed is not None
-            or self.initialization_temperature_K is not None
+        if (
+            not self._resuming
+            and self._start_step == 0
+            and (
+                self.velocity_seed is not None
+                or self.initialization_temperature_K is not None
+            )
         ):
             if self.velocity_seed is None or self.initialization_temperature_K is None:
                 raise ValueError(
@@ -169,20 +236,33 @@ class MDRunner(PreemptableMixin, CalculateRunner):
 
         self._atoms.calc = self.calculator
 
-        self._dyn = self.thermostat.build(self._atoms, self.timestep_fs)
-
-        if self._thermostat_state_to_restore is not None:
+        if self._thermostat_state_to_restore is None:
+            self._dyn = self.thermostat.build(self._atoms, self.timestep_fs)
+        elif hasattr(self.thermostat, "build_for_restart"):
+            self._dyn = self.thermostat.build_for_restart(
+                self._atoms, self.timestep_fs, self._thermostat_state_to_restore
+            )
+        else:
+            self._dyn = self.thermostat.build(self._atoms, self.timestep_fs)
             self.thermostat.restore_state(self._dyn, self._thermostat_state_to_restore)
 
         self._dyn.nsteps = self._start_step
 
         self._trajectory_writer = self._trajectory_writer_fn(trajectory_file)
+        if self._resuming and hasattr(self._trajectory_writer, "resume"):
+            self._trajectory_writer.resume(self._start_step, self._trajectory_state)
+        elif self._resuming and trajectory_file.exists():
+            raise ValueError(
+                "Resuming into existing output requires a restart-aware trajectory writer"
+            )
 
         # Attach trajectory collector with global step alignment
         # We use interval=1 and check alignment manually to handle checkpoint resume correctly
         def collect_frame():
             global_step = self._dyn.get_number_of_steps()
             self._atoms.info["md_step"] = global_step
+            if self._resuming and global_step == self._start_step:
+                return
             if global_step % self.trajectory_interval == 0:
                 frame = TrajectoryFrame.from_atoms(
                     self._atoms,
@@ -233,7 +313,10 @@ class MDRunner(PreemptableMixin, CalculateRunner):
                     f"Saving periodic checkpoint at step {current_step} "
                     f"to {checkpoint_save_path}"
                 )
-                self.save_state(checkpoint_save_path, is_preemption=False)
+                if not self.save_state(checkpoint_save_path, is_preemption=False):
+                    raise OSError(
+                        f"Failed to save periodic checkpoint at step {current_step}"
+                    )
 
             self._dyn.attach(
                 save_periodic_checkpoint, interval=self.checkpoint_interval
@@ -246,15 +329,23 @@ class MDRunner(PreemptableMixin, CalculateRunner):
             self._dyn.run(remaining_steps)
         except StopfairDetected:
             stopped_by_stopfair = True
+        except BaseException:
+            if hasattr(self._trajectory_writer, "abort"):
+                self._trajectory_writer.abort()
+            else:
+                self._trajectory_writer.close()
+            raise
         finally:
             self._elapsed_wall_time += time.monotonic() - self._wall_t0
-            if not stopped_by_stopfair and self._trajectory_writer:
-                self._trajectory_writer.close()
+            logger.close()
+        if not stopped_by_stopfair:
+            self._trajectory_writer.close()
 
         return {
             "trajectory_file": trajectory_file,
             "log_file": log_file,
-            "total_steps": self.steps,
+            "total_steps": self._dyn.get_number_of_steps(),
+            "target_steps": self.steps,
             "start_step": self._start_step,
             "structure_id": sid,
             "stopped_by_stopfair": stopped_by_stopfair,
@@ -293,6 +384,8 @@ class MDRunner(PreemptableMixin, CalculateRunner):
                 "trajectory_file": trajectory_file,
                 "log_file": log_file,
                 "total_steps": results["total_steps"],
+                "target_steps": results["target_steps"],
+                "stopped_by_stopfair": results["stopped_by_stopfair"],
                 "trajectory_interval": self.trajectory_interval,
                 "log_interval": self.log_interval,
                 "thermostat_class": type(self.thermostat).__name__,
@@ -310,12 +403,22 @@ class MDRunner(PreemptableMixin, CalculateRunner):
             del cfg.runner.atoms
         return cfg
 
+    def save_state(self, checkpoint_location: str, is_preemption: bool = False) -> bool:
+        saved = super().save_state(checkpoint_location, is_preemption)
+        if saved and is_preemption and self._trajectory_writer:
+            try:
+                self._trajectory_writer.close()
+            except Exception:
+                logging.exception("Failed to finalize the preemption trajectory")
+                return False
+        return saved
+
     def save_simulation_state(self, checkpoint_dir: Path, is_preemption: bool) -> None:
         """
         Save MD-specific state files into checkpoint_dir.
 
         Saves:
-        - Atoms state (positions, velocities) in ExtXYZ format
+        - Lossless ASE atom state and an ExtXYZ compatibility view
         - Thermostat/barostat state in JSON format
         - MD metadata (step count, etc.) in JSON format
 
@@ -324,26 +427,67 @@ class MDRunner(PreemptableMixin, CalculateRunner):
             is_preemption: Whether this save is due to preemption.
         """
         if self._dyn is None or self._atoms is None:
-            return
+            raise RuntimeError("Cannot checkpoint before MD dynamics are initialized")
 
-        if self._trajectory_writer:
-            if is_preemption:
-                self._trajectory_writer.close()
-            elif hasattr(self._trajectory_writer, "flush"):
-                self._trajectory_writer.flush()
-
-        atoms_path = checkpoint_dir / "checkpoint.extxyz"
         self._atoms.info["md_step"] = self._dyn.get_number_of_steps()
-        ase.io.write(str(atoms_path), self._atoms, format="extxyz")
+        _save_atoms(self._atoms, checkpoint_dir / "atoms.json")
+        ase.io.write(
+            str(checkpoint_dir / "checkpoint.extxyz"),
+            self._atoms,
+            format="extxyz",
+            # Keep the legacy format's representable per-atom data and fixed
+            # masks. Higher-rank and unsupported arrays live in atoms.json.
+            columns=["symbols", "positions", "move_mask"]
+            + [
+                key
+                for key, array in self._atoms.arrays.items()
+                if key
+                not in {
+                    "numbers",
+                    "symbols",
+                    "positions",
+                    "move_mask",
+                    "species",
+                    "pos",
+                }
+                and array.ndim <= 2
+                and array.dtype.kind in "dfiOSUb"
+            ],
+            write_results=False,
+        )
 
         thermostat_state = self.thermostat.save_state(self._dyn)
         thermostat_path = checkpoint_dir / "thermostat_state.json"
         with open(thermostat_path, "w") as f:
             json.dump(thermostat_state, f)
 
+        trajectory_state = None
+        if self._trajectory_writer:
+            if hasattr(self._trajectory_writer, "checkpoint"):
+                trajectory_state = self._trajectory_writer.checkpoint()
+            elif hasattr(self._trajectory_writer, "flush"):
+                self._trajectory_writer.flush()
+
         md_state = {
+            "version": 1,
+            "timestep_fs": self.timestep_fs,
+            "thermostat_parameters": {
+                key: getattr(self.thermostat, key)
+                for key in (
+                    "temperature_K",
+                    "friction_per_fs",
+                    "tdamp_fs",
+                    "taut_fs",
+                    "taup_fs",
+                    "pressure_bar",
+                    "compressibility_bar",
+                )
+                if hasattr(self.thermostat, key)
+            },
+            "trajectory": trajectory_state,
             "current_step": self._dyn.get_number_of_steps(),
-            "total_steps": self.steps,
+            "total_steps": self._dyn.get_number_of_steps(),
+            "target_steps": self.steps,
             "elapsed_wall_time": (
                 self._elapsed_wall_time + time.monotonic() - self._wall_t0
             ),
@@ -369,7 +513,7 @@ class MDRunner(PreemptableMixin, CalculateRunner):
         Load MD-specific state from checkpoint_dir.
 
         Restores:
-        - Atoms positions and velocities from ExtXYZ
+        - Atoms arrays and constraints from the versioned state or legacy ExtXYZ
         - Starting step count from metadata
         - Thermostat/barostat state (applied after dynamics creation)
 
@@ -379,14 +523,47 @@ class MDRunner(PreemptableMixin, CalculateRunner):
         atoms_path = checkpoint_dir / "checkpoint.extxyz"
         state_path = checkpoint_dir / "md_state.json"
 
-        if not atoms_path.exists() or not state_path.exists():
+        if not state_path.exists():
+            if atoms_path.exists():
+                raise FileNotFoundError(state_path)
             return
-
-        self._atoms = ase.io.read(str(atoms_path), format="extxyz")
-
         with open(state_path) as f:
             md_state = json.load(f)
 
+        version = md_state.get("version", 0)
+        if version == 1:
+            state = decode(
+                (checkpoint_dir / "atoms.json").read_text(encoding="utf-8"),
+                always_array=False,
+            )
+            self._atoms = Atoms.fromdict(state)
+            for constraint, descriptor in zip(
+                self._atoms.constraints, state["constraints"], strict=True
+            ):
+                if (
+                    isinstance(constraint, FixLinearTriatomic)
+                    and "arrays" in descriptor
+                ):
+                    for name in _TRIATOMIC_ARRAYS:
+                        setattr(constraint, name, descriptor["arrays"][name])
+            # ASE's constructor normalizes the dtype of these two arrays.
+            self._atoms.arrays.update(
+                {key: state[key] for key in ("numbers", "positions")}
+            )
+            if self.timestep_fs != md_state["timestep_fs"]:
+                raise ValueError("MD timestep differs from saved checkpoint")
+            parameters = md_state.get("thermostat_parameters") or {}
+            for key, value in parameters.items():
+                if getattr(self.thermostat, key, value) != value:
+                    raise ValueError(
+                        f"Thermostat parameter {key} differs from saved checkpoint"
+                    )
+        elif version == 0:
+            self._atoms = ase.io.read(str(atoms_path), format="extxyz")
+        else:
+            raise ValueError(f"Unsupported MD checkpoint version {version}")
+        self._trajectory_state = md_state.get("trajectory")
+        self._resuming = True
         self._start_step = md_state["current_step"]
         self._elapsed_wall_time = md_state.get("elapsed_wall_time", 0.0)
 
@@ -411,6 +588,8 @@ class MDRunner(PreemptableMixin, CalculateRunner):
                     f"{checkpoint_thermostat} but current config uses "
                     f"{current_thermostat}."
                 )
+        elif version == 1:
+            raise FileNotFoundError(thermostat_path)
         else:
             self._thermostat_state_to_restore = None
 

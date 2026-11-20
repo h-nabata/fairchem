@@ -19,6 +19,8 @@ from types import MethodType
 import torch
 from torch.utils import _pytree
 
+from fairchem.core.common.distutils import parse_device
+
 # Valid only for the single public load that performed the operator probe.
 _preflight_fp64 = ContextVar("fairchem_preflight_fp64", default=None)
 _capture_lock = threading.Lock()
@@ -50,7 +52,7 @@ def probe_fp64_support(device: str | torch.device) -> dict:
     not a throughput benchmark or a proof that every model kernel is supported.
     No emulation environment flags, global dtype, or random state are changed.
     """
-    device = torch.device(device)
+    device = parse_device(device)
     if device.type not in {"cpu", "cuda", "xpu"}:
         raise ValueError("FP64 probe supports cpu, cuda and xpu")
     if device.type != "cpu" and not getattr(torch, device.type).is_available():
@@ -302,7 +304,7 @@ def mole_composition_key(
         systems = systems[:1]
     return (
         model_id,
-        str(torch.device(device)),
+        str(parse_device(device)),
         str(dtype),
         settings_key,
         tuple(systems),

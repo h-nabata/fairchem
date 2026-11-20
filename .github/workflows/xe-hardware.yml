@@ -2,6 +2,13 @@ name: Xe hardware validation
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches: [intel-xpu-fp32]
+    paths:
+      - "src/fairchem/core/**"
+      - "tests/core/common/test_distributed_subgroup_audit.py"
+      - "tests/core/components/test_batch_server_live_cpu.py"
+      - ".github/workflows/xe-hardware.yml"
   push:
     branches: [intel-xpu-fp32]
 
@@ -9,6 +16,39 @@ permissions:
   contents: read
 
 jobs:
+  cpu-communication:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTHONPATH: ${{ github.workspace }}/src:${{ github.workspace }}
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      RAY_USAGE_STATS_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install CPU PyTorch and portable runtime dependencies
+        run: |
+          python -m pip install uv
+          uv pip install --system --index-url https://download.pytorch.org/whl/cpu 'torch==2.15.0+cpu'
+          python - <<'PYDEPS' > "$RUNNER_TEMP/fairchem-cpu-deps.txt"
+          import tomllib
+          from pathlib import Path
+          project = tomllib.loads(Path("packages/fairchem-core-xpu/pyproject.toml").read_text())["project"]
+          for requirement in project["dependencies"]:
+              if not requirement.startswith(("torch==", "triton-xpu")):
+                  print(requirement)
+          print(*project["optional-dependencies"]["ray"], "pytest", "syrupy", "pymatgen", "pyarrow", sep="\n")
+          PYDEPS
+          uv pip install --system -r "$RUNNER_TEMP/fairchem-cpu-deps.txt"
+      - name: Exercise real Gloo process groups and a local Ray Serve deployment
+        run: |
+          python -m pytest -q tests/core/common/test_distributed_subgroup_audit.py \
+            tests/core/components/test_batch_server_live_cpu.py
+
   two-b70:
     if: github.repository == 'h-nabata/fairchem' && github.ref == 'refs/heads/intel-xpu-fp32' && vars.XE_B70_CI == 'true'
     runs-on: [self-hosted, linux, xe-b70-dual]
@@ -68,11 +108,19 @@ jobs:
         run: |
           test -f "$BASELINE"
           test -n "$CHECKPOINT_ID"
-          for profile in xpu xpu-fp64 xpu-int8; do
+          status=0
+          for pair in xpu:FP32 xpu-fp64:FP64 xpu-int8:TF32; do
+            profile=${pair%:*}
+            tier=${pair#*:}
             python -m fairchem.core.regression_suite fast "$profile" --run-on local --device xpu:1 \
               --suite prediction-fidelity --baseline "$BASELINE" --checkpoint "$MODEL" \
-              --checkpoint-id "$CHECKPOINT_ID" --no-wandb --format json > "results/reference-$profile.json"
+              --minimum-tier "$tier" --checkpoint-id "$CHECKPOINT_ID" --no-wandb --format json > "results/reference-$profile.json" || status=1
           done
+          exit "$status"
+      - name: Record omitted physical-reference comparison
+        if: vars.XE_B70_BASELINE == ''
+        run: |
+          echo 'Pinned physical-reference comparison was not run (XE_B70_BASELINE is unset).' >> "$GITHUB_STEP_SUMMARY"
       - name: Measure single-card and independent dual-card batch throughput
         run: |
           for count in 1 2; do

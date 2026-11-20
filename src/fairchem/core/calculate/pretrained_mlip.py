@@ -20,7 +20,7 @@ from omegaconf import OmegaConf
 
 from fairchem.core import calculate
 from fairchem.core._config import CACHE_DIR
-from fairchem.core.common.distutils import resolve_xpu_device
+from fairchem.core.common.distutils import parse_device, resolve_xpu_device
 from fairchem.core.units.mlip_unit import MLIPPredictUnit, load_predict_unit
 from fairchem.core.units.mlip_unit.api.inference import guess_inference_settings
 from fairchem.core.units.mlip_unit.inference_runtime import (
@@ -82,7 +82,7 @@ class ResolvedCheckpoint:
     form_elem_refs: dict | None = None
 
 
-def pretrained_checkpoint_path_from_name(model_name: str):
+def pretrained_checkpoint_path_from_name(model_name: str, cache_dir: str = CACHE_DIR):
     try:
         model_checkpoint = _MODEL_CKPTS.checkpoints[model_name]
     except KeyError as err:
@@ -94,7 +94,7 @@ def pretrained_checkpoint_path_from_name(model_name: str):
         repo_id=model_checkpoint.repo_id,
         subfolder=model_checkpoint.subfolder,
         revision=model_checkpoint.revision,
-        cache_dir=CACHE_DIR,
+        cache_dir=cache_dir,
     )
     return checkpoint_path
 
@@ -111,7 +111,7 @@ def resolve_checkpoint(
 
     Args:
         name_or_path: A name from available_models or a path to a checkpoint file.
-        cache_dir: Folder where reference energy files are stored.
+        cache_dir: Folder containing checkpoint weights and reference energies.
 
     Returns:
         The resolved checkpoint path and any reference energies.
@@ -121,7 +121,9 @@ def resolve_checkpoint(
             nor an existing file.
     """
     if name_or_path in _MODEL_CKPTS.checkpoints:
-        checkpoint_path = pretrained_checkpoint_path_from_name(name_or_path)
+        checkpoint_path = pretrained_checkpoint_path_from_name(
+            name_or_path, cache_dir=cache_dir
+        )
         if _MODEL_CKPTS.checkpoints[name_or_path].atom_refs is not None:
             atom_refs = get_reference_energies(name_or_path, "atom_refs", cache_dir)
         else:
@@ -188,7 +190,7 @@ def get_predict_unit(
     # Fail before authentication/download if an explicit Intel device cannot
     # serve the request. The predictor performs the same check on local loads.
     evidence = None
-    if device is not None and torch.device(device).type == "xpu":
+    if device is not None and parse_device(device).type == "xpu":
         if workers != 1 or gp_config is not None:
             raise ValueError(
                 "XPU inference supports workers=1 without graph parallelism."

@@ -19,6 +19,7 @@ from typing import Any, Literal
 
 import torch
 
+from fairchem.core.common.distutils import parse_device
 from fairchem.core.units.mlip_unit.api.inference import (
     InferenceSettings,
     guess_inference_settings,
@@ -112,7 +113,7 @@ def _canonicalize_device(device: str | None) -> str | None:
     if device is None:
         return None
     try:
-        return str(torch.device(device))
+        return str(parse_device(device))
     except (RuntimeError, TypeError, ValueError) as err:
         raise ValueError(
             f"device must be a valid torch device, got {device!r}"
