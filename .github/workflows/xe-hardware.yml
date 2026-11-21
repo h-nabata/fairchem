@@ -3,9 +3,13 @@ name: Xe hardware validation
 on:
   workflow_dispatch:
   pull_request:
-    branches: [intel-xpu-fp32]
+    branches: [intel-xpu-fp32, main]
     paths:
       - "src/fairchem/core/**"
+      - "tests/core/calculate/test_requested_properties.py"
+      - "tests/core/components/test_batch_server_interop.py"
+      - "tests/core/datasets/test_atomic_data_interop.py"
+      - "tests/core/scripts/test_benchmark_xpu_batch.py"
       - "tests/core/common/test_distributed_subgroup_audit.py"
       - "tests/core/components/test_batch_server_live_cpu.py"
       - ".github/workflows/xe-hardware.yml"
@@ -44,6 +48,12 @@ jobs:
           print(*project["optional-dependencies"]["ray"], "pytest", "syrupy", "pymatgen", "pyarrow", sep="\n")
           PYDEPS
           uv pip install --system -r "$RUNNER_TEMP/fairchem-cpu-deps.txt"
+      - name: Run portable regression tests
+        run: |
+          python -m pytest -q tests/core/calculate/test_requested_properties.py \
+            tests/core/components/test_batch_server_interop.py \
+            tests/core/datasets/test_atomic_data_interop.py \
+            tests/core/scripts/test_benchmark_xpu_batch.py
       - name: Exercise real Gloo process groups and a local Ray Serve deployment
         run: |
           python -m pytest -q tests/core/common/test_distributed_subgroup_audit.py \
