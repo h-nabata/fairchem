@@ -1,0 +1,453 @@
+"""
+Copyright (c) Meta Platforms, Inc. and affiliates.
+
+This source code is licensed under the MIT license found in the
+LICENSE file in the root directory of this source tree.
+"""
+
+from __future__ import annotations
+
+import pickle
+from types import SimpleNamespace
+from typing import ClassVar
+
+import numpy as np
+import pytest
+import torch
+from ase.build import molecule
+from ase.calculators.lj import LennardJones
+from ase.calculators.mixing import SumCalculator
+from ase.constraints import FixAtoms
+from ase.filters import FrechetCellFilter
+from ase.mep import NEB
+from ase.optimize import BFGS, FIRE
+from ase.vibrations import Vibrations
+
+from fairchem.core.calculate.ase_calculator import (
+    FAIRChemCalculator,
+    FormationEnergyCalculator,
+    pretrained_mlip,
+)
+from fairchem.core.units.mlip_unit.api.inference import InferenceSettings
+
+
+class BufferPredictor:
+    """
+    A coordinate-dependent potential with deliberately reusable output storage.
+    """
+
+    supports_requested_properties = True
+
+    def __init__(self):
+        self.inference_settings = InferenceSettings()
+        self.dataset_to_tasks = {
+            "omol": [
+                SimpleNamespace(property=p)
+                for p in ("energy", "forces", "stress", "hessian")
+            ]
+        }
+        self.calls = 0
+        self.fail = False
+        self.override = {}
+        self.forces = torch.empty(3, 3)
+
+    def validate_atoms_data(self, atoms, task_name):
+        pass
+
+    def predict(self, data, requested_properties=None):
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError("deliberate prediction failure")
+        self.forces.copy_(-2 * data.pos)
+        results = {
+            "energy": data.pos.square().sum().reshape(1) + data.charge,
+            "forces": self.forces,
+            "stress": torch.eye(3).unsqueeze(0),
+            "hessian": 2 * torch.eye(9).unsqueeze(0),
+        }
+        results.update(self.override)
+        return {
+            k: v
+            for k, v in results.items()
+            if requested_properties is None or k in requested_properties
+        }
+
+
+def _atoms():
+    atoms = molecule("H2O")
+    atoms.set_cell([7.0, 7.5, 8.0])
+    atoms.info.update(charge=0, spin=1)
+    return atoms
+
+
+def test_metadata_arrays_and_nested_mutation_do_not_contaminate_cache():
+    predictor = BufferPredictor()
+    atoms = _atoms()
+    atoms.info["job"] = {
+        "vector": np.array([1.0, 2.0]),
+        "frames": [{"tag": np.array([3, 4])}],
+    }
+    atoms.calc = FAIRChemCalculator(predictor, task_name="omol")
+    atoms.get_potential_energy()
+    atoms.get_potential_energy()
+    assert predictor.calls == 1
+    atoms.info["job"]["frames"][0]["tag"][0] = 10
+    assert atoms.calc.atoms.info["job"]["frames"][0]["tag"][0] == 3
+    atoms.get_potential_energy()
+    assert predictor.calls == 2
+    atoms.info["charge"] = 1
+    before = atoms.calc.results["energy"]
+    assert atoms.get_potential_energy() == pytest.approx(before + 1)
+
+
+@pytest.mark.parametrize("formation", [False, True])
+def test_cyclic_metadata_cache_detects_nested_changes(formation):
+    predictor = BufferPredictor()
+    atoms = _atoms()
+    job = {"values": [np.array([1, 2])]}
+    job["self"] = job
+    job["values"].append(job["values"])
+    atoms.info["job"] = job
+    calculator = FAIRChemCalculator(predictor, task_name="omol")
+    if formation:
+        calculator = FormationEnergyCalculator(
+            calculator, {"H": 0, "O": 0}, apply_corrections=False
+        )
+    atoms.calc = calculator
+    atoms.get_potential_energy()
+    atoms.get_potential_energy()
+    assert predictor.calls == 1
+    job["values"][0][0] = 3
+    atoms.get_potential_energy()
+    assert predictor.calls == 2
+    assert calculator.atoms.info["job"]["self"] is calculator.atoms.info["job"]
+    assert calculator.atoms.info["job"] is not job
+
+
+def test_checkpoint_factory_passes_seed_to_loader(monkeypatch, caplog):
+    calls = []
+    predictor = BufferPredictor()
+
+    def load(name, **kwargs):
+        calls.append((name, kwargs))
+        return predictor
+
+    monkeypatch.setattr(pretrained_mlip, "get_predict_unit", load)
+    calculator = FAIRChemCalculator.from_model_checkpoint(
+        "local.pt", task_name="omol", seed=123
+    )
+    assert calculator.predictor is predictor
+    assert calls[0][1]["seed"] == 123
+    assert "'seed' argument is deprecated" not in caplog.text
+
+
+def test_calculators_own_cpu_prediction_arrays_across_shared_predictor_jobs():
+    predictor = BufferPredictor()
+    first, second = _atoms(), _atoms()
+    second.positions += 2
+    for atoms in (first, second):
+        atoms.calc = FAIRChemCalculator(predictor, task_name="omol")
+    expected = first.get_forces()
+    second.get_forces()
+    predictor.forces.add_(100)
+    np.testing.assert_array_equal(first.get_forces(), expected)
+    assert predictor.calls == 2
+    assert first.calc.results["forces"].flags.owndata
+
+
+def test_direct_calculate_defaults_and_failure_do_not_reuse_previous_job():
+    predictor = BufferPredictor()
+    calc = FAIRChemCalculator(predictor, task_name="omol")
+    first, second = _atoms(), _atoms()
+    second.positions += 1
+    calc.calculate(first)
+    calc.calculate()
+    predictor.fail = True
+    with pytest.raises(RuntimeError, match="deliberate"):
+        calc.calculate_properties(second, ["energy"])
+    assert calc.atoms is None
+    assert not calc.results
+    predictor.fail = False
+    second.calc = calc
+    assert second.get_potential_energy() == pytest.approx(
+        float((second.positions**2).sum()), rel=2e-6
+    )
+
+
+@pytest.mark.parametrize("formation", [False, True])
+def test_cancelled_calculation_does_not_reuse_previous_job(formation):
+    predictor = BufferPredictor()
+    calc = FAIRChemCalculator(predictor, task_name="omol")
+    if formation:
+        calc = FormationEnergyCalculator(
+            calc, {"H": 0, "O": 0}, apply_corrections=False
+        )
+    calc.calculate(_atoms())
+
+    def interrupted(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    predictor.predict = interrupted
+    moved = _atoms()
+    moved.positions += 1
+    with pytest.raises(KeyboardInterrupt):
+        calc.calculate(moved)
+    assert calc.atoms is None
+    assert not calc.results
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("energy", torch.zeros(2)),
+        ("forces", torch.zeros(9)),
+        ("stress", torch.zeros(4)),
+        ("hessian", torch.zeros(3, 3)),
+        ("energy", np.array([np.nan])),
+        ("forces", np.full((3, 3), "bad")),
+    ],
+)
+def test_malformed_wrapper_outputs_fail_without_poisoning_results(name, value):
+    predictor = BufferPredictor()
+    calc = FAIRChemCalculator(predictor, task_name="omol")
+    calc.calculate(_atoms())
+    predictor.override[name] = value
+    with pytest.raises(ValueError):
+        calc.calculate(_atoms(), [name])
+    assert calc.atoms is None
+    assert not calc.results
+
+
+@pytest.mark.parametrize("shape", [(6,), (1, 6), (3, 3), (1, 3, 3), (9,), (1, 9)])
+def test_standard_stress_layouts_preserve_voigt_order(shape):
+    predictor = BufferPredictor()
+    stress = np.array([[1.0, 4.0, 5.0], [4.0, 2.0, 6.0], [5.0, 6.0, 3.0]])
+    expected = np.array([1.0, 2.0, 3.0, 6.0, 5.0, 4.0])
+    predictor.override["stress"] = (
+        expected if np.prod(shape) == 6 else stress
+    ).reshape(shape)
+    atoms = _atoms()
+    atoms.calc = FAIRChemCalculator(predictor, task_name="omol")
+    np.testing.assert_array_equal(atoms.get_stress(), expected)
+
+
+def test_formation_wrapper_caches_owns_references_and_invalidates_parameters():
+    predictor = BufferPredictor()
+    base = FAIRChemCalculator(predictor, task_name="omol")
+    references = {"H": 1.0, "O": 2.0}
+    wrapper = FormationEnergyCalculator(base, references, apply_corrections=False)
+    atoms = _atoms()
+    atoms.calc = wrapper
+    atoms.get_forces()
+    restored = pickle.loads(pickle.dumps(wrapper))
+    assert restored.check_state(atoms) == []
+    forces = atoms.get_forces()
+    energy = atoms.get_potential_energy()
+    assert wrapper.atoms is not None
+    assert predictor.calls == 1
+    references["H"] = 100
+    base.results["forces"][:] = 100
+    np.testing.assert_array_equal(atoms.get_forces(), forces)
+    assert atoms.get_potential_energy() == energy
+    wrapper.element_references["H"] = 2
+    assert atoms.get_potential_energy() == pytest.approx(energy - 2)
+    assert predictor.calls == 2
+    atoms.info["charge"] = 1
+    assert atoms.get_potential_energy() == pytest.approx(energy - 1)
+    wrapper.element_references.pop("O")
+    with pytest.raises(ValueError, match="Missing reference"):
+        atoms.get_potential_energy()
+    assert wrapper.atoms is None
+    assert not wrapper.results
+
+
+def _real_calculator():
+    from tests.core.units.mlip_unit.test_predict_memory import (
+        _IdentityNormalizer,
+        _task,
+    )
+    from tests.core.units.mlip_unit.test_xpu_preparation import _small_predictor
+
+    predictor = _small_predictor()
+    predictor.inference_settings.merge_mole = False
+    predictor.inference_settings.activation_checkpointing = False
+    backbone = predictor.model.module.backbone
+    backbone.neighbor_skin = 0.4
+    backbone.edge_chunk_size = 16
+    backbone.graph_edge_order = "spatial"
+    tasks = []
+    for prop in ("energy", "forces", "stress", "hessian"):
+        task = _task(f"omol_{prop}", "atom" if prop == "forces" else "system", prop)
+        task.normalizer = _IdentityNormalizer()
+        task.element_references = None
+        tasks.append(task)
+    predictor.model.module._tasks = {task.name: task for task in tasks}
+    predictor.model.module._dataset_to_tasks = {"omol": tasks}
+    return FAIRChemCalculator(predictor, task_name="omol")
+
+
+@pytest.mark.parametrize("optimizer", [BFGS, FIRE])
+def test_real_uma_optimizer_and_constraint_jobs(optimizer):
+    atoms = _atoms()
+    atoms.calc = _real_calculator()
+    atoms.set_constraint(FixAtoms(indices=[0]))
+    initial = atoms.positions.copy()
+    forces = atoms.get_forces()
+    assert np.count_nonzero(forces[1:]) > 0
+    optimizer(atoms, logfile=None).run(fmax=1e-10, steps=2)
+    np.testing.assert_array_equal(atoms.positions[0], initial[0])
+    assert not np.array_equal(atoms.positions[1:], initial[1:])
+    assert np.isfinite(atoms.get_forces()).all()
+    assert atoms.calc.predictor.model.module.backbone._neighbor_cache is not None
+
+
+def test_real_uma_neb_and_sum_calculator_job_outputs_are_independent():
+    calculator = _real_calculator()
+    images = [_atoms() for _ in range(3)]
+    for i, atoms in enumerate(images):
+        atoms.positions[1, 0] += 0.07 * i
+        atoms.calc = FAIRChemCalculator(calculator.predictor, task_name="omol")
+    neb = NEB(images, climb=True)
+    assert np.isfinite(neb.get_forces()).all()
+    first_force = images[0].get_forces()
+    images[-1].get_forces()
+    np.testing.assert_array_equal(images[0].get_forces(), first_force)
+    atoms = _atoms()
+    base, correction = _real_calculator(), LennardJones()
+    expected_energy = base.get_potential_energy(
+        atoms
+    ) + correction.get_potential_energy(atoms)
+    expected_forces = base.get_forces(atoms) + correction.get_forces(atoms)
+    atoms.calc = SumCalculator([base, correction])
+    assert atoms.get_potential_energy() == pytest.approx(expected_energy)
+    np.testing.assert_allclose(atoms.get_forces(), expected_forces)
+
+
+def test_real_uma_cell_filter_and_finite_difference_vibration_jobs(tmp_path):
+    atoms = _atoms()
+    atoms.pbc = True
+    atoms.calc = _real_calculator()
+    cell_filter = FrechetCellFilter(atoms, mask=[1, 1, 1, 0, 0, 0])
+    assert cell_filter.get_forces().shape == (len(atoms) + 3, 3)
+    assert np.isfinite(cell_filter.get_forces()).all()
+    FIRE(cell_filter, logfile=None, dt=0.01).run(fmax=1e-12, steps=1)
+    positions = atoms.positions.copy()
+    vibrations = Vibrations(atoms, indices=[1], name=str(tmp_path / "vib"), delta=0.005)
+    vibrations.run()
+    hessian = vibrations.get_vibrations().get_hessian_2d()
+    assert hessian.shape == (3, 3)
+    assert np.isfinite(hessian).all()
+    np.testing.assert_array_equal(atoms.positions, positions)
+    vibrations.clean()
+
+
+def test_real_uma_sella_job_accepts_numpy_hessian_callback():
+    sella = pytest.importorskip("sella")
+    atoms = _atoms()
+    atoms.calc = _real_calculator()
+
+    def hessian(current):
+        value = current.calc.get_property("hessian", current)
+        assert value.shape == (9, 9)
+        assert np.isfinite(value).all()
+        return value
+
+    optimizer = sella.Sella(
+        atoms, order=1, logfile=None, hessian_function=hessian, max_cpu_threads=1
+    )
+    optimizer.run(fmax=1e-12, steps=1)
+    assert np.isfinite(atoms.positions).all()
+    assert np.isfinite(atoms.get_forces()).all()
+
+
+@pytest.mark.parametrize("wrap", ["predictor", "formation", "d3"])
+def test_cached_energy_tracks_tags_and_fixed_mask(monkeypatch, wrap):
+    from ase.calculators.calculator import Calculator
+
+    from fairchem.core.calculate import dftd3_calculator
+
+    class InputPredictor(BufferPredictor):
+        def predict(self, data, requested_properties):
+            self.calls += 1
+            return {"energy": data.tags.sum() + 10 * data.fixed.sum()}
+
+    class ZeroDispersion(Calculator):
+        implemented_properties = ("energy",)
+
+        def calculate(self, atoms, properties, system_changes):
+            super().calculate(atoms, properties, system_changes)
+            self.results = {"energy": 0.0}
+
+    predictor = InputPredictor()
+    atoms = _atoms()
+    calc = FAIRChemCalculator(predictor, "omol")
+    if wrap != "predictor":
+        calc = FormationEnergyCalculator(calc, {"H": 0, "O": 0})
+    if wrap == "d3":
+        monkeypatch.setattr(
+            dftd3_calculator,
+            "_NValChemiDFTD3Calculator",
+            lambda *a, **k: ZeroDispersion(),
+        )
+        calc = dftd3_calculator.DFTD3Calculator(calc, "pbe")
+    atoms.calc = calc
+    assert atoms.get_potential_energy() == 0
+    atoms.set_tags([0, 2, 0])
+    assert atoms.get_potential_energy() == 2
+    atoms.set_constraint(FixAtoms(indices=[0, 2]))
+    assert atoms.get_potential_energy() == 22
+    atoms.set_constraint([FixAtoms(indices=[0]), FixAtoms(indices=[2])])
+    assert atoms.get_potential_energy() == 22
+    assert predictor.calls == 3
+
+
+def test_distinct_formation_energy_and_child_cache(monkeypatch):
+    from ase import Atoms
+    from ase.calculators.calculator import Calculator
+
+    from fairchem.core.calculate import dftd3_calculator
+
+    class EnergyPair(Calculator):
+        implemented_properties = ("energy", "free_energy")
+        default_parameters: ClassVar = {"offset": 0}
+
+        def calculate(self, atoms, properties, system_changes):
+            super().calculate(atoms, properties, system_changes)
+            self.results = {
+                p: {"energy": 10, "free_energy": 8}[p] + self.parameters.offset
+                for p in properties
+            }
+
+    atoms = Atoms("H")
+    base = FormationEnergyCalculator(EnergyPair(), {"H": 2})
+    assert base.get_property("free_energy", atoms) == 6
+    base.calculate(atoms, ["energy", "free_energy"])
+    assert base.results == {"energy": 8, "free_energy": 6}
+    d3 = EnergyPair()
+    monkeypatch.setattr(
+        dftd3_calculator, "_NValChemiDFTD3Calculator", lambda *a, **k: d3
+    )
+    total = dftd3_calculator.DFTD3Calculator(base, "pbe")
+    assert total.get_potential_energy(atoms) == 18
+    base.element_references["H"] = 7
+    assert total.get_potential_energy(atoms) == 13
+    base.element_references["H"] = 3
+    assert base.get_potential_energy(atoms) == 7
+    assert total.get_potential_energy(atoms) == 17
+    d3.parameters.offset += 1
+    assert total.get_potential_energy(atoms) == 18
+
+
+@pytest.mark.parametrize("request_aware", [True, False])
+def test_undefined_molecular_stress_never_cached(request_aware):
+    predictor = BufferPredictor()
+    predictor.supports_requested_properties = request_aware
+    predictor.override["stress"] = torch.full((3, 3), float("nan"))
+    atoms = _atoms()
+    atoms.set_cell([0, 0, 0])
+    atoms.calc = FAIRChemCalculator(predictor, "omol")
+    assert np.isfinite(atoms.get_potential_energy())
+    assert np.isfinite(atoms.get_forces()).all()
+    assert "stress" not in atoms.calc.results
+    with pytest.raises(ValueError, match="finite nonzero volume"):
+        atoms.get_stress()

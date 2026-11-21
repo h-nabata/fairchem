@@ -10,7 +10,7 @@
 
 ![tests](https://github.com/facebookresearch/fairchem/actions/workflows/test.yml/badge.svg?branch=main&event=push)
 ![PyPI - Version](https://img.shields.io/pypi/v/fairchem-core)
-![Static Badge](https://img.shields.io/badge/python-3.10%2B-blue)
+![Static Badge](https://img.shields.io/badge/python-3.11%2B-blue)
 [![codecov](https://codecov.io/gh/facebookresearch/fairchem/graph/badge.svg)](https://codecov.io/gh/facebookresearch/fairchem)
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.15587498.svg)](https://doi.org/10.5281/zenodo.15587498)
 
@@ -23,6 +23,65 @@
 `fairchem` is the [FAIR](https://ai.meta.com/research/) Chemistry's centralized repository of all its data, models,
 demos, and application efforts for materials science and quantum chemistry.
 
+<a id="dependencies"></a>
+
+## 主な依存関係
+
+このフォークの通常版manifestに基づく範囲です。導入例・検証環境はPython 3.12を使用します。
+
+| 用途 | ライブラリ／条件 |
+| --- | --- |
+| Python | `>=3.11,<3.15` |
+| テンソル計算 | PyTorch `>=2.13,<2.16`。Intel用導入例は`2.15.0+xpu` |
+| 数値計算 | NumPy `>=2.0,<2.5`、SciPy `>=1.15` |
+| 原子シミュレーション | ASE `>=3.26`、e3nn `>=0.5` |
+| 設定・学習基盤 | Hydra、OmegaConf、TorchTNT |
+| 任意機能 | TorchSim用`[torchsim]`、Pymatgen等の`[extras]`、Ray用`[ray]` |
+
+完全な依存定義は[pyproject.toml](packages/fairchem-core/pyproject.toml)を参照してください。
+NumPy1.26互換版とIntel向けwheelの導入方法は下記ガイドに記載しています。
+
+<a id="intel-xpu-guide"></a>
+
+## Intel XPU対応フォークの導入・運用ガイド
+
+2026年11月19日の[監査項目別の修正・回帰試験・B70での検証手順](docs/core/common_tasks/intel_xpu_implementation_20261119.md)には、厳密FP32/FP64、B系列、2枚のGPUでのバッチ処理、ASE・TorchSim・LAMMPSの変更をまとめています。
+
+このブランチ`intel-xpu-fp32`は、UMAをIntel GPU上のPyTorch XPUで利用するための
+互換性修正、FP32／FP64の共通最適化（A系列）、明示指定する近似計算（B系列）を含みます。
+upstreamのロゴ・タイトルは冒頭に、機能説明・導入例などの本文はこのガイドの後に残しています。
+**Intelで最初に使用する設定は`device="xpu:0", inference_settings="xpu"`です。**
+下部のupstream手順にある`pip install fairchem-core`だけでは、このフォークの修正は入りません。
+
+2026年11月16日の[デバイス割当て・併用・メモリ再監査](docs/core/common_tasks/intel_xpu_runtime_audit_20261116.md)では、
+独自XPU kernelの起動先、Graph cacheの精度条件、複数predictorのthread設定を修正し、
+Hessian・曲率解析・連続計算の一時メモリを削減しました。
+検査対象と実GPUで未確認の項目は同記録に区別して記載しています。
+
+2026年11月15日のA/B併用・メモリ再監査は
+[併用監査記録](docs/core/common_tasks/intel_xpu_combination_audit_20261115.md)を参照してください。
+23通りの二因子組合せ試験と、非対応な65通りの設定の拒否を追加しています。
+最終の直列試験は2,091件成功・47件skip・失敗なしでした。
+初回の並列試験でのworker異常終了と数値比較の修正についても、同記録に記載しています。
+
+2026年11月10日のFP64対応・最適化とupstream調査は
+[FP64監査記録](docs/core/common_tasks/intel_xpu_fp64_audit.md)に記録しています。
+11月10日の統合試験は1,864件成功・47件skip・失敗なしでした。
+前回11月9日の21項目の修正と1,663件成功・44件skipの結果は
+[前回の監査記録](docs/core/common_tasks/intel_xpu_final_audit.md)を参照してください。
+CPUでの実計算とGPU制御経路の模擬試験を実施していますが、Arc Pro B70実機の速度、
+VRAM使用量、配布UMAモデルによる長時間MDの安定性は未検証です。
+
+### 目次
+
+- [主な依存関係](#dependencies)
+- [Intel XPU対応フォークの導入・運用ガイド](#intel-xpu-guide)
+  - [実行方式と精度の区別](#fork-execution)
+  - [Ubuntu・Arc Pro B70への導入](#fork-install)
+  - [最初のFP32計算](#fork-fp32)
+  - [FP64の利用と段階的な最適化](#fork-fp64)
+  - [A系列の追加設定とB系列の明示指定](#fork-options)
+  - [実機での受入試験とMD測定](#fork-validation)
 - [UMA performance](#uma-is-now-much-faster)
 - [Latest news](#latest-news)
 - [Installation](#installation)
@@ -34,6 +93,270 @@ demos, and application efforts for materials science and quantum chemistry.
   - [D3 dispersion corrections](#d3-dispersion-corrections)
   - [Multi-GPU inference and LAMMPS](#multi-gpu-inference-and-lammps)
 - [License](#license)
+
+<a id="fork-execution"></a>
+
+### 実行方式と精度の区別
+
+| 機能 | 実装・対象 | 運用上の扱い |
+| --- | --- | --- |
+| Intel FP32基準 | PyTorchのXPU演算、通常UMA backend | `xpu`設定。compile、TF32、B系列、Nitroは無効 |
+| FP64基準 | CPU／CUDA、実演算検査を通るXPUの通常UMA backend | `fp64`／`xpu-fp64`設定。FP32専用カーネルは使用しない |
+| A系列 | 正確な近傍再利用、MoLE統合、portable演算、出力選択など | 低精度化を加えない。演算順序による丸め差はあり得る |
+| B系列 | BF16/FP16、量子化、低ランク化など | 既定で無効。対象構造で誤差と速度を比較して明示指定 |
+| UMA Nitro | CUDA専用Triton/CuTeカーネルとCUDA Graph | Intel XPUでは動かない。厳密FP32基準とも異なる |
+
+このフォークはUMA全体を独自SYCLカーネルへ書き直したものではありません。
+Intel GPUへの実行は[PyTorch XPU backend](https://docs.pytorch.org/docs/2.15/notes/get_start_xpu.html)
+を通します。CUDA版Nitroとの性能差を示す実機比較値はまだありません。
+
+<a id="fork-install"></a>
+
+### Ubuntu・Arc Pro B70への導入
+
+Python 3.12と、Intel GPUを認識するドライバー／ランタイムを用意してください。
+[IntelのPyTorch 2.15向け前提条件](https://www.intel.com/content/www/us/en/developer/articles/tool/pytorch-prerequisites-for-intel-gpu/2-15.html)
+では、B70を含むArc Pro BシリーズについてUbuntu 24.04／26.04とOMIX 0.4.0の組合せが
+記載されています。対応するOSのポイントリリース、カーネル、GPUアクセス権は
+[OMIX導入ガイド](https://dgpu-docs.intel.com/installation-guides/installing-omix.html)で確認してください。
+公式PyTorch wheelを使う場合は、競合を避けるため`/opt/intel/oneapi/setvars.sh`をsourceしません。
+別の作業でsource済みなら、source前の環境から新しい端末を開き、
+シェル初期化ファイルによる自動sourceも無効にした状態で以下を実行します。
+
+[uv](https://docs.astral.sh/uv/getting-started/installation/)とGitを導入したうえで、
+既存のCUDA環境とは別の仮想環境を作ります。
+
+```bash
+git clone --branch intel-xpu-fp32 --single-branch https://github.com/h-nabata/fairchem.git
+cd fairchem
+export UV_PROJECT_ENVIRONMENT="$PWD/.venv-xpu"
+uv sync --locked --project packages/fairchem-core-xpu --python 3.12
+source .venv-xpu/bin/activate
+uv pip check --python .venv-xpu/bin/python
+```
+
+Intel専用のロックファイルはLinux x86-64向けで、PyTorch 2.15.0+xpuと依存パッケージの組み合わせを固定します。
+通常版のCUDA環境は別の仮想環境に作成してください。Intel GPUの認識と演算を次のコードで確認できます。
+
+```bash
+python - <<'PY'
+import torch
+
+print("PyTorch:", torch.__version__)
+assert torch.xpu.is_available(), "Intel GPUを認識できていません"
+for index in range(torch.xpu.device_count()):
+    print(f"xpu:{index}", torch.xpu.get_device_name(index))
+    x = torch.ones((64, 64), device=f"xpu:{index}", dtype=torch.float32)
+    assert torch.isfinite(x @ x).all().item()
+torch.xpu.synchronize()
+PY
+```
+
+TorchSimを併用する場合は、上記の`uv sync`に`--extra torchsim`を追加します。
+Pymatgenなどを使う際は`--extra extras`を追加します。複数の追加機能を使う場合は同じコマンドにまとめて指定してください。
+NumPy 1.26が必要な既存環境には、Python 3.11／3.12向けに別構成の`packages/fairchem-core-numpy126`があります。
+
+<a id="fork-fp32"></a>
+
+### 最初のFP32計算
+
+配布モデルには[Hugging FaceのUMA利用許可](https://huggingface.co/facebook/UMA)が必要です。
+許可取得後、仮想環境内で`hf auth login`を実行してください。
+初回はモデルをダウンロードします。モデル名の代わりに、対応するローカルcheckpointも指定できます。
+
+```python
+from ase.build import bulk
+from fairchem.core import FAIRChemCalculator
+
+atoms = bulk("Si", cubic=True).repeat((2, 2, 2))
+atoms.calc = FAIRChemCalculator.from_model_checkpoint(
+    "uma-s-1p2p1",
+    task_name="omat",
+    device="xpu:0",
+    inference_settings="xpu",
+)
+print("Energy [eV]:", atoms.get_potential_energy())
+print("Forces [eV/Angstrom]:", atoms.get_forces())
+print("Stress [eV/Angstrom^3]:", atoms.get_stress())
+print("Effective settings:", atoms.calc.predictor.inference_settings)
+```
+
+`task_name`は計算対象に合わせます。上の例は無機材料向け`omat`で、分子は通常`omol`です。
+電荷・スピンなどの指定は[calculatorの説明](https://facebookresearch.github.io/fairchem/ase-calculator/)
+に従ってください。混在GPU機では自動選択がCUDAを優先する場合があるため、Intelには
+必ず`xpu:0`などを明示します。B70が2枚ある場合、独立したjobを別プロセスで
+`xpu:0`と`xpu:1`へ割り当てられますが、1計算で2枚のVRAMを自動合算する機能ではありません。
+現状のRay Serve、InferenceBatcher、graph parallelによる複数XPU実行は未対応です。
+
+<a id="fork-fp64"></a>
+
+### FP64の利用と段階的な最適化
+
+近傍cache、MoLE統合、folded GEMM、portable radial／Wigner演算、出力選択、
+バッチ転送と出力分割などのA系列は、FP64でも共通の実装を利用します。
+FP32専用の融合カーネルはFP64に適用せず、dtypeを保つ通常演算へ戻ります。
+**`high-precision`はFP32設定です。FP64には`fp64`または`xpu-fp64`を明示してください。**
+
+今回の改修では、XPUのFP64一律拒否を、対応機能と実際の演算を確認する検査へ変更しました。
+Intelの公開Compute RuntimeにはBMGのFP64対応が記載されていますが、
+ドライバーの能力宣言からB70上のUMA速度や全演算の成功までは判断できません。
+まずモデルをダウンロードせずに確認します。
+
+```bash
+python -m fairchem.core.scripts.validate_xpu \
+  --device xpu:0 --dtype float64 --probe-only --output xpu-fp64-probe.json
+```
+
+検査を通過した環境では、例えば次のように使用します。
+CPUで比較基準を作る場合は`device="cpu", inference_settings="fp64"`に変更します。
+
+```python
+from fairchem.core import FAIRChemCalculator
+
+calc = FAIRChemCalculator.from_model_checkpoint(
+    "uma-s-1p2p1",
+    task_name="omat",
+    device="xpu:0",
+    inference_settings="xpu-fp64",
+)
+# atoms.calc = calc
+# atoms.get_potential_energy(), atoms.get_forces(), atoms.get_stress()
+```
+
+両FP64 presetはgeneral backend、eager、MoLE統合、TF32／Nitro／B無効です。
+モデルの浮動小数点重みと入力をFP64に揃えます。FP32で保存されたcheckpointをFP64へ変換しても、
+保存時に失った桁や学習誤差が回復するわけではありません。
+TorchSimの`FairChemModel`は、`dtype`を省略するとpredictorの基底精度を引き継ぎます。
+`dtype=torch.float64`だけを指定してもFP32モデルの演算精度は変わらないため、
+モデルにも`inference_settings="fp64"`または`"xpu-fp64"`を指定してください。
+
+大きい系では、まずA系列の`activation_checkpointing=True`を検討してください。
+中間値を再計算するため時間との交換になりますが、計算精度を落とさずに保存量を削減します。
+今回、chunkごとの不要なnode tensor保持と、エネルギーの微分から力を求める推論での
+完了済み出力によるautograd graph保持を修正しました。
+固定組成の近傍再利用や`requested_properties`もFP64で利用できます。
+
+さらにメモリが不足するときだけ、B系列の保存活性圧縮を明示指定できます。
+
+```python
+from dataclasses import replace
+from fairchem.core.units.mlip_unit.api.inference import inference_settings_fp64
+from fairchem.core.units.mlip_unit.api.series_b import SeriesBSettings
+
+settings_b64 = replace(
+    inference_settings_fp64(),
+    series_b=SeriesBSettings(saved_feature_dtype="fp32"),
+)
+# 新しいcalculatorのinference_settings=settings_b64へ渡す
+```
+
+この設定は、微分計算のため保存する対象の学習済み特徴をFP64からFP32へ圧縮します。
+前向き演算と重み・幾何計算はFP64ですが、復元値を用いる力・stress・Hessian等は近似になります。
+前向きのエネルギーが一致しても、力の微分整合性やNVEでのエネルギー保存は別途確認が必要です。
+対象tensorの保存量はほぼ半分になる一方、圧縮・復元の時間が増えるため、高速化は保証しません。
+FP64に対するB設定はこの方式だけを許可し、他の低精度GEMM・量子化等は拒否します。
+活性化checkpointとB圧縮は併用せず、別設定として比較してください。
+[FP64監査記録](docs/core/common_tasks/intel_xpu_fp64_audit.md)に精度比較とCPU測定条件を記載しています。
+
+```bash
+python -m fairchem.core.scripts.validate_xpu \
+  --model uma-s-1p2p1 --device xpu:0 --dtype float64 --stress --compare-merged \
+  --output xpu-fp64-validation.json
+
+python -m fairchem.core.scripts.benchmark_md \
+  --model uma-s-1p2p1 --device xpu:0 --inference-settings xpu-fp64 \
+  --task omat --repeat 5 5 5 --steps 1000 --warmup 20 \
+  --timestep-fs 0.1 --output md-xpu-fp64.json
+```
+
+検証の許容誤差はFP64指定だけでは厳しくなりません。`--energy-tolerance`、
+`--force-tolerance`、`--stress-tolerance`と有限差分設定は、`validate_xpu`で用途に合わせて調整します。
+
+B圧縮の比較には、取得済みcheckpointと対象構造を指定します。
+
+```bash
+python -m fairchem.core.scripts.compare_series_b \
+  --checkpoint /path/to/model.pt --structure structure.extxyz --task omat \
+  --device xpu:0 --dtype float64 --series-b '{"saved_feature_dtype":"fp32"}' \
+  --properties energy,forces,stress --measure-memory --output fp64-b-comparison.json
+```
+
+<a id="fork-options"></a>
+
+### A系列の追加設定とB系列の明示指定
+
+固定組成のMDでは、移動量に応じて近傍候補を再利用する設定を追加できます。
+再利用時も距離、物理cutoff、近傍上限は各回評価します。
+
+```python
+from dataclasses import replace
+from fairchem.core.units.mlip_unit.api.inference import inference_settings_xpu
+
+settings = replace(
+    inference_settings_xpu(),
+    neighbor_skin=0.5,  # Angstrom; 候補数と再構築頻度のバランスを実測する
+    neighbor_cache_entries=1,
+    requested_properties=("energy", "forces"),  # 固定セルMD向け。NPTではstressも必要
+)
+# from_model_checkpoint(..., inference_settings=settings)へ渡す
+```
+
+compile、数値ブロックのXPU Graph、`umas_fast_portable`は追加の選択肢ですが、
+まずeagerのFP32基準が通ることを確認してください。各設定と制約は
+[A系列の仕様](docs/core/common_tasks/intel_xpu_series_a.md)に記載しています。
+組成・task等を切り替える計算では、MoLE再準備／fallbackとキャッシュ保持量が増える場合があります。
+キャッシュ上限は入力サイズによらない固定VRAM上限ではありません。
+
+B系列を使用するときだけ、例えば以下のように新しい設定を作ります。
+
+```python
+from dataclasses import replace
+from fairchem.core.units.mlip_unit.api.inference import inference_settings_xpu
+from fairchem.core.units.mlip_unit.api.series_b import SeriesBSettings
+
+settings_b = replace(
+    inference_settings_xpu(),
+    series_b=SeriesBSettings(gemm_precision="bf16"),
+)
+# 新しいcalculatorのinference_settings=settings_bに渡す
+```
+
+BF16の例は低精度化を伴い、高速化も保証しません。準備済みpredictorの設定を書き換えて
+FP32／Bを切り替えず、別インスタンスを作ってください。B系列とNitro、compile、
+XPU Graphなどの未対応な組合せは拒否します。
+[B系列の仕様・比較手順](docs/core/common_tasks/intel_xpu_series_b.md)を参照してください。
+
+<a id="fork-validation"></a>
+
+### 実機での受入試験とMD測定
+
+まずエネルギー・力・stressと微分の整合性を確認します。
+次のコマンドは配布モデルを実際に実行し、判定結果をJSONへ記録します。
+
+```bash
+python -m fairchem.core.scripts.validate_xpu \
+  --model uma-s-1p2p1 --device xpu:0 --stress --compare-merged \
+  --output xpu-validation.json
+
+python -m fairchem.core.scripts.benchmark_md \
+  --model uma-s-1p2p1 --device xpu:0 --inference-settings xpu \
+  --task omat --repeat 5 5 5 --steps 1000 --warmup 20 \
+  --timestep-fs 0.1 --sample-interval 25 --output md-xpu-fp32.json
+```
+
+MDの例はSi 1,000原子の固定セルNVEです。実際の対象には`--input structure.extxyz`を指定し、
+task・温度・時間刻みを合わせてください。初回準備時間、step時間、エネルギーdrift、
+PyTorch allocatorのallocated／reserved／peakを記録します。速度にはASE処理と検査・同期を含み、
+reserved memoryの増加だけではメモリリークと判定できません。ドライバー等の確保量は別途観測が必要です。
+短時間で有限値が得られることと、長時間の物理的安定性は別の検証です。
+
+導入に失敗した場合は、`torch.__version__`、XPU認識結果、GPU／ドライバー情報、
+使用した設定、完全な例外ログと上記JSONを保存してください。
+検証範囲と残る制限は[最終監査記録](docs/core/common_tasks/intel_xpu_final_audit.md)にまとめています。
+
+---
+
+<!-- Upstream feature and usage sections follow. -->
 
 ## UMA is now much faster!
 

@@ -213,10 +213,11 @@ def decompose_tensor(data_object, config) -> AtomicData:
     if rank != 2:
         raise NotImplementedError
 
+    tensor = data_object[tensor_key]
     tensor_decomposition = torch.einsum(
         "ab, cb->ca",
-        cg_change_mat(rank),
-        data_object[tensor_key].reshape(1, irreps_sum(rank)),
+        cg_change_mat(rank, device=tensor.device, dtype=tensor.dtype),
+        tensor.reshape(1, irreps_sum(rank)),
     )
 
     for decomposition_key in config["decomposition"]:

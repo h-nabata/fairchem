@@ -122,6 +122,9 @@ def test_predict_uses_inference_tf32_and_restores_caller(tf32):
 
     predict_unit = MLIPPredictUnit.__new__(MLIPPredictUnit)
     predict_unit.inference_settings = InferenceSettings(tf32=tf32)
+    # This tests CUDA precision policy with CPU stand-ins; CPU/XPU predictors
+    # intentionally leave CUDA's process-wide precision policy unchanged.
+    predict_unit.device = "cuda"
     predict_unit.model = PrecisionCheckingModel()
 
     def passthrough_outputs(data, output, undo_refs):

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
+from ase.geometry import complete_cell
 from ase.geometry.minkowski_reduction import minkowski_reduce
 
 
@@ -37,6 +38,12 @@ def wrap_positions(
     pos_np = np.asarray(pos, dtype=np.float64)
     cell_np = np.asarray(cell, dtype=np.float64)
     pbc_np = np.broadcast_to(np.asarray(pbc, dtype=bool), (3,)).copy()
+    if not pbc_np.any():
+        return np.array(pos, copy=True)
+
+    if (pbc_np & (cell_np == 0).all(axis=1)).any():
+        raise ValueError("Periodic lattice vectors must be nonzero")
+    cell_np = complete_cell(cell_np)
     frac = np.linalg.solve(cell_np.T, pos_np.T).T
     for i in range(3):
         if pbc_np[i]:
@@ -63,9 +70,48 @@ def wrap_positions_torch(
     Returns:
         Wrapped positions, shape (n_atoms, 3).
     """
-    frac = torch.linalg.solve(cell.transpose(1, 2), pos.unsqueeze(-1)).squeeze(-1)
-    frac = torch.where(pbc, frac % 1.0, frac)
-    return (frac.unsqueeze(1) @ cell).squeeze(1)
+    periodic = pbc.any(dim=1)
+    if not bool(periodic.any()):
+        return pos.clone()
+    active_cell = cell[periodic]
+    active_pos = pos[periodic]
+    # Lattice image numbers are piecewise constant. Only the final lattice
+    # translation needs the autograd graph.
+    with torch.no_grad():
+        missing = (active_cell == 0).all(dim=-1)
+        if bool(missing.any()):
+            if bool((pbc[periodic] & missing).any()):
+                raise ValueError("Periodic lattice vectors must be nonzero")
+            # Solve full cells directly. For a missing vacuum vector, solve
+            # for the projection onto the span of the present rows. Thin QR
+            # avoids squaring the condition number of narrow skew cells.
+            patterns = (
+                missing.long() * missing.new_tensor([1, 2, 4], dtype=torch.long)
+            ).sum(1)
+            frac = torch.zeros_like(active_pos)
+            for pattern in patterns.unique().tolist():
+                systems = torch.where(patterns == pattern)[0]
+                if pattern == 0:
+                    frac[systems] = torch.linalg.solve(
+                        active_cell[systems].transpose(1, 2),
+                        active_pos[systems].unsqueeze(-1),
+                    ).squeeze(-1)
+                    continue
+                axes = [i for i in range(3) if not (pattern & (1 << i))]
+                basis = active_cell[systems][:, axes]
+                q, r = torch.linalg.qr(basis.transpose(1, 2), mode="reduced")
+                projected = q.transpose(1, 2) @ active_pos[systems].unsqueeze(-1)
+                frac[systems[:, None], axes] = torch.linalg.solve(r, projected).squeeze(
+                    -1
+                )
+        else:
+            frac = torch.linalg.solve(
+                active_cell.transpose(1, 2), active_pos.unsqueeze(-1)
+            ).squeeze(-1)
+        images = torch.where(pbc[periodic], frac.floor(), 0)
+    result = pos.clone()
+    result[periodic] = active_pos - (images.unsqueeze(1) @ active_cell).squeeze(1)
+    return result
 
 
 def compute_minkowski_op(
@@ -111,64 +157,104 @@ def minimum_image_displacement(
 
     Args:
         dr: Displacement vectors, shape (n_atoms, 3).
-        cell: Unit cells — either per-system (n_systems, 3, 3) when ``batch``
-            is provided, or per-atom (n_atoms, 3, 3).
+        cell: Unit cells, per system when batch is supplied, per atom, or
+            one shared cell of shape (3, 3) or (1, 3, 3).
         pbc: Periodic flags — either per-system (n_systems, 3) when ``batch``
             is provided, or per-atom (n_atoms, 3).
         batch: System index for each atom, shape (n_atoms,).  When provided,
             ``cell`` and ``pbc`` are per-system and will be expanded
             internally.
         minkowski_op: Precomputed Minkowski reduction operators, per-system
-            (n_systems, 3, 3).  If ``None``, computed on the fly.
+            (n_systems, 3, 3). Recompute when the cell or periodic axes
+            change. If ``None``, computed on the fly.
 
     Returns:
         Minimum-image displacements, shape (n_atoms, 3).
     """
-    if not pbc.any():
+    if not len(dr):
         return dr
-
-    if batch is not None:
-        pbc_per_atom = torch.atleast_2d(pbc)[batch]
-        cell_per_atom = cell[batch]
-    else:
-        pbc_per_atom = pbc
-        cell_per_atom = cell
-
-    eye = torch.eye(3, dtype=cell_per_atom.dtype, device=cell_per_atom.device)
-    off_diag_max = (cell_per_atom * (1.0 - eye)).abs().max()
-    if off_diag_max < 1e-10:
-        diag = torch.diagonal(cell_per_atom, dim1=1, dim2=2)
-        frac = dr / diag
-        frac = torch.where(pbc_per_atom, frac - torch.round(frac), frac)
-        return frac * diag
-
-    system_cell = cell if batch is not None else cell_per_atom
-    system_pbc = torch.atleast_2d(pbc) if batch is not None else pbc_per_atom
+    if cell.ndim == 2:
+        cell = cell.unsqueeze(0)
+    pbc = torch.atleast_2d(pbc)
+    if batch is None:
+        if len(cell) == 1 and len(pbc) == 1:
+            # One shared lattice: every displacement belongs to system zero.
+            batch = torch.zeros(len(dr), dtype=torch.long, device=dr.device)
+        elif len(cell) in (1, len(dr)):
+            cell = cell.expand(len(dr), -1, -1)
+        else:
+            raise ValueError(
+                "Supply a shared cell or one cell per displacement when batch is omitted"
+            )
+    pbc = pbc.expand(len(cell), 3)
     if minkowski_op is not None:
-        ops = minkowski_op if batch is None else minkowski_op
-        rcell_system = torch.bmm(ops.to(dtype=system_cell.dtype), system_cell)
-    else:
-        rcell_system = _minkowski_reduce_batched(system_cell, system_pbc)
-    if batch is not None:
-        rcell = rcell_system[batch]
-    else:
-        rcell = rcell_system
-
-    frac = torch.linalg.solve(rcell.transpose(1, 2), dr.unsqueeze(-1)).squeeze(-1)
-    frac = torch.where(pbc_per_atom, frac - torch.floor(frac + 0.5), frac)
-
-    r = torch.tensor([-1, 0, 1], dtype=frac.dtype, device=frac.device)
-    shifts = torch.cartesian_prod(r, r, r)
-
-    shifts_masked = shifts.unsqueeze(0) * pbc_per_atom.unsqueeze(1).to(frac.dtype)
-
-    candidates_frac = frac.unsqueeze(1) + shifts_masked
-
-    candidates_cart = torch.bmm(candidates_frac, rcell)
-
-    lengths = torch.linalg.norm(candidates_cart, dim=2)
-    indices = torch.argmin(lengths, dim=1)
-    return candidates_cart[torch.arange(dr.shape[0], device=dr.device), indices]
+        minkowski_op = minkowski_op.expand(len(cell), -1, -1)
+    # Eight patterns suffice. A zero cell in a nonperiodic system must never
+    # enter a solve or division. Distinct axis-aligned cells share the fast path.
+    powers = torch.tensor([1, 2, 4], device=pbc.device)
+    patterns = (pbc.long() * powers).sum(-1)
+    diagonal = cell - torch.diag_embed(cell.diagonal(dim1=-2, dim2=-1))
+    patterns = patterns + 8 * (diagonal == 0).all(dim=(1, 2)).long()
+    groups = torch.unique(patterns).tolist()
+    if all(pattern % 8 == 0 for pattern in groups):
+        return dr
+    dtype = torch.promote_types(dr.dtype, cell.dtype)
+    dr, cell = dr.to(dtype), cell.to(dtype)
+    result = dr.clone()
+    for pattern in groups:
+        if pattern % 8 == 0:
+            continue
+        sys_indices = torch.where(patterns == pattern)[0]
+        if batch is None:
+            atom_indices = sys_indices
+            local = torch.arange(len(sys_indices), device=dr.device)
+        else:
+            atom_indices = torch.where(patterns[batch] == pattern)[0]
+            local = torch.searchsorted(sys_indices, batch[atom_indices])
+        axes = [i for i in range(3) if pattern & (1 << i)]
+        cells = cell[sys_indices]
+        vectors = dr[atom_indices]
+        if pattern >= 8:
+            lengths = cells.diagonal(dim1=-2, dim2=-1)[local][:, axes]
+            if bool((lengths == 0).any()):
+                raise ValueError("Periodic lattice vectors must be nonzero")
+            wrapped = vectors.clone()
+            coordinates = vectors[:, axes]
+            wrapped[:, axes] = coordinates - (coordinates / lengths).round() * lengths
+        else:
+            if len(axes) > 1:
+                if minkowski_op is None:
+                    cells = _minkowski_reduce_batched(cells, pbc[sys_indices])
+                else:
+                    cells = minkowski_op[sys_indices].to(cells) @ cells
+            basis = cells[:, axes]
+            # Project onto the periodic subspace. Full-cell fractional
+            # coordinates depend on arbitrary vacuum vectors for partial PBC.
+            if len(axes) == 3:
+                dual = torch.linalg.inv(basis).transpose(1, 2)
+            else:
+                dual = torch.linalg.solve(basis @ basis.transpose(1, 2), basis)
+            frac = (dual[local] @ vectors.unsqueeze(-1)).squeeze(-1)
+            image = (frac + 0.5).floor()
+            centered = vectors - (image.unsqueeze(1) @ basis[local]).squeeze(1)
+            wrapped = centered
+            if len(axes) > 1:
+                signs = dr.new_tensor([-1, 0, 1])
+                shifts = torch.cartesian_prod(*([signs] * len(axes)))
+                translations = shifts @ basis
+                # All images have the same displacement normal to the periodic
+                # subspace. Including its squared norm can erase the entire
+                # difference between neighboring images in floating point.
+                projected = (
+                    centered
+                    if len(axes) == 3
+                    else ((frac - image).unsqueeze(1) @ basis[local]).squeeze(1)
+                )
+                candidates = projected[:, None] + translations[local]
+                best = candidates.square().sum(-1).argmin(-1)
+                wrapped = centered + translations[local, best]
+        result[atom_indices] = wrapped
+    return result
 
 
 def _minkowski_reduce_batched(
@@ -193,12 +279,13 @@ def _minkowski_reduce_batched(
     pbc_cpu = pbc.detach().cpu()
     n = cell.shape[0]
 
-    ops = torch.empty(n, 3, 3, dtype=cell.dtype, device=cell.device)
-    for i in range(n):
-        _, op = minkowski_reduce(cell_cpu[i].numpy(), pbc=pbc_cpu[i].numpy())
-        ops[i] = torch.tensor(op, dtype=cell.dtype, device=cell.device)
-
-    return torch.bmm(ops, cell)
+    ops = np.stack(
+        [
+            minkowski_reduce(cell_cpu[i].numpy(), pbc=pbc_cpu[i].numpy())[1]
+            for i in range(n)
+        ]
+    )
+    return cell.new_tensor(ops) @ cell
 
 
 def _wrap_torch(
@@ -214,8 +301,8 @@ def _wrap_torch(
         pbc_tensor = pos.new_full((n, 3), pbc, dtype=torch.bool)
     else:
         pbc_tensor = torch.as_tensor(pbc, dtype=torch.bool, device=pos.device)
-        if pbc_tensor.dim() == 1:
-            pbc_tensor = pbc_tensor.unsqueeze(0).expand(n, -1)
+        if pbc_tensor.dim() < 2:
+            pbc_tensor = pbc_tensor.expand(n, 3)
         elif pbc_tensor.dim() == 2 and pbc_tensor.shape[0] == 1:
             pbc_tensor = pbc_tensor.expand(n, -1)
     return wrap_positions_torch(pos, cell_batched, pbc_tensor)

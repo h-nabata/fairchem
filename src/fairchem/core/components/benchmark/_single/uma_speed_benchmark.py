@@ -12,7 +12,7 @@ import json
 import logging
 import os
 import random
-import timeit
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 
@@ -44,20 +44,40 @@ def seed_everywhere(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
 
 
 def get_qps(data, predictor, warmups: int = 10, timeiters: int = 10, repeats: int = 5):
-    def timefunc():
-        predictor.predict(data)
-        # torch.cuda.synchronize()
-        torch.distributed.barrier()
-
+    if warmups < 0 or timeiters < 1 or repeats < 1:
+        raise ValueError("warmups must be nonnegative and timeiters/repeats positive")
+    device = torch.device(predictor.device)
+    backend = getattr(torch, device.type) if device.type in {"cuda", "xpu"} else None
+    distributed = (
+        torch.distributed.is_available() and torch.distributed.is_initialized()
+    )
     for _ in range(warmups):
-        timefunc()
-        logging.info(f"memory allocated: {torch.cuda.memory_allocated()/(1024**3)}")
-
-    result = timeit.repeat(timefunc, number=timeiters, repeat=repeats)
+        predictor.predict(data)
+    if backend is not None:
+        backend.synchronize(device)
+        logging.info(
+            "Allocated bytes after warmup: %s", backend.memory_allocated(device)
+        )
+    result = []
+    for _ in range(repeats):
+        if distributed:
+            torch.distributed.barrier()
+        start = time.perf_counter()
+        for _ in range(timeiters):
+            predictor.predict(data)
+        if backend is not None:
+            backend.synchronize(device)
+        elapsed = time.perf_counter() - start
+        if distributed:
+            # Gloo collectives use CPU tensors, including in XPU jobs.
+            rank_device = "cpu" if torch.distributed.get_backend() == "gloo" else device
+            slowest = torch.tensor(elapsed, device=rank_device, dtype=torch.float32)
+            torch.distributed.all_reduce(slowest, op=torch.distributed.ReduceOp.MAX)
+            elapsed = slowest.item()
+        result.append(elapsed)
     logging.info(
         f"Timing results over {repeats} repeats: {result}, mean: {np.mean(result)}, std: {np.std(result)}"
     )
@@ -74,7 +94,10 @@ def trace_handler(p, name, save_loc):
 
 
 def make_profile(data, predictor, name, save_loc):
-    activities = [ProfilerActivity.CPU, ProfilerActivity.CUDA]
+    device = torch.device(predictor.device)
+    activities = [ProfilerActivity.CPU]
+    if device.type in {"cuda", "xpu"}:
+        activities.append(getattr(ProfilerActivity, device.type.upper()))
     profile_schedule, total_profile_steps = get_profile_schedule(active=5)
     tc = functools.partial(trace_handler, name=name, save_loc=save_loc)
 
@@ -83,12 +106,13 @@ def make_profile(data, predictor, name, save_loc):
         schedule=profile_schedule,
         on_trace_ready=tc,
     ) as p:
-        torch.distributed.barrier()
+        distutils.synchronize()
         for i in range(total_profile_steps):
             predictor.predict(data)
             logging.info(f"done step {i}")
-            with record_function(f"final_barrier_{i}"):
-                torch.distributed.barrier()
+            if device.type in {"cuda", "xpu"}:
+                with record_function(f"device_sync_{i}"):
+                    getattr(torch, device.type).synchronize(device)
             p.step()
 
 
@@ -272,7 +296,7 @@ class InferenceBenchRunner(Runner):
                     radius=cutoff,
                 )
                 del predictor
-                torch.cuda.empty_cache()
+
             else:
                 from_ase_kwargs = dict(task_name=self.dataset_name)
                 del predictor
@@ -338,7 +362,12 @@ class InferenceBenchRunner(Runner):
                     raise
                 finally:
                     # Free GPU memory after each input
-                    torch.cuda.empty_cache()
+                    del predictor
+                    device = torch.device(self.device)
+                    if device.type in {"cuda", "xpu"}:
+                        backend = getattr(torch, device.type)
+                        with backend.device(device):
+                            backend.empty_cache()
 
         # Save results to file
         if distutils.is_master():

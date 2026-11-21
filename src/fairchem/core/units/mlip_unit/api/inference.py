@@ -7,11 +7,16 @@ file in the root directory of this source tree.
 
 from __future__ import annotations
 
+import copy
+import math
+from collections.abc import Collection, Mapping
 from dataclasses import asdict, dataclass, field, replace
+from numbers import Integral, Real
 
 import torch  # - needed at runtime for dataclass field type resolution
 
 from fairchem.core.common.utils import StrEnum
+from fairchem.core.units.mlip_unit.api.series_b import SeriesBSettings
 
 
 class UMATask(StrEnum):
@@ -95,7 +100,9 @@ def validate_uma_atoms_data(atoms, task_name: str, logger=None) -> None:
 
     # Validate charge range
     charge = atoms.info["charge"]
-    if not isinstance(charge, (int, np.integer)):
+    if isinstance(charge, (bool, np.bool_)) or not isinstance(
+        charge, (int, np.integer)
+    ):
         raise TypeError(
             f"Invalid type for charge: {type(charge)}. "
             "Charge must be an integer representing the total charge on the system."
@@ -108,7 +115,7 @@ def validate_uma_atoms_data(atoms, task_name: str, logger=None) -> None:
 
     # Validate spin range
     spin = atoms.info["spin"]
-    if not isinstance(spin, (int, np.integer)):
+    if isinstance(spin, (bool, np.bool_)) or not isinstance(spin, (int, np.integer)):
         raise TypeError(
             f"Invalid type for spin: {type(spin)}. "
             "Spin must be an integer representing the spin multiplicity."
@@ -160,6 +167,22 @@ class InferenceSettings:
     # Flag to enable or disable the compilation of the inference model.
     compile: bool = False
 
+    # Compile numerical geometry, radial and message-passing cores when graph
+    # construction and derivative heads should remain eager. Neither scope
+    # enables reduced-precision options.
+    compile_scope: str = "model"
+    compile_dynamic: bool = True
+
+    # Opt-in, shape-specific XPU graph replay of tensor-only numerical blocks.
+    # Higher-order derivative requests always use the eager callable.
+    xpu_graph: bool = False
+    xpu_graph_cache_size: int = 1
+
+    # Prepared models are independent copies keyed by exact elemental counts,
+    # charge/spin/task and runtime configuration. Zero disables this cache.
+    mole_cache_size: int = 0
+    mole_cache_max_bytes: int | None = None
+
     # Deprecated
     # Flag to enable or disable the use of CUDA Graphs for compute
     # This flag is no longer used and will be removed in future versions
@@ -174,7 +197,20 @@ class InferenceSettings:
     # version 3 uses Nvidia alchemi library's neighbor list.
     internal_graph_gen_version: int = 2
 
-    # Number of internal torch threads to use for inference
+    # Exact graph acceleration: skin caches candidate topology only. Distances,
+    # physical cutoff filtering and neighbor limits are evaluated every call.
+    neighbor_skin: float = 0.0
+    neighbor_cache_entries: int = 1
+    neighbor_cache_max_bytes: int | None = None
+
+    # Trade packed GEMM throughput for a smaller frozen weight/activation set.
+    compact_angular_weights: bool = False
+    radial_layer_group_size: int | None = None
+    graph_search_method: str = "cell"
+    graph_edge_order: str = "original"
+
+    # CPU intra-op threads (process-wide). Does not configure PyTorch's one-shot
+    # inter-op pool. Leave None when the application manages thread policy.
     torch_num_threads: int | None = None
 
     # Used for padding edges during inference, this is useful to reduce recompiling time during dynamic inference runs
@@ -201,6 +237,8 @@ class InferenceSettings:
     # Execution backend mode for the backbone.
     # Set to "general" for the default execution mode that works across all models and hardware.
     # Set to "umas_fast_pytorch" to enable block-diagonal SO2 GEMM conversion for faster inference.
+    # "umas_portable" uses compact PyTorch blocks; "umas_fast_portable" also
+    # enables compact geometry and lazy radial projection across accelerators.
     # Set to "umas_fast_gpu" to enable highly optimized backend with triton kernels for maximum speed.
     # If None, the predictor will decide the best execution mode based on the model and hardware capabilities (e.g., will choose "umas_fast_gpu" for uma-s if running on compatible Nvidia GPU).
     execution_mode: str | None = None
@@ -217,6 +255,11 @@ class InferenceSettings:
     # Disable for backends whose custom backward operators lack vmap rules.
     # The loop uses less memory but performs one backward pass per force component.
     hessian_vmap: bool = True
+    hessian_chunk_size: int = 64
+
+    # None preserves all checkpoint/default outputs. A per-call request can
+    # override this tuple without mutating the predictor's shared settings.
+    requested_properties: tuple[str, ...] | None = None
 
     # When True, allow backbones to add their default untrained tasks
     # (e.g., eSCNMDBackbone adds stress for all energy tasks by default)
@@ -228,12 +271,146 @@ class InferenceSettings:
     # VRAM but allow bigger systems; reduce if you run into OOM errors.
     max_atoms: int | None = None
 
+    # Approximation is opt-in and travels with model/server cache identity.
+    series_b: SeriesBSettings | dict = field(default_factory=SeriesBSettings)
+
     def __post_init__(self):
+        if isinstance(self.series_b, Mapping):
+            self.series_b = SeriesBSettings(**dict(self.series_b))
+        if not isinstance(self.series_b, SeriesBSettings):
+            raise ValueError("series_b must be a SeriesBSettings instance or mapping")
+        self.series_b.__post_init__()
+        if self.series_b.enabled:
+            if self.execution_mode is None:
+                self.execution_mode = "general"
+            if self.execution_mode != "general":
+                raise ValueError("Series B currently requires execution_mode='general'")
+            if self.compile or self.xpu_graph or self.nitro:
+                raise ValueError(
+                    "Series B currently requires compile, xpu_graph and nitro disabled"
+                )
+            if self.activation_checkpointing:
+                raise ValueError(
+                    "Series B currently requires activation_checkpointing=False"
+                )
+            if self.base_precision_dtype in (torch.float64, "float64"):
+                if not self.series_b.fp64_saved_features_only:
+                    raise ValueError(
+                        "FP64 Series B only supports saved_feature_dtype='fp32' "
+                        "with all other approximations disabled"
+                    )
+            elif self.base_precision_dtype not in (torch.float32, "float32"):
+                raise ValueError("Series B requires float32 or supported FP64 settings")
+            elif self.series_b.saved_feature_dtype == "fp32":
+                raise ValueError(
+                    "saved_feature_dtype='fp32' requires FP64 base precision"
+                )
+            if self.tf32:
+                raise ValueError("Use the separate series_b.onednn_tf32 option for XPU")
+            if self.series_b.low_rank_fraction is not None and not self.merge_mole:
+                raise ValueError(
+                    "Series B low-rank compression requires merge_mole=True"
+                )
+        for name in (
+            "tf32",
+            "activation_checkpointing",
+            "merge_mole",
+            "compile",
+            "compile_dynamic",
+            "compact_angular_weights",
+            "xpu_graph",
+            "external_graph_gen",
+            "use_quaternion_wigner",
+            "nitro",
+            "hessian_vmap",
+            "auto_add_default_untrained_tasks",
+        ):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be a boolean")
+        if self.compile_scope not in {"model", "blocks"}:
+            raise ValueError("compile_scope must be 'model' or 'blocks'")
+        for name in (
+            "xpu_graph_cache_size",
+            "neighbor_cache_entries",
+            "hessian_chunk_size",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, Integral) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+            setattr(self, name, int(value))
+        if (
+            isinstance(self.mole_cache_size, bool)
+            or not isinstance(self.mole_cache_size, Integral)
+            or self.mole_cache_size < 0
+        ):
+            raise ValueError("mole_cache_size must be a nonnegative integer")
+        self.mole_cache_size = int(self.mole_cache_size)
+        for name in (
+            "mole_cache_max_bytes",
+            "neighbor_cache_max_bytes",
+            "radial_layer_group_size",
+            "edge_chunk_size",
+            "torch_num_threads",
+            "max_atoms",
+        ):
+            value = getattr(self, name)
+            if value is not None:
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, Integral)
+                    or value < 1
+                ):
+                    raise ValueError(f"{name} must be a positive integer")
+                setattr(self, name, int(value))
+        if (
+            isinstance(self.neighbor_skin, bool)
+            or not isinstance(self.neighbor_skin, Real)
+            or not math.isfinite(self.neighbor_skin)
+            or self.neighbor_skin < 0
+        ):
+            raise ValueError("neighbor_skin must be finite and nonnegative")
+        self.neighbor_skin = float(self.neighbor_skin)
+        if self.graph_search_method == "allpairs":
+            self.graph_search_method = "all_pairs"
+        if self.graph_search_method not in {"cell", "auto", "all_pairs", "bvh"}:
+            raise ValueError("Unsupported graph_search_method")
+        if self.graph_edge_order not in {"original", "spatial"}:
+            raise ValueError("graph_edge_order must be 'original' or 'spatial'")
+        if self.requested_properties is not None:
+            if isinstance(
+                self.requested_properties, (str, bytes, Mapping)
+            ) or not isinstance(self.requested_properties, Collection):
+                raise ValueError(
+                    "requested_properties must be a sequence of names, not a string"
+                )
+            self.requested_properties = tuple(self.requested_properties)
+            if not self.requested_properties or any(
+                not isinstance(prop, str) or not prop
+                for prop in self.requested_properties
+            ):
+                raise ValueError("requested_properties must contain property names")
         if isinstance(self.base_precision_dtype, str):
-            self.base_precision_dtype = getattr(torch, self.base_precision_dtype)
-            assert (
-                self.base_precision_dtype in ALLOWED_DTYPES
-            ), f"base_precision_dtype must be one of {ALLOWED_DTYPES}, got {self.base_precision_dtype}"
+            self.base_precision_dtype = getattr(torch, self.base_precision_dtype, None)
+        if (
+            not isinstance(self.base_precision_dtype, torch.dtype)
+            or self.base_precision_dtype not in ALLOWED_DTYPES
+        ):
+            raise ValueError(
+                f"base_precision_dtype must be one of {ALLOWED_DTYPES}, got {self.base_precision_dtype}"
+            )
+        for name in (
+            "predict_untrained_forces",
+            "predict_untrained_stress",
+            "predict_untrained_hessian",
+        ):
+            value = getattr(self, name)
+            if (
+                isinstance(value, (str, bytes, Mapping))
+                or not isinstance(value, Collection)
+                or any(not isinstance(dataset, str) or not dataset for dataset in value)
+            ):
+                raise ValueError(f"{name} must be a collection of dataset names")
+            setattr(self, name, set(value))
 
     def to_omegaconf(self) -> dict:
         """
@@ -244,6 +421,12 @@ class InferenceSettings:
         back to a torch.dtype when InferenceSettings is reinstantiated.
         """
         config = asdict(self)
+        for name in (
+            "predict_untrained_forces",
+            "predict_untrained_stress",
+            "predict_untrained_hessian",
+        ):
+            config[name] = sorted(config[name])
         config["base_precision_dtype"] = str(self.base_precision_dtype).replace(
             "torch.", ""
         )
@@ -279,6 +462,44 @@ def inference_settings_batch():
         compile=False,
         external_graph_gen=False,
         internal_graph_gen_version=2,
+    )
+
+
+def inference_settings_xpu():
+    """
+    FP32 eager inference on a single Intel GPU using portable PyTorch operations.
+
+    MOLE merging reduces repeated work for fixed-composition simulations. XPU
+    compilation is opt-in until numerical and performance checks pass on the
+    target GPU; CUDA-specific Nitro and Triton kernels are not used.
+    """
+    return InferenceSettings(
+        tf32=False,
+        activation_checkpointing=False,
+        merge_mole=True,
+        compile=False,
+        internal_graph_gen_version=2,
+        execution_mode="general",
+    )
+
+
+def inference_settings_fp64():
+    """
+    FP64 eager inference with exact MoLE merging and portable model operations.
+
+    Suitable for CPU, CUDA and XPU devices with working FP64 operators. XPU
+    construction probes the selected device before loading model weights. This
+    does not enable reduced-precision saved features or other Series B settings.
+    Compilation and graph replay remain explicit, separately validated options.
+    """
+    return InferenceSettings(
+        tf32=False,
+        activation_checkpointing=False,
+        merge_mole=True,
+        compile=False,
+        internal_graph_gen_version=2,
+        execution_mode="general",
+        base_precision_dtype=torch.float64,
     )
 
 
@@ -330,6 +551,9 @@ NAME_TO_INFERENCE_SETTING = {
     "multigpu": inference_settings_multigpu(),
     "traineval": inference_settings_traineval(),
     "nitro": inference_settings_nitro(),
+    "xpu": inference_settings_xpu(),
+    "fp64": inference_settings_fp64(),
+    "xpu-fp64": inference_settings_fp64(),
 }
 
 
@@ -337,13 +561,19 @@ def describe_inference_settings(settings: InferenceSettings) -> str:
     """
     A preset's name, or the full settings on one line.
 
-    "default" is an alias of "nitro", so it reports the mode that runs. Presets
+    "default" aliases "nitro" and "xpu-fp64" aliases the portable "fp64" preset,
+    so aliases report their canonical mode. Presets
     leave execution_mode to automatic backend selection, which fills it in when
-    the model loads, so the comparison ignores it.
+    the model loads, so the comparison accepts a resolved mode for those presets. Explicit
+    backend choices on presets such as xpu must still match.
     """
     auto_backend = replace(settings, execution_mode=None)
     for name, preset in NAME_TO_INFERENCE_SETTING.items():
-        if name != "default" and auto_backend == preset:
+        if name != "default" and (
+            settings == preset
+            if preset.execution_mode is not None
+            else auto_backend == preset
+        ):
             return name
     return repr(settings)
 
@@ -359,7 +589,11 @@ def guess_inference_settings(settings: str | InferenceSettings):
         assert (
             settings in NAME_TO_INFERENCE_SETTING
         ), f"inference setting name must be one of {NAME_TO_INFERENCE_SETTING.keys()}"
-        return NAME_TO_INFERENCE_SETTING[settings]
+        # Named presets are shared templates. A caller may customize a returned
+        # setting (including its mutable derivative-task sets) before creating
+        # a predictor; that must not contaminate subsequent jobs or the presets
+        # used to describe active settings.
+        return copy.deepcopy(NAME_TO_INFERENCE_SETTING[settings])
     elif isinstance(settings, InferenceSettings):
         return settings
     else:

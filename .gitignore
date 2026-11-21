@@ -144,3 +144,6 @@ package-lock.json
 bulks.pkl
 # MyST build outputs
 _build
+
+# Numerical regression results and local candidate reports
+regression-artifacts/

@@ -1,0 +1,369 @@
+"""
+Copyright (c) Meta Platforms, Inc. and affiliates.
+
+This source code is licensed under the MIT license found in the
+LICENSE file in the root directory of this source tree.
+"""
+
+from __future__ import annotations
+
+import copy
+import gc
+import json
+import weakref
+from dataclasses import replace
+from types import SimpleNamespace
+
+import pytest
+import torch
+from ase.build import molecule
+from ase.io import write
+
+from fairchem.core.scripts import compare_series_b as script
+from fairchem.core.units.mlip_unit.api.inference import inference_settings_xpu
+from fairchem.core.units.mlip_unit.api.series_b import SeriesBSettings
+from tests.core.units.mlip_unit.test_predict_interoperability import _public_predictor
+from tests.core.units.mlip_unit.test_xpu_preparation import _data
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt])
+def test_retained_comparison_error_releases_private_predictor(monkeypatch, error_type):
+    references = []
+
+    class FailingPredictor:
+        device = "cpu"
+
+        def __init__(self, settings):
+            self.inference_settings = settings
+            self.bound = self.predict
+
+        def predict(self, data, requested_properties):
+            raise error_type("comparison interrupted")
+
+    def load(name, *, device, inference_settings):
+        predictor = FailingPredictor(inference_settings)
+        references.append(weakref.ref(predictor))
+        return predictor
+
+    monkeypatch.setattr(script.pretrained_mlip, "get_predict_unit", load)
+    with pytest.raises(error_type, match="comparison interrupted") as recorded:
+        script.run_comparison(
+            "unused.pt",
+            molecule("H2O"),
+            task="omol",
+            device="cpu",
+            series_b={"weight_bits": 8},
+            warmup=0,
+            repeats=1,
+        )
+    gc.collect()
+    assert recorded.value is not None
+    assert references
+    assert all(reference() is None for reference in references)
+
+
+def test_real_uma_comparison_reports_errors_without_claiming_qualification():
+    reference, candidate = _public_predictor(), _public_predictor()
+    candidate.inference_settings = replace(
+        candidate.inference_settings,
+        series_b=SeriesBSettings(gemm_precision="bf16", low_precision_emulation=True),
+    )
+    data = _data()
+    before = data.clone()
+    report = script.compare_predictors(
+        reference,
+        candidate,
+        data,
+        properties=("energy", "forces", "hessian"),
+        warmup=0,
+        repeats=2,
+    )
+    assert report["success"]
+    assert report["finite"]
+    assert not report["accuracy_qualified"]
+    assert report["candidate"]["cpu_low_precision_emulation"]
+    assert report["candidate"]["approximation_manifest"]["linear"]["converted"]
+    assert len(report["candidate"]["timing"]["seconds"]) == 2
+    assert report["candidate"]["allocator_memory"] is None
+    assert report["errors"]["forces"]["shape"] == [3, 3]
+    assert report["errors"]["hessian"]["shape"] == [9, 9]
+    assert report["errors"]["energy"]["max_absolute_error"] > 0
+    torch.testing.assert_close(data.pos, before.pos, rtol=0, atol=0)
+    assert not data.pos.requires_grad
+    json.dumps(report, allow_nan=False)
+
+
+@pytest.mark.parametrize(
+    "dtype,options_json",
+    [
+        ("float32", '{"weight_bits":8}'),
+        ("float64", '{"saved_feature_dtype":"fp32","saved_feature_min_elements":1}'),
+    ],
+)
+def test_cli_json_file_options_load_independent_models_sequentially(
+    tmp_path, monkeypatch, dtype, options_json
+):
+    previous, settings_seen = [], []
+
+    def load(name, *, device, inference_settings):
+        assert name == "tiny-uma.pt"
+        assert device == "cpu"
+        if previous:
+            assert previous[-1]() is None
+        predictor = _public_predictor()
+        predictor.inference_settings = copy.deepcopy(inference_settings)
+        original_predict = predictor.predict
+
+        def checked_predict(data, **kwargs):
+            assert data.pos.dtype == getattr(torch, dtype)
+            return original_predict(data, **kwargs)
+
+        predictor.predict = checked_predict
+        previous.append(weakref.ref(predictor))
+        settings_seen.append(copy.deepcopy(inference_settings))
+        return predictor
+
+    monkeypatch.setattr(script.pretrained_mlip, "get_predict_unit", load)
+    atoms = molecule("H2O")
+    source, options, output = (
+        tmp_path / "water.xyz",
+        tmp_path / "options.json",
+        tmp_path / "report.json",
+    )
+    write(source, atoms)
+    options.write_text(options_json)
+    assert (
+        script.main(
+            [
+                "--checkpoint",
+                "tiny-uma.pt",
+                "--structure",
+                str(source),
+                "--task",
+                "omol",
+                "--device",
+                "cpu",
+                "--dtype",
+                dtype,
+                "--series-b",
+                f"@{options}",
+                "--output",
+                str(output),
+                "--warmup",
+                "0",
+                "--repeats",
+                "1",
+            ]
+        )
+        == 0
+    )
+    report = json.loads(output.read_text())
+    assert report["success"]
+    assert not report["accuracy_qualified"]
+    assert not settings_seen[0].series_b.enabled
+    assert settings_seen[1].base_precision_dtype == getattr(torch, dtype)
+    if dtype == "float64":
+        assert settings_seen[1].series_b.saved_feature_dtype == "fp32"
+        assert report["candidate"]["output_dtypes"]["forces"] == "torch.float64"
+    else:
+        assert settings_seen[1].series_b.weight_bits == 8
+    assert all(reference() is None for reference in previous)
+    assert "Sequential" in report["memory_scope"]
+    assert report["natoms"] == 3
+    assert report["task"] == "omol"
+    assert "charge" not in atoms.info
+    assert "spin" not in atoms.info
+
+
+def test_cli_reports_failure_as_json_and_nonzero_status(tmp_path, monkeypatch):
+    output = tmp_path / "error.json"
+    monkeypatch.setattr(
+        script.pretrained_mlip,
+        "get_predict_unit",
+        lambda *a, **k: pytest.fail("invalid options must fail before loading"),
+    )
+    assert (
+        script.main(
+            [
+                "--checkpoint",
+                "unused.pt",
+                "--structure",
+                "unused.xyz",
+                "--task",
+                "omol",
+                "--series-b",
+                "[]",
+                "--output",
+                str(output),
+            ]
+        )
+        == 1
+    )
+    report = json.loads(output.read_text())
+    assert not report["success"]
+    assert not report["accuracy_qualified"]
+    assert report["error"]["type"] == "ValueError"
+
+
+def test_error_metrics_have_no_broadcasting_or_zero_reference_division():
+    reference = {"forces": torch.zeros(2, 3, dtype=torch.float64)}
+    candidate = {"forces": torch.ones(2, 3, dtype=torch.float64)}
+    result = script._error_report(reference, candidate)["forces"]
+    assert result["max_absolute_error"] == result["rms_error"] == 1
+    assert result["reference_l2_norm"] == 0
+    assert result["relative_l2_error"] is None
+    with pytest.raises(ValueError, match="shape mismatch"):
+        script._error_report(reference, {"forces": torch.ones(1, 3)})
+    with pytest.raises(FloatingPointError, match="Nonfinite"):
+        script._snapshot({"energy": torch.tensor([float("nan")])}, ("energy",), 2)
+    with pytest.raises(ValueError, match="shape"):
+        script._snapshot({"forces": torch.ones(1, 3)}, ("forces",), 2)
+
+
+def test_measurement_synchronizes_selected_device_and_resets_memory_windows(
+    monkeypatch,
+):
+    events = []
+    settings = inference_settings_xpu()
+    predictor = SimpleNamespace(device="xpu:2", inference_settings=settings)
+
+    def predict(data, requested_properties):
+        events.append("predict")
+        assert not torch.is_autocast_enabled("xpu")
+        return {"energy": torch.zeros(1)}
+
+    def allocator(device, *, reset=False):
+        events.append(("memory", str(device), reset))
+        return {"peak_allocated_bytes": 100}
+
+    predictor.predict = predict
+    monkeypatch.setattr(script, "_allocator", allocator)
+    monkeypatch.setattr(
+        script, "_synchronize", lambda device: events.append(("sync", str(device)))
+    )
+    _, result = script._measure_predictor(predictor, _data(), ("energy",), 1, 2, True)
+    assert events.count("predict") == 4  # cold + warmup + two measured calls
+    assert events.count(("memory", "xpu:2", True)) == 2
+    for index, event in enumerate(events):
+        if event == "predict":
+            assert events[index - 1] == events[index + 1] == ("sync", "xpu:2")
+    assert result["allocator_memory"]["steady"]["after"]["peak_allocated_bytes"] == 100
+    assert result["timing"]["repeats"] == 2
+
+
+def test_comparison_requires_independent_strict_reference_and_valid_counts():
+    reference, candidate = _public_predictor(), _public_predictor()
+    with pytest.raises(ValueError, match="independent"):
+        script.compare_predictors(reference, reference, _data())
+    for kwargs in (
+        {"warmup": -1},
+        {"repeats": 0},
+        {"repeats": True},
+        {"properties": "energy,energy"},
+    ):
+        with pytest.raises(ValueError):
+            script.compare_predictors(reference, candidate, _data(), **kwargs)
+    reference.inference_settings.tf32 = True
+    with pytest.raises(ValueError, match="strict FP32"):
+        script.compare_predictors(reference, candidate, _data())
+
+
+def test_outer_cpu_autocast_does_not_reduce_reference_precision(monkeypatch):
+    reference, candidate = _public_predictor(), _public_predictor()
+    calls = []
+    for predictor in (reference, candidate):
+        original = predictor._run_inference
+
+        def checked(*args, original=original, **kwargs):
+            calls.append(torch.is_autocast_enabled("cpu"))
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(predictor, "_run_inference", checked)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        report = script.compare_predictors(
+            reference, candidate, _data(), warmup=0, repeats=1
+        )
+        assert torch.is_autocast_enabled("cpu")
+    assert calls == [False] * 4
+    assert report["errors"]["energy"]["max_absolute_error"] < 1e-6
+    assert report["errors"]["forces"]["max_absolute_error"] < 1e-6
+
+
+def test_fp64_comparison_reports_derivative_error_without_changing_forward_precision(
+    monkeypatch,
+):
+    measure = script._measure_predictor
+
+    def matched_rolls(*args, **kwargs):
+        # General UMA samples a random edge-frame roll on each forward, even
+        # in eval mode. Independent rolls can differ at roundoff even for A/A;
+        # pair them to test saved-feature compression's exact forward contract.
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(42)
+            return measure(*args, **kwargs)
+
+    monkeypatch.setattr(script, "_measure_predictor", matched_rolls)
+    reference, candidate = _public_predictor(), _public_predictor()
+    reference.inference_settings = replace(
+        reference.inference_settings, base_precision_dtype=torch.float64
+    )
+    candidate.inference_settings = replace(
+        reference.inference_settings,
+        series_b=SeriesBSettings(
+            saved_feature_dtype="fp32", saved_feature_min_elements=1
+        ),
+    )
+    data = _data()
+    data.pos = data.pos.double()
+    data.cell = data.cell.double()
+    report = script.compare_predictors(
+        reference,
+        candidate,
+        data,
+        properties=("energy", "forces", "hessian"),
+        warmup=0,
+        repeats=1,
+    )
+    assert report["success"]
+    assert not report["accuracy_qualified"]
+    for side in ("reference", "candidate"):
+        assert report[side]["settings"]["base_precision_dtype"] == "float64"
+        assert set(report[side]["output_dtypes"].values()) == {"torch.float64"}
+    assert report["errors"]["energy"]["max_absolute_error"] == 0
+    assert report["errors"]["forces"]["max_absolute_error"] > 0
+    assert report["errors"]["hessian"]["max_absolute_error"] > 0
+
+
+def test_comparison_rejects_mixed_base_precision_before_predicting():
+    reference, candidate = _public_predictor(), _public_predictor()
+    candidate.inference_settings = replace(
+        candidate.inference_settings, base_precision_dtype=torch.float64
+    )
+    with pytest.raises(ValueError, match="same base precision"):
+        script.compare_predictors(reference, candidate, _data())
+
+
+def test_fp64_comparison_checks_device_support_before_checkpoint_load(monkeypatch):
+    from fairchem.core.units.mlip_unit import inference_runtime
+
+    monkeypatch.setattr(torch.xpu, "is_available", lambda: True)
+
+    def unsupported(device):
+        assert device == torch.device("xpu:0")
+        raise RuntimeError("FP64 unsupported")
+
+    monkeypatch.setattr(inference_runtime, "probe_fp64_support", unsupported)
+    monkeypatch.setattr(
+        script.pretrained_mlip,
+        "get_predict_unit",
+        lambda *a, **kw: pytest.fail("Probe must precede checkpoint loading"),
+    )
+    with pytest.raises(RuntimeError, match="FP64 unsupported"):
+        script.run_comparison(
+            "unused.pt",
+            molecule("H2O"),
+            task="omol",
+            device="xpu:0",
+            base_precision_dtype=torch.float64,
+            series_b=SeriesBSettings(saved_feature_dtype="fp32"),
+        )

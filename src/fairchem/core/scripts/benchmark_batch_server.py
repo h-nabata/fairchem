@@ -35,17 +35,21 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import os
+import platform
 import statistics
 import sys
 import time
 from concurrent.futures import as_completed
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 import matplotlib.pyplot as plt
 import torch
 from ase.build import bulk
+from ase.calculators.calculator import all_changes
 from monty.dev import requires
 
 try:
@@ -57,6 +61,7 @@ except ImportError:
 
 from fairchem.core import FAIRChemCalculator, pretrained_mlip
 from fairchem.core.calculate._batch import AutobatchConfig, InferenceBatcher
+from fairchem.core.common.distutils import parse_device
 from fairchem.core.datasets.atomic_data import AtomicData
 
 if TYPE_CHECKING:
@@ -116,6 +121,42 @@ def build_workload(count: int, natoms_target: int) -> list[Atoms]:
 # ---------------------------------------------------------------------------
 # Worker: kept at module scope so it stays picklable for process/ray backends
 # ---------------------------------------------------------------------------
+class _PredictorProxy:
+    """Preserve the predictor API and its optional capabilities under Ray serialization."""
+
+    def __init__(self, predictor):
+        self.predictor = predictor
+
+    def __getattr__(self, name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return getattr(object.__getattribute__(self, "predictor"), name)
+
+
+class _CountedPredictor(_PredictorProxy):
+    """Attach one shared system-level identifier to each successful batched call."""
+
+    def predict(self, data, *args, **kwargs):
+        predictions = self.predictor.predict(data, *args, **kwargs)
+        token = torch.tensor(list(uuid4().bytes), dtype=torch.uint8, device="cpu")
+        return {**predictions, "_benchmark_call": token.expand(data.num_graphs, -1)}
+
+
+class _RequestObservation(_PredictorProxy):
+    def __init__(self, predictor):
+        super().__init__(predictor)
+        self.call_ids = []
+        self.returned = set()
+
+    def predict(self, data, *args, **kwargs):
+        predictions = dict(self.predictor.predict(data, *args, **kwargs))
+        token = predictions.pop("_benchmark_call", None)
+        if token is not None:
+            self.call_ids.append(bytes(token.reshape(-1).cpu().tolist()).hex())
+        self.returned.update(predictions)
+        return predictions
+
+
 def timed_calculate(atoms: Atoms, task_name: str, predict_unit) -> dict[str, Any]:
     """
     Compute energy and forces for one system and time the call.
@@ -129,11 +170,20 @@ def timed_calculate(atoms: Atoms, task_name: str, predict_unit) -> dict[str, Any
         Dict with the per-request ``latency_s`` and the system's ``natoms``.
     """
     atoms = atoms.copy()
-    atoms.calc = FAIRChemCalculator(predict_unit, task_name=task_name)
+    observation = _RequestObservation(predict_unit)
+    atoms.calc = FAIRChemCalculator(observation, task_name=task_name)
     t0 = time.perf_counter()
-    atoms.get_potential_energy()
-    atoms.get_forces()
-    return {"latency_s": time.perf_counter() - t0, "natoms": len(atoms)}
+    atoms.calc.calculate(
+        atoms, properties=["energy", "forces"], system_changes=all_changes
+    )
+    if any(key not in atoms.calc.results for key in ("energy", "forces")):
+        raise ValueError("Both energy and forces must be returned")
+    return {
+        "latency_s": time.perf_counter() - t0,
+        "natoms": len(atoms),
+        "predictor_call_ids": observation.call_ids,
+        "returned_properties": sorted(observation.returned),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -153,11 +203,9 @@ def _summarize(
     Returns:
         Dict with ``qps``, ``wall_time_s``, ``count`` and latency stats.
     """
-    p95 = (
-        statistics.quantiles(latencies, n=20)[-1]
-        if len(latencies) > 1
-        else latencies[0]
-    )
+    if count != len(latencies) or not count:
+        raise ValueError("A latency measurement is required for each request")
+    p95 = sorted(latencies)[math.ceil(0.95 * count) - 1]
     return {
         "qps": count / wall_time_s if wall_time_s > 0 else float("inf"),
         "wall_time_s": wall_time_s,
@@ -165,6 +213,8 @@ def _summarize(
         "mean_latency_s": statistics.fmean(latencies),
         "median_latency_s": statistics.median(latencies),
         "p95_latency_s": p95,
+        "max_latency_s": max(latencies),
+        "calculator_calls": count,
     }
 
 
@@ -186,11 +236,19 @@ def run_serial(
 ) -> dict[str, float | int]:
     """Run predictions one at a time and return summary statistics."""
     t0 = time.perf_counter()
-    latencies = [
-        timed_calculate(atoms, task_name, predict_unit)["latency_s"]
-        for atoms in workload
-    ]
-    return _summarize(latencies, time.perf_counter() - t0, len(workload))
+    records = [timed_calculate(atoms, task_name, predict_unit) for atoms in workload]
+    return _request_metrics(records, time.perf_counter() - t0)
+
+
+def _request_metrics(records, elapsed):
+    summary = _summarize([r["latency_s"] for r in records], elapsed, len(records))
+    summary["successful_predictor_calls"] = len(
+        {token for row in records for token in row["predictor_call_ids"]}
+    )
+    summary["returned_property_sets"] = sorted(
+        {tuple(sorted(row["returned_properties"])) for row in records}
+    )
+    return summary
 
 
 def run_batched(
@@ -208,7 +266,7 @@ def run_batched(
     ]
     results = _collect(futures)
     wall_time = time.perf_counter() - t0
-    return _summarize([r["latency_s"] for r in results], wall_time, len(workload))
+    return _request_metrics(results, wall_time)
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +285,7 @@ def sweep_batch_server(
     min_batch_size: int = 512,
     max_batch_size_cap: int = 4096,
     run_name: str | None = None,
+    device: str | None = None,
 ) -> dict[str, Any]:
     """
     Sweep concurrency x system size against the batch server.
@@ -249,8 +308,23 @@ def sweep_batch_server(
     Returns:
         Aggregated results dictionary (also written to JSON).
     """
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    selected = parse_device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    if selected.type not in {"cpu", "cuda"}:
+        raise ValueError("The Ray batch server supports CPU and CUDA devices")
+    if selected.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("Requested CUDA device is unavailable")
+        index = (
+            torch.cuda.current_device() if selected.index is None else selected.index
+        )
+        selected = torch.device("cuda", index)
+        device_name = torch.cuda.get_device_name(selected)
+    else:
+        device_name = platform.processor() or platform.machine()
+    device = str(selected)
     predict_unit = pretrained_mlip.get_predict_unit(model_name, device=device)
+    predict_unit.inference_settings.requested_properties = ("energy", "forces")
+    predict_unit = _CountedPredictor(predict_unit)
 
     autobatch_config = AutobatchConfig(
         min_batch_size=min_batch_size,
@@ -265,6 +339,10 @@ def sweep_batch_server(
         "model": model_name,
         "task": task_name,
         "device": device,
+        "serial_device_name": device_name,
+        "serial_device_index": selected.index,
+        "requested_properties": ["energy", "forces"],
+        "percentile_method": "nearest_rank",
         "concurrency_backend": concurrency_backend,
         "num_replicas": num_replicas,
         "natoms_list": natoms_list,
@@ -292,7 +370,7 @@ def sweep_batch_server(
             logging.info(
                 f"Autobatch: max_batch_size={autobatch.max_batch_size}, "
                 f"timeout={autobatch.batch_wait_timeout_s:.4f}s, "
-                f"median_latency={autobatch.median_latency_s:.4f}s"
+                f"median_latency_s={autobatch.median_latency_s}"
             )
 
             # Warmup the server so probe/JIT costs don't pollute timings.
@@ -301,6 +379,13 @@ def sweep_batch_server(
                     build_workload(warmup_requests, natoms_target),
                     task_name,
                     batcher,
+                )
+
+            if warmup_requests:
+                run_serial(
+                    build_workload(warmup_requests, natoms_target),
+                    task_name,
+                    batcher.predict_unit,
                 )
 
             # Serial baseline (bounded sample); QPS is ~constant in the workload
@@ -317,19 +402,22 @@ def sweep_batch_server(
 
             concurrency = []
             for num_requests in num_requests_list:
+                workload = build_workload(num_requests, natoms_target)
+                matched_serial = run_serial(workload, task_name, batcher.predict_unit)
                 batched = run_batched(
-                    build_workload(num_requests, natoms_target),
+                    workload,
                     task_name,
                     batcher,
                 )
                 speedup = (
-                    batched["qps"] / serial["qps"]
-                    if serial["qps"] > 0
+                    batched["qps"] / matched_serial["qps"]
+                    if matched_serial["qps"] > 0
                     else float("inf")
                 )
                 concurrency.append(
                     {
                         "num_requests": num_requests,
+                        "matched_serial": matched_serial,
                         "batched": batched,
                         "speedup": speedup,
                     }
@@ -587,6 +675,11 @@ def main() -> int:
         default=None,
         help="Optional label included in plot titles and output directory.",
     )
+    parser.add_argument(
+        "--device",
+        choices=("cpu", "cuda"),
+        help="Local baseline and Ray accelerator type",
+    )
     args = parser.parse_args()
 
     # Initialize Ray early so setup_batch_predict_server reuses this instance.
@@ -619,6 +712,7 @@ def main() -> int:
     logging.info(f"Backend: {args.concurrency_backend}, replicas: {args.num_replicas}")
 
     aggregated = sweep_batch_server(
+        device=args.device,
         model_name=model_name,
         task_name=args.task,
         natoms_list=args.natoms,

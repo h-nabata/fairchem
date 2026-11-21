@@ -195,14 +195,15 @@ class TestAtomsToGraphs:
         # test converting a molecule with no unit cell
         molecule = Atoms("2N", [(0.0, 0.0, 0.0), (0.0, 0.0, 1.0)])
 
-        # this will raise a Singular Matrix Error because the cell doesn't exist
-        with pytest.raises(np.linalg.LinAlgError):
-            AtomicData.from_ase(
-                molecule,
-                max_neigh=200,
-                radius=6,
-                r_edges=True,
-            )
+        # Complete only the private graph-generation cell; the molecule remains
+        # nonperiodic and must not acquire image neighbors or a caller-owned box.
+        unboxed = AtomicData.from_ase(molecule, max_neigh=200, radius=6, r_edges=True)
+        assert not unboxed.pbc.any()
+        assert unboxed.edge_index.shape == (2, 2)
+        assert set(map(tuple, unboxed.edge_index.T.tolist())) == {(0, 1), (1, 0)}
+        assert not torch.count_nonzero(unboxed.cell_offsets)
+        np.testing.assert_array_equal(molecule.cell, np.zeros((3, 3)))
+        np.testing.assert_array_equal(unboxed.pos, molecule.positions)
         # now add a molecular box
         cell_size = 120.0
         converted_mol = AtomicData.from_ase(

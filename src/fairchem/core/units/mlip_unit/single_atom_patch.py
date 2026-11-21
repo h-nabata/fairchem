@@ -22,6 +22,7 @@ def single_atom_prediction_from_lookup(
     atom_refs: dict[str, dict],
     tasks: dict[str, Task],
     device: torch.device,
+    dtype: torch.dtype = torch.float32,
 ) -> dict[str, torch.Tensor] | None:
     """
     Handle prediction for single-atom systems without PBC.
@@ -48,6 +49,8 @@ def single_atom_prediction_from_lookup(
             single isolated atom (unsupported case).
     """
     # Identify single-atom systems (natoms==1 and pbc all False)
+    if data.natoms.numel() == 1 and data.atomic_numbers.numel() > 1:
+        return None
     is_single_atom = data.natoms == 1
     has_no_pbc = ~data.pbc.any(dim=1)
     single_atom_mask = is_single_atom & has_no_pbc
@@ -109,15 +112,11 @@ def single_atom_prediction_from_lookup(
             continue
         if task.property == "energy":
             pred_output[task_name] = torch.tensor(
-                [float(energy)], dtype=torch.float32, device=device
+                [float(energy)], dtype=dtype, device=device
             )
         elif task.property == "forces":
-            pred_output[task_name] = torch.zeros(
-                (1, 3), dtype=torch.float32, device=device
-            )
+            pred_output[task_name] = torch.zeros((1, 3), dtype=dtype, device=device)
         elif task.property == "stress":
-            pred_output[task_name] = torch.zeros(
-                (1, 9), dtype=torch.float32, device=device
-            )
+            pred_output[task_name] = torch.zeros((1, 9), dtype=dtype, device=device)
 
     return pred_output

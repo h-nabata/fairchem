@@ -7,19 +7,27 @@ LICENSE file in the root directory of this source tree.
 
 from __future__ import annotations
 
+import json
+import os
+import shutil
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
 import ase.units
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from fairchem.core.components.runner import _sync_directory
+
 if TYPE_CHECKING:
     from ase import Atoms
 
 from ase.calculators.calculator import PropertyNotImplementedError
+from ase.constraints import FixAtoms
 
 
 @dataclass
@@ -106,35 +114,40 @@ class TrajectoryFrame:
         Returns:
             TrajectoryFrame populated with atoms data
         """
-        try:
-            stress = atoms.get_stress()
-        except (PropertyNotImplementedError, RuntimeError):
-            stress = None
 
-        try:
-            energy = atoms.get_potential_energy()
-        except (PropertyNotImplementedError, RuntimeError):
-            energy = None
+        def property_value(name, getter):
+            if atoms.calc is None:
+                return None
+            try:
+                return getter()
+            except PropertyNotImplementedError:
+                return None
+            except Exception as exc:
+                exc.add_note(
+                    f"Reading {name} at MD step {step}, sid={atoms.info.get('sid')!r}"
+                )
+                raise
 
-        try:
-            forces = atoms.get_forces().copy()
-        except (PropertyNotImplementedError, RuntimeError):
-            forces = None
-
-        try:
-            velocities = atoms.get_velocities().copy()
-        except (PropertyNotImplementedError, RuntimeError):
-            velocities = None
-
-        try:
-            temperature = atoms.get_temperature()
-        except Exception:
-            temperature = None
-
-        try:
-            kinetic_energy = atoms.get_kinetic_energy()
-        except Exception:
-            kinetic_energy = None
+        # ASE may complete missing cell vectors for other operations, but
+        # stress and its derived pressure require a real physical volume.
+        # This guards only the optional stress read; energy and force failures
+        # must still surface, including for invalid periodic geometries.
+        cell = atoms.cell.copy()
+        volume = cell.volume if np.isfinite(cell).all() else 0.0
+        stress = (
+            property_value("stress", atoms.get_stress)
+            if np.isfinite(volume) and volume > 0
+            else None
+        )
+        energy = property_value("energy", atoms.get_potential_energy)
+        forces = property_value("forces", atoms.get_forces)
+        velocities = atoms.get_velocities()
+        kinetic_energy = atoms.get_kinetic_energy()
+        temperature = (
+            atoms.get_temperature()
+            if atoms.get_number_of_degrees_of_freedom() > 0
+            else None
+        )
 
         # Pressure from stress: P = -trace(stress)/3, converted to bar
         if stress is not None:
@@ -149,8 +162,6 @@ class TrajectoryFrame:
         # Fixed atoms: build bool mask from FixAtoms constraints
         fixed = None
         if atoms.constraints:
-            from ase.constraints import FixAtoms
-
             mask = np.zeros(len(atoms), dtype=bool)
             for constraint in atoms.constraints:
                 if isinstance(constraint, FixAtoms):
@@ -166,7 +177,7 @@ class TrajectoryFrame:
             time=time,
             atomic_numbers=atoms.get_atomic_numbers().copy(),
             positions=atoms.get_positions().copy(),
-            cell=atoms.get_cell()[:].copy(),
+            cell=cell.array,
             pbc=np.array(atoms.get_pbc()),
             velocities=velocities,
             energy=energy,
@@ -183,70 +194,220 @@ class TrajectoryFrame:
         )
 
 
-class ParquetTrajectoryWriter:
-    """
-    Buffered writer for MD trajectory data in parquet format.
+_FLOATS = pa.list_(pa.float64())
+_VECTORS = pa.list_(_FLOATS)
+_INTS = pa.list_(pa.int64())
+_TRAJECTORY_SCHEMA = pa.schema(
+    [
+        ("step", pa.int64()),
+        ("natoms", pa.int64()),
+        ("atomic_numbers", _INTS),
+        ("positions", _VECTORS),
+        ("cell", _VECTORS),
+        ("pbc", pa.list_(pa.bool_())),
+        ("sid", pa.string()),
+        ("sid_integer", pa.int64()),
+        ("time", pa.float64()),
+        ("velocities", _VECTORS),
+        ("energy", pa.float64()),
+        ("forces", _VECTORS),
+        ("stress", _FLOATS),
+        ("temperature", pa.float64()),
+        ("kinetic_energy", pa.float64()),
+        ("pressure", pa.float64()),
+        ("tags", _INTS),
+        ("fixed", pa.list_(pa.bool_())),
+        ("charge", pa.int64()),
+        ("spin", pa.int64()),
+    ],
+    metadata={b"fairchem.trajectory_version": b"1"},
+)
 
-    Uses PyArrow's ParquetWriter for efficient incremental writes
-    without read-modify-write overhead.
+
+def _trajectory_table(rows):
+    for row in rows:
+        sid = row.get("sid")
+        if isinstance(sid, (int, np.integer)):
+            row["sid_integer"] = int(sid)
+            row["sid"] = str(sid)
+    return pa.Table.from_pylist(rows, schema=_TRAJECTORY_SCHEMA)
+
+
+class ParquetTrajectoryWriter:
+    """Buffer row groups and seal an immutable Parquet part at each checkpoint.
+
+    The public output is a single ordinary Parquet file. A checkpoint identifies
+    exactly which parts belong to its history, even after a later restart.
     """
 
     def __init__(self, path: Path | str, flush_interval: int = 1000):
-        """
-        Initialize the parquet trajectory writer.
-
-        Args:
-            path: Path to the output parquet file
-            flush_interval: Number of frames to buffer before writing to disk
-        """
         self.path = Path(path)
-        self.total_frames = 0
         self.flush_interval = flush_interval
+        self.total_frames = 0
         self.buffer: list[dict] = []
+        self._directory = self.path.with_name(f".{self.path.name}.parts")
+        self._id = uuid4().hex
+        self._parts: list[dict] = []
         self._writer = None
-        self._schema = None
+        self._part = None
+        self._closed = False
+
+    def resume(self, step: int, state: dict | None) -> None:
+        """Select the committed prefix, or import a pre-versioned trajectory."""
+        if state is not None:
+            if state["version"] != 1:
+                raise ValueError("Unsupported trajectory checkpoint version")
+            parts = state["parts"]
+            if any(
+                Path(part["name"]).name != part["name"] or part["last_step"] > step
+                for part in parts
+            ):
+                raise ValueError("Invalid trajectory checkpoint parts")
+            same_output = str(self.path.resolve()) == state["output"]
+            if same_output or (parts and (self._directory / parts[0]["name"]).exists()):
+                previous_last = None
+                for part in parts:
+                    path = self._directory / part["name"]
+                    with pq.ParquetFile(path) as parquet:
+                        metadata = parquet.metadata
+                        first = metadata.row_group(0).column(0).statistics.min
+                        last = (
+                            metadata.row_group(metadata.num_row_groups - 1)
+                            .column(0)
+                            .statistics.max
+                        )
+                    if (
+                        part["rows"] != metadata.num_rows
+                        or part["first_step"] != first
+                        or part["last_step"] != last
+                        or (previous_last is not None and first <= previous_last)
+                    ):
+                        raise ValueError(
+                            f"Trajectory part {path} does not match its checkpoint index"
+                        )
+                    previous_last = last
+                self._parts = parts.copy()
+                self._id = state["id"]
+                self.total_frames = sum(part["rows"] for part in parts)
+                return
+            if self.path.exists():
+                raise ValueError(
+                    f"Existing trajectory {self.path} belongs to a different run"
+                )
+        elif self.path.exists():
+            with pq.ParquetFile(self.path) as previous:
+                for batch in previous.iter_batches(batch_size=128):
+                    rows = [row for row in batch.to_pylist() if row["step"] <= step]
+                    if rows:
+                        self._write_rows(rows)
+            self._seal_part()
 
     def append(self, frame: TrajectoryFrame) -> None:
-        """
-        Add frame to buffer, flush if interval reached.
-
-        Args:
-            frame: TrajectoryFrame to append
-        """
+        if self._closed:
+            raise ValueError("Cannot append to a closed trajectory")
         self.buffer.append(frame.to_dict())
         if len(self.buffer) >= self.flush_interval:
             self.flush()
 
-    def flush(self) -> None:
-        """
-        Write buffered frames as a new row group.
-        """
-        if not self.buffer:
-            return
-
-        table = pa.Table.from_pydict(
-            {k: [row[k] for row in self.buffer] for k in self.buffer[0]}
-        )
-
+    def _write_rows(self, rows):
+        first, last = rows[0]["step"], rows[-1]["step"]
+        previous = self._part or (self._parts[-1] if self._parts else None)
+        if previous and first <= previous["last_step"]:
+            raise ValueError(f"Trajectory step {first} follows {previous['last_step']}")
+        if any(a["step"] >= b["step"] for a, b in pairwise(rows)):
+            raise ValueError("Trajectory steps must increase")
+        table = _trajectory_table(rows)
         if self._writer is None:
-            self._schema = table.schema
-            self._writer = pq.ParquetWriter(self.path, self._schema, compression="zstd")
-
+            self._directory.mkdir(exist_ok=True)
+            name = f"{self._id}-{uuid4().hex}.parquet"
+            self._writer = pq.ParquetWriter(
+                self._directory / name, _TRAJECTORY_SCHEMA, compression="zstd"
+            )
+            self._part = {"name": name, "first_step": first, "rows": 0}
         self._writer.write_table(table)
-        self.total_frames += len(self.buffer)
-        self.buffer.clear()
+        self._part["last_step"] = last
+        self._part["rows"] += len(rows)
+        self.total_frames += len(rows)
+
+    def flush(self) -> None:
+        if self.buffer:
+            self._write_rows(self.buffer)
+            self.buffer.clear()
+
+    def _seal_part(self) -> None:
+        self.flush()
+        if self._writer is None:
+            return
+        self._writer.close()
+        with (self._directory / self._part["name"]).open("rb") as part:
+            os.fsync(part.fileno())
+        _sync_directory(self._directory)
+        _sync_directory(self.path.parent)
+        self._parts.append(self._part)
+        self._writer = self._part = None
+
+    def checkpoint(self) -> dict:
+        self._seal_part()
+        return {
+            "version": 1,
+            "id": self._id,
+            "output": str(self.path.resolve()),
+            "parts": self._parts.copy(),
+        }
 
     def close(self) -> None:
-        """
-        Flush remaining buffer and finalize.
-        """
-        self.flush()
+        if self._closed:
+            return
+        self._seal_part()
+        if self._parts:
+            temporary = self.path.with_name(f".{self.path.name}.{uuid4().hex}.tmp")
+            try:
+                if len(self._parts) == 1:
+                    source = self._directory / self._parts[0]["name"]
+                    try:
+                        os.link(source, temporary)
+                    except OSError:
+                        shutil.copyfile(source, temporary)
+                else:
+                    with pq.ParquetWriter(
+                        temporary, _TRAJECTORY_SCHEMA, compression="zstd"
+                    ) as output:
+                        for part in self._parts:
+                            with pq.ParquetFile(
+                                self._directory / part["name"]
+                            ) as parquet:
+                                for batch in parquet.iter_batches(batch_size=128):
+                                    output.write_batch(batch)
+                # Keep a complete index even when a fresh run reuses this path.
+                manifest = self._directory / f"{self._id}-{uuid4().hex}.json"
+                with manifest.open("x", encoding="utf-8") as file:
+                    json.dump(self.checkpoint(), file)
+                    file.flush()
+                    os.fsync(file.fileno())
+                _sync_directory(self._directory)
+                with temporary.open("rb") as file:
+                    os.fsync(file.fileno())
+                os.replace(temporary, self.path)
+                _sync_directory(self.path.parent)
+            finally:
+                temporary.unlink(missing_ok=True)
+        self._closed = True
+
+    def abort(self) -> None:
+        """Discard the uncommitted tail and keep all published output readable."""
+        self.buffer.clear()
         if self._writer is not None:
             self._writer.close()
+            (self._directory / self._part["name"]).unlink(missing_ok=True)
+            self._writer = self._part = None
+        self._closed = True
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
+        if exc_type is None:
+            self.close()
+        else:
+            self.abort()
         return False

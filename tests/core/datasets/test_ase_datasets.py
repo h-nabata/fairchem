@@ -235,3 +235,79 @@ def test_empty_dataset(tmp_path):
 
     with pytest.raises(ValueError):
         AseDBDataset(config={"src": str(tmp_path)})
+
+
+@pytest.mark.parametrize("use_index", [True, False])
+def test_trajectory_frame_selection_cache_and_path_spaces(
+    tmp_path, monkeypatch, use_index
+):
+    import ase.io
+
+    paths = [tmp_path / "run one.traj", tmp_path / "run two.traj"]
+    for path, count in zip(paths, (3, 4)):
+        with Trajectory(path, mode="w") as writer:
+            for i in range(count):
+                atoms = build.bulk("Cu", a=3.5 + 0.1 * i)
+                atoms.calc = SinglePointCalculator(atoms, energy=float(i))
+                writer.write(atoms)
+    cfg = dict(
+        src=str(tmp_path),
+        pattern="*.traj",
+        keep_in_memory=True,
+        include_relaxed_energy=True,
+        ase_read_args={"index": "1::2"},
+    )
+    if use_index:
+        index = tmp_path / "index"
+        index.write_text(f"{paths[0]} 3\n\n{paths[1]} 4\n")
+        cfg["index_file"] = str(index)
+    transforms = []
+
+    def transform(atoms):
+        transforms.append(len(atoms))
+        # A rigid translation preserves this synthetic scalar label. Reattach
+        # it explicitly to the transformed state, as a label-aware transform.
+        energy = atoms.get_potential_energy()
+        atoms.positions += 0.5
+        atoms.calc = SinglePointCalculator(atoms, energy=energy)
+        return atoms
+
+    dataset = AseReadMultiStructureDataset(cfg, atoms_transform=transform)
+    assert cfg["ase_read_args"] == {"index": "1::2"}
+    assert sorted(dataset.ids) == sorted(
+        [f"{paths[0]} 1", f"{paths[1]} 1", f"{paths[1]} 3"]
+    )
+    if use_index:
+        assert dataset.ids[1] == f"{paths[1]} 1"
+    reads = []
+    original = ase.io.read
+
+    def read(filename, *, index, **kwargs):
+        reads.append(index)
+        return original(filename, index=index, **kwargs)
+
+    monkeypatch.setattr(ase.io, "read", read)
+    i = dataset.ids.index(f"{paths[1]} 1")
+    first = dataset[i]
+    first.pos.add_(10)
+    second = dataset[i - len(dataset)]
+    assert reads == [1, -1]
+    assert len(transforms) == 2
+    assert second.energy_relaxed == 3
+    assert np.allclose(second.pos, 0.5)
+    dataset[dataset.ids.index(f"{paths[1]} 3")]
+    assert reads == [1, -1, 3]
+
+
+def test_db_ids_distinguish_sources_and_preserve_explicit_identifiers(tmp_path):
+    from ase import Atoms
+    from ase.db import connect
+
+    for name in ("first", "second"):
+        db = connect(tmp_path / f"{name}.db")
+        db.write(Atoms("H"))
+        db.write(Atoms("He"), sid=17)
+    dataset = AseDBDataset({"src": str(tmp_path)})
+    assert dataset[0].sid[0].endswith("first.db#1")
+    assert dataset[2].sid[0].endswith("second.db#1")
+    assert dataset[1].sid == ["17"]

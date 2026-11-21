@@ -1,0 +1,4 @@
+label: xpu-fp64
+preset: xpu-fp64
+predictor_scope: structure
+minimum_tier: FP64

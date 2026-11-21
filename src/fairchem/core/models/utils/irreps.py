@@ -10,7 +10,11 @@ from __future__ import annotations
 import torch
 
 
-def cg_change_mat(ang_mom: int, device: str = "cpu") -> torch.tensor:
+def cg_change_mat(
+    ang_mom: int,
+    device: str | torch.device = "cpu",
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
     if ang_mom not in [2]:
         raise NotImplementedError
 
@@ -38,6 +42,7 @@ def cg_change_mat(ang_mom: int, device: str = "cpu") -> torch.tensor:
                 [-(2 ** (-0.5)), 0, 0, 0, 0, 0, 0, 0, 2 ** (-0.5)],
             ],
             device=device,
+            dtype=dtype,
         ).detach()
 
     return change_mat

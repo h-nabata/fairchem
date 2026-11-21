@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from typing import TYPE_CHECKING, Any, Callable
 
 import torch
@@ -18,6 +19,9 @@ if TYPE_CHECKING:
 
     from torch.nn import Module
     from torch.utils.data import Dataset
+
+
+_CHECKPOINT_LOAD_LOCK = threading.RLock()
 
 
 def save_checkpoint(
@@ -42,7 +46,25 @@ def _load_check_duplicates(config: dict, name: str) -> dict[str, torch.nn.Module
     """
     modules = {}
     if "file" in config:
-        modules = torch.load(config["file"])
+        # These checkpoints contain modules written by save_checkpoint. Allow
+        # only our statistic containers, without enabling arbitrary pickle code.
+        # Local imports avoid the modules' imports of this helper at startup.
+        from .element_references import ElementReferences, LinearReferences
+        from .normalizer import Normalizer
+
+        # safe_globals adds/removes process-wide entries without reference
+        # counting. Retain prior caller registrations and serialize our loads.
+        with _CHECKPOINT_LOAD_LOCK:
+            existing = torch.serialization.get_safe_globals()
+            temporary = [
+                cls
+                for cls in (Normalizer, LinearReferences, ElementReferences)
+                if cls not in existing
+            ]
+            with torch.serialization.safe_globals(temporary):
+                modules = torch.load(
+                    config["file"], map_location="cpu", weights_only=True
+                )
         logging.info(f"Loaded {name} for the following targets: {list(modules.keys())}")
     # make sure that element-refs are not specified both as fit and file
     fit_targets = config["fit"]["targets"] if "fit" in config else []
@@ -103,10 +125,25 @@ def _load_from_config(
                     if target not in modules
                 ]
                 fit_kwargs.update(
-                    {k: v for k, v in config["fit"].items() if k != "targets"}
+                    {
+                        k: v
+                        for k, v in config["fit"].items()
+                        if k not in ("targets", "fitted")
+                    }
                 )
                 modules.update(fit_fun(targets=targets, dataset=dataset, **fit_kwargs))
                 config["fit"]["fitted"] = True
+            else:
+                configured_targets = set(config) - {"file", "fit"}
+                missing = set(config["fit"]["targets"]) - (
+                    set(modules) | configured_targets
+                )
+                if missing:
+                    raise ValueError(
+                        f"{name} are marked fitted but statistics for {sorted(missing)} "
+                        "were not loaded. Provide their saved file or explicit values, "
+                        "or set fit.fitted=False to fit again."
+                    )
         # if a single file for all outputs is not provided,
         # then check if a single file is provided for a specific output
         elif target != "file":

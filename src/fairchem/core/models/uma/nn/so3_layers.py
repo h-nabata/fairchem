@@ -38,6 +38,20 @@ class SO3_Linear(torch.nn.Module):
         self.register_buffer("expand_index", expand_index, persistent=False)
 
     def forward(self, input_embedding):
+        if self.lmax == 2 and getattr(self, "compact_weights", False):
+            # The 1, 3 and 5 magnetic components share a weight per degree.
+            # Separate linear operations avoid forming nine matrices per call.
+            return torch.cat(
+                [
+                    torch.nn.functional.linear(
+                        component, self.weight[l], self.bias if l == 0 else None
+                    )
+                    for l, component in enumerate(
+                        input_embedding.split((1, 3, 5), dim=1)
+                    )
+                ],
+                dim=1,
+            )
         weight = torch.index_select(
             self.weight, dim=0, index=self.expand_index
         )  # [(L_max + 1) ** 2, C_out, C_in]

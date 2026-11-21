@@ -8,7 +8,6 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 import functools
-from contextlib import suppress
 
 import torch
 import torch.nn as nn
@@ -20,10 +19,6 @@ from fairchem.core.models.uma.nn.mole import (
     norm_str_to_fn,
 )
 from fairchem.core.models.uma.nn.so2_layers import SO2_Convolution
-
-fairchem_cpp_found = False
-with suppress(ModuleNotFoundError):
-    fairchem_cpp_found = True
 
 
 class MOLEInterface:
@@ -56,10 +51,11 @@ def recursive_replace_so2_MOLE(model, replacement_factory):
         if isinstance(child, torch.nn.Module):
             recursive_replace_so2_MOLE(child, replacement_factory)
         if isinstance(child, SO2_Convolution):
-            target_device = child.fc_m0.weights.device
-            child.fc_m0 = replacement_factory(child.fc_m0).to(target_device)
+            if isinstance(child.fc_m0, (MOLE, MOLEDGL)):
+                child.fc_m0 = replacement_factory(child.fc_m0)
             for so2_module in child.so2_m_conv:
-                so2_module.fc = replacement_factory(so2_module.fc).to(target_device)
+                if isinstance(so2_module.fc, (MOLE, MOLEDGL)):
+                    so2_module.fc = replacement_factory(so2_module.fc)
 
 
 def recursive_replace_so2_linear(model, replacement_factory):
@@ -140,9 +136,6 @@ def replace_linear_with_MOLE(
         return cache[layer_identifier]
 
     if mole_layer_type == "dgl":
-        assert (
-            fairchem_cpp_found
-        ), "Cannot use DGL layer type if fairchem_cpp package is not available"
         layer = MOLEDGL(
             num_experts=num_experts,
             global_mole_tensors=global_mole_tensors,
@@ -261,3 +254,9 @@ def convert_model_to_MOLE_model(
         )
     else:
         raise ValueError(f"Not a valid mole_type {mole_type}")
+
+    for block in model.blocks:
+        # Existing checkpoints may be converted in place. Refresh the routing
+        # table on the next checkpointed forward after changing the linears.
+        if hasattr(block.edge_wise, "_checkpoint_mole_states"):
+            del block.edge_wise._checkpoint_mole_states

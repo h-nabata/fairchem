@@ -102,8 +102,26 @@ def conditional_grad(dec):
         def cls_method(self, *args, **kwargs):
             f = func
             if hasattr(self, "regress_config"):
-                regress_forces = self.regress_config.forces
+                regress_forces = any(
+                    getattr(self.regress_config, name, False)
+                    for name in ("forces", "stress", "hessian")
+                )
                 direct_forces = self.regress_config.direct_forces
+                data = args[0] if args else kwargs.get("data", kwargs.get("data_dict"))
+                request = (
+                    data.get(
+                        "_requested_properties",
+                        getattr(self, "requested_properties", None),
+                    )
+                    if hasattr(data, "get")
+                    else None
+                )
+                if request is not None:
+                    regress_forces = bool(
+                        set(request).intersection(
+                            {"forces", "stress", "hessian", "hessian_vector_product"}
+                        )
+                    )
             else:
                 regress_forces = self.regress_forces
                 direct_forces = getattr(self, "direct_forces", 0)
@@ -206,20 +224,30 @@ def setup_imports(config: dict | None = None) -> None:
     if has_already_setup:
         return
 
-    try:
-        project_root = _get_project_root()
-        logging.info(f"Project root: {project_root}")
-        importlib.import_module("fairchem.core.common.logger")
+    project_root = _get_project_root()
+    logging.info(f"Project root: {project_root}")
+    importlib.import_module("fairchem.core.common.logger")
 
-        import_keys = ["trainers", "datasets", "models", "tasks"]
-        for key in import_keys:
-            for f in (project_root / "core" / key).rglob("*.py"):
-                _import_local_file(f, project_root=project_root)
+    # These implementation packages do not register models. Importing them
+    # eagerly initializes CUDA-specific kernels and allocator settings even
+    # for CPU/XPU callers. Their execution backends import them on demand.
+    lazy_implementation_dirs = (
+        project_root / "core" / "models" / "uma" / "triton",
+        project_root / "core" / "models" / "uma" / "uma_nitro",
+    )
+    import_keys = ["trainers", "datasets", "models", "tasks"]
+    for key in import_keys:
+        for f in (project_root / "core" / key).rglob("*.py"):
+            if any(f.is_relative_to(path) for path in lazy_implementation_dirs):
+                continue
+            _import_local_file(f, project_root=project_root)
 
-        if not skip_experimental_imports:
-            setup_experimental_imports(project_root)
-    finally:
-        registry.register("imports_setup", True)
+    if not skip_experimental_imports:
+        setup_experimental_imports(project_root)
+
+    # A failed import must remain retryable instead of advertising a partially
+    # initialized registry as ready.
+    registry.register("imports_setup", True)
 
 
 def debug_log_entry_exit(func):

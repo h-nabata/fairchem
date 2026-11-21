@@ -7,18 +7,28 @@ LICENSE file in the root directory of this source tree.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 from dataclasses import dataclass
 from importlib import resources
 from typing import TYPE_CHECKING, Literal
 
+import torch
 from huggingface_hub import hf_hub_download
 from omegaconf import OmegaConf
 
 from fairchem.core import calculate
 from fairchem.core._config import CACHE_DIR
+from fairchem.core.common.distutils import parse_device, resolve_xpu_device
 from fairchem.core.units.mlip_unit import MLIPPredictUnit, load_predict_unit
+from fairchem.core.units.mlip_unit.api.inference import guess_inference_settings
+from fairchem.core.units.mlip_unit.inference_runtime import (
+    _preflight_fp64,
+    probe_fp64_support,
+    validate_xpu_policy,
+)
+from fairchem.core.units.mlip_unit.series_b_runtime import validate_series_b
 
 if TYPE_CHECKING:
     from fairchem.core.units.mlip_unit import InferenceSettings
@@ -72,7 +82,7 @@ class ResolvedCheckpoint:
     form_elem_refs: dict | None = None
 
 
-def pretrained_checkpoint_path_from_name(model_name: str):
+def pretrained_checkpoint_path_from_name(model_name: str, cache_dir: str = CACHE_DIR):
     try:
         model_checkpoint = _MODEL_CKPTS.checkpoints[model_name]
     except KeyError as err:
@@ -84,7 +94,7 @@ def pretrained_checkpoint_path_from_name(model_name: str):
         repo_id=model_checkpoint.repo_id,
         subfolder=model_checkpoint.subfolder,
         revision=model_checkpoint.revision,
-        cache_dir=CACHE_DIR,
+        cache_dir=cache_dir,
     )
     return checkpoint_path
 
@@ -101,7 +111,7 @@ def resolve_checkpoint(
 
     Args:
         name_or_path: A name from available_models or a path to a checkpoint file.
-        cache_dir: Folder where reference energy files are stored.
+        cache_dir: Folder containing checkpoint weights and reference energies.
 
     Returns:
         The resolved checkpoint path and any reference energies.
@@ -111,7 +121,9 @@ def resolve_checkpoint(
             nor an existing file.
     """
     if name_or_path in _MODEL_CKPTS.checkpoints:
-        checkpoint_path = pretrained_checkpoint_path_from_name(name_or_path)
+        checkpoint_path = pretrained_checkpoint_path_from_name(
+            name_or_path, cache_dir=cache_dir
+        )
         if _MODEL_CKPTS.checkpoints[name_or_path].atom_refs is not None:
             atom_refs = get_reference_energies(name_or_path, "atom_refs", cache_dir)
         else:
@@ -135,7 +147,7 @@ def get_predict_unit(
     model_name: str,
     inference_settings: InferenceSettings | str = "default",
     overrides: dict | None = None,
-    device: Literal["cuda", "cpu"] | None = None,
+    device: str | None = None,
     cache_dir: str = CACHE_DIR,
     workers: int = 1,
     seed: int = 41,
@@ -154,10 +166,14 @@ def get_predict_unit(
             compile with TF32 matrix multiplies on CUDA. "high-precision" uses
             merge_mole + compile in full FP32. "multigpu" and "high-precision" fall
             back automatically if their fixed-input contract is broken. "batch" keeps
-            MOLE unmerged for heterogeneous inputs. More advanced use cases can use a
-            custom InferenceSettings object.
+            MOLE unmerged for heterogeneous inputs. "fp64" (alias "xpu-fp64") uses
+            portable FP64 eager inference with MOLE merging; explicitly selected
+            XPU devices are probed before downloading weights. More advanced use
+            cases can use a custom InferenceSettings object.
         overrides: Optional dictionary of settings to override default inference settings.
-        device: Optional torch device to load the model onto. If None, uses the default device.
+        device: Optional device ("cpu", "cuda", "xpu", or "xpu:<index>").
+            If None, prefers CUDA, then XPU, then CPU. On XPU, "default" selects
+            FP32 eager inference with portable PyTorch operations and MOLE merging.
         cache_dir: Path to folder where model files will be stored. Default is "~/.cache/fairchem"
         workers: Number of parallel workers for prediction unit. Default is 1. If greater than 1,
             we will instantiate a ParallelMLIPPredictUnit instead of the normal predict unit.
@@ -171,18 +187,44 @@ def get_predict_unit(
         UnknownCheckpointError: If model_name is neither a registered model name nor
             an existing file. Subclasses KeyError and ValueError.
     """
+    # Fail before authentication/download if an explicit Intel device cannot
+    # serve the request. The predictor performs the same check on local loads.
+    evidence = None
+    if device is not None and parse_device(device).type == "xpu":
+        if workers != 1 or gp_config is not None:
+            raise ValueError(
+                "XPU inference supports workers=1 without graph parallelism."
+            )
+        device = resolve_xpu_device(device)
+        # Validate a private settings copy before fetching weights. FP64 support
+        # depends on the installed driver/operator stack, not just discovery of
+        # the device. The constructor repeats this check for direct local loads.
+        settings = copy.deepcopy(
+            guess_inference_settings(
+                "xpu" if inference_settings == "default" else inference_settings
+            )
+        )
+        settings.__post_init__()
+        validate_xpu_policy(settings)
+        validate_series_b(settings, device)
+        if settings.base_precision_dtype == torch.float64:
+            evidence = (device, probe_fp64_support(device))
     checkpoint = resolve_checkpoint(model_name, cache_dir)
-    return load_predict_unit(
-        checkpoint.path,
-        inference_settings,
-        overrides,
-        device,
-        checkpoint.atom_refs,
-        checkpoint.form_elem_refs,
-        workers,
-        seed,
-        gp_config=gp_config,
-    )
+    token = _preflight_fp64.set(evidence)
+    try:
+        return load_predict_unit(
+            checkpoint.path,
+            inference_settings,
+            overrides,
+            device,
+            checkpoint.atom_refs,
+            checkpoint.form_elem_refs,
+            workers,
+            seed,
+            gp_config=gp_config,
+        )
+    finally:
+        _preflight_fp64.reset(token)
 
 
 def get_reference_energies(

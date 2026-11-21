@@ -1,0 +1,72 @@
+{
+  "torch": "2.15.0+cpu",
+  "device": "cpu",
+  "threads": 2,
+  "scope": "server output splitting only, E/F/stress, 16384 atoms; no model inference or GPU transfer",
+  "measurements": [
+    {
+      "systems": 1,
+      "atoms": 16384,
+      "baseline_median_ms": 0.27108099311590195,
+      "revised_median_ms": 0.01689499185886234
+    },
+    {
+      "systems": 8,
+      "atoms": 16384,
+      "baseline_median_ms": 4.290390299865976,
+      "revised_median_ms": 0.36925741500454023
+    },
+    {
+      "systems": 32,
+      "atoms": 16384,
+      "baseline_median_ms": 6.0603275007451884,
+      "revised_median_ms": 0.6576195009984076
+    }
+  ],
+  "date": "2026-11-09",
+  "baseline_commit": "7b404662ef606c132e26c099b22712c0eba081c9",
+  "limitations": "CPU component benchmark on a shared executor; no native GPU transfer/model inference measured; timings are not MD/GPU speedup estimates.",
+  "graph_neighbor_adapter": {
+    "torch": "2.15.0+cpu",
+    "device": "cpu",
+    "threads": 2,
+    "atoms": 10000,
+    "capacity": 128,
+    "cap": 6,
+    "cutoff": 2.0,
+    "repetitions": 10,
+    "median_ms": {
+      "baseline": 28.108268495998345,
+      "patched": 25.728888998855837
+    },
+    "samples_ms": {
+      "baseline": [
+        25.477161994786,
+        27.757083997130394,
+        28.925904000061564,
+        28.459452994866297,
+        34.68856800463982,
+        37.69838099833578,
+        31.046671007061377,
+        26.231727009871975,
+        23.531572995125316,
+        26.566854008706287
+      ],
+      "patched": [
+        21.498464993783273,
+        27.209944993956015,
+        22.38910300366115,
+        35.707816990907304,
+        31.943976995535195,
+        33.459019992733374,
+        30.960942996898666,
+        23.805738004739396,
+        21.137030998943374,
+        24.24783300375566
+      ]
+    },
+    "baseline_torch_profile_peak_bytes": 39073244,
+    "patched_torch_profile_peak_bytes": 26672191,
+    "scope": "Native CPU nvalchemi graph adapter; profiler-tracked PyTorch CPU allocations only, excluding native Warp/driver allocations and whole-process RSS. Interleaved timings overlap on a shared executor; not evidence of GPU acceleration."
+  }
+}

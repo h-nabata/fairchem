@@ -78,9 +78,11 @@ class EquivariantLayerNormArray(nn.Module):
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(lmax={self.lmax}, num_channels={self.num_channels}, eps={self.eps})"
 
-    @torch.autocast("cuda", enabled=False)
-    @torch.autocast("cpu", enabled=False)
     def forward(self, node_input):
+        with torch.autocast(device_type=node_input.device.type, enabled=False):
+            return self._forward(node_input)
+
+    def _forward(self, node_input):
         """
         Assume input is of shape [N, sphere_basis, C]
         """
@@ -181,9 +183,11 @@ class EquivariantLayerNormArraySphericalHarmonics(nn.Module):
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(lmax={self.lmax}, num_channels={self.num_channels}, eps={self.eps}, std_balance_degrees={self.std_balance_degrees})"
 
-    @torch.autocast("cuda", enabled=False)
-    @torch.autocast("cpu", enabled=False)
     def forward(self, node_input):
+        with torch.autocast(device_type=node_input.device.type, enabled=False):
+            return self._forward(node_input)
+
+    def _forward(self, node_input):
         """
         Assume input is of shape [N, sphere_basis, C]
         """
@@ -270,9 +274,11 @@ class EquivariantRMSNormArraySphericalHarmonics(nn.Module):
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(lmax={self.lmax}, num_channels={self.num_channels}, eps={self.eps})"
 
-    @torch.autocast("cuda", enabled=False)
-    @torch.autocast("cpu", enabled=False)
     def forward(self, node_input):
+        with torch.autocast(device_type=node_input.device.type, enabled=False):
+            return self._forward(node_input)
+
+    def _forward(self, node_input):
         """
         Assume input is of shape [N, sphere_basis, C]
         """
@@ -367,9 +373,11 @@ class EquivariantRMSNormArraySphericalHarmonicsV2(nn.Module):
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(lmax={self.lmax}, num_channels={self.num_channels}, eps={self.eps}, centering={self.centering}, std_balance_degrees={self.std_balance_degrees})"
 
-    @torch.autocast("cuda", enabled=False)
-    @torch.autocast("cpu", enabled=False)
     def forward(self, node_input):
+        with torch.autocast(device_type=node_input.device.type, enabled=False):
+            return self._forward(node_input)
+
+    def _forward(self, node_input):
         """
         Assume input is of shape [N, sphere_basis, C]
         """

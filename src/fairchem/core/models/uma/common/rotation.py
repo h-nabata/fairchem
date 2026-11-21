@@ -15,13 +15,15 @@ EPS = 1e-7
 class Safeacos(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x):
-        x_clamped = x.clamp(-1 + EPS, 1 - EPS)
-        ctx.save_for_backward(x_clamped)
+        # Save the input, not an intermediate created under the custom
+        # forward's no-grad context: higher derivatives must track x.
+        ctx.save_for_backward(x)
         return torch.acos(x)
 
     @staticmethod
     def backward(ctx, grad_output):
-        (x_clamped,) = ctx.saved_tensors
+        (x,) = ctx.saved_tensors
+        x_clamped = x.clamp(-1 + EPS, 1 - EPS)
         denom = torch.sqrt(1 - x_clamped.pow(2)).clamp(min=EPS)
         return -grad_output / denom
 

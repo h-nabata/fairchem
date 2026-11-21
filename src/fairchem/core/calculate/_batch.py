@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
 from functools import cached_property
 from multiprocessing import cpu_count
 from typing import TYPE_CHECKING, Literal, Protocol
@@ -28,6 +29,8 @@ from fairchem.core.components.batch_server import (
     AutobatchConfig,
     AutobatchResult,
     BatchConfig,
+    _owned_deployment,
+    delete_batch_predict_server,
     probe_optimal_batch_size,
     setup_batch_predict_server,
     update_batch_config,
@@ -142,10 +145,11 @@ class InferenceBatcher:
                     "upscale_delay_s": 5,  # Scale up quickly
                 }
         """
+        config = BatchConfig(max_batch_size, batch_wait_timeout_s, split_oom_batch)
         self.predict_unit = predict_unit
-        self.max_batch_size = max_batch_size
-        self.batch_wait_timeout_s = batch_wait_timeout_s
-        self.split_oom_batch = split_oom_batch
+        self.max_batch_size = config.max_batch_size
+        self.batch_wait_timeout_s = config.batch_wait_timeout_s
+        self.split_oom_batch = config.split_oom_batch
         self.num_replicas = num_replicas
         self.autoscaling_config = autoscaling_config
 
@@ -153,25 +157,6 @@ class InferenceBatcher:
         if deployment_name is None:
             deployment_name = f"predict-server-{uuid.uuid4().hex[:8]}"
         self.deployment_name = deployment_name
-
-        self.predict_server_handle = setup_batch_predict_server(
-            predict_unit=self.predict_unit,
-            deployment_config={
-                "ray_actor_options": ray_actor_options or {},
-                **(
-                    {"autoscaling_config": self.autoscaling_config}
-                    if self.autoscaling_config is not None
-                    else {"num_replicas": self.num_replicas}
-                ),
-            },
-            batch_config={
-                "max_batch_size": self.max_batch_size,
-                "batch_wait_timeout_s": self.batch_wait_timeout_s,
-                "split_oom_batch": self.split_oom_batch,
-            },
-            deployment_name=self.deployment_name,
-            route_prefix=f"/{self.deployment_name}",
-        )
 
         # Copy rather than mutate: the caller's dict should not gain a
         # max_workers key as a side effect of constructing the batcher.
@@ -185,6 +170,28 @@ class InferenceBatcher:
         self.executor: ExecutorProtocol = _get_concurrency_backend(
             concurrency_backend, concurrency_backend_options
         )
+        # Validate local options before creating an external deployment. If
+        # deployment setup fails, release the executor created by this attempt.
+        try:
+            self._deployment_owner = object()
+            self.predict_server_handle = setup_batch_predict_server(
+                predict_unit=self.predict_unit,
+                deployment_config={
+                    "ray_actor_options": ray_actor_options or {},
+                    **(
+                        {"autoscaling_config": self.autoscaling_config}
+                        if self.autoscaling_config is not None
+                        else {"num_replicas": self.num_replicas}
+                    ),
+                },
+                batch_config=config.to_init_kwargs(),
+                deployment_name=self.deployment_name,
+                route_prefix=f"/{self.deployment_name}",
+                _owner=self._deployment_owner,
+            )
+        except BaseException:
+            self.executor.shutdown(wait=False)
+            raise
 
     def __enter__(self):
         return self
@@ -213,27 +220,30 @@ class InferenceBatcher:
         Returns:
             AutobatchResult with the determined optimal parameters.
         """
-        result = probe_optimal_batch_size(
-            predict_unit=self.predict_unit,
-            probe_data=data,
-            config=config,
-        )
-        # Broadcast through user_config rather than a handle call: a handle
-        # call reaches one replica and would leave the rest -- and any replica
-        # autoscaling adds later -- on the old batch size. This blocks until
-        # the update is applied, so a failure raises instead of being dropped.
-        update_batch_config(
-            self.deployment_name,
-            BatchConfig(
-                max_batch_size=result.max_batch_size,
-                batch_wait_timeout_s=result.batch_wait_timeout_s,
-                split_oom_batch=self.split_oom_batch,
-            ),
-        )
-        # Keep the batcher's advertised settings in step with the server's.
-        self.max_batch_size = result.max_batch_size
-        self.batch_wait_timeout_s = result.batch_wait_timeout_s
-        return result
+        with _owned_deployment(
+            self.deployment_name, getattr(self, "_deployment_owner", None)
+        ):
+            result = probe_optimal_batch_size(
+                predict_unit=self.predict_unit,
+                probe_data=data,
+                config=config,
+            )
+            # Broadcast through user_config rather than a handle call: a handle
+            # call reaches one replica and would leave the rest -- and any replica
+            # autoscaling adds later -- on the old batch size. This blocks until
+            # the update is applied, so a failure raises instead of being dropped.
+            update_batch_config(
+                self.deployment_name,
+                BatchConfig(
+                    max_batch_size=result.max_batch_size,
+                    batch_wait_timeout_s=result.batch_wait_timeout_s,
+                    split_oom_batch=self.split_oom_batch,
+                ),
+            )
+            # Keep the batcher's advertised settings in step with the server's.
+            self.max_batch_size = result.max_batch_size
+            self.batch_wait_timeout_s = result.batch_wait_timeout_s
+            return result
 
     def update_checkpoint(self, new_predict_unit: MLIPPredictUnit) -> None:
         """Update the checkpoint being served without shutting down the deployment.
@@ -242,11 +252,40 @@ class InferenceBatcher:
         pick it up, so in-flight requests are drained by Ray Serve's rolling
         update rather than being served a mix of old and new weights.
 
+        Client metadata must remain compatible. For a different property
+        schema, inference configuration, or reference energies, create a new
+        deployment and calculators. Recreate existing ASE calculators after
+        any checkpoint update to discard their cached energies and forces.
+
         Args:
             new_predict_unit: A new MLIPPredictUnit instance with the updated checkpoint
         """
-        update_served_predict_unit(self.deployment_name, new_predict_unit)
-        self.predict_unit = new_predict_unit
+        from fairchem.core.calculate.ase_calculator import _metadata_equal
+
+        def client_metadata(predictor):
+            return {
+                "tasks": {
+                    dataset: sorted((task.property, task.level) for task in tasks)
+                    for dataset, tasks in predictor.dataset_to_tasks.items()
+                },
+                "settings": asdict(predictor.inference_settings),
+                "atom_refs": predictor.atom_refs,
+                "form_elem_refs": predictor.form_elem_refs,
+            }
+
+        with _owned_deployment(
+            self.deployment_name, getattr(self, "_deployment_owner", None)
+        ):
+            if not _metadata_equal(
+                client_metadata(self.predict_unit), client_metadata(new_predict_unit)
+            ):
+                raise ValueError(
+                    "Checkpoint update changes cached client metadata (tasks, inference "
+                    "settings, or references). Create a new InferenceBatcher and calculators."
+                )
+            update_served_predict_unit(self.deployment_name, new_predict_unit)
+            self.predict_unit = new_predict_unit
+            self.__dict__.pop("batch_predict_unit", None)
 
     def delete(self) -> None:
         """Delete the Ray Serve deployment without shutting down Ray or the executor.
@@ -258,11 +297,10 @@ class InferenceBatcher:
             hasattr(self, "predict_server_handle")
             and self.predict_server_handle is not None
         ):
-            # Check if Ray is still initialized before trying to delete
-            if ray.is_initialized():
-                with contextlib.suppress(Exception):
-                    serve.delete(self.deployment_name)
-
+            delete_batch_predict_server(
+                self.deployment_name, owner=getattr(self, "_deployment_owner", None)
+            )
+            self.__dict__.pop("batch_predict_unit", None)
             self.predict_server_handle = None
 
     def shutdown(self, wait: bool = True, shutdown_ray: bool = False) -> None:

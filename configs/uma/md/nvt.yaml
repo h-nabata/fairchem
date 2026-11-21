@@ -31,6 +31,7 @@ runner:
     temperature_K: ${temperature_K}
     friction_per_fs: 0.01
     use_fix_com_constraint: true
+    thermostat_seed: 43  # Independent of velocity_seed
   timestep_fs: 1.0
   steps: 1000
   trajectory_interval: 10

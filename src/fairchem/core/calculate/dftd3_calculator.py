@@ -9,6 +9,7 @@ ASE calculator wrapper for nvalchemiops DFT-D3(BJ) corrections.
 
 from __future__ import annotations
 
+import copy
 import io
 import re
 import tarfile
@@ -22,6 +23,8 @@ import requests
 import torch
 from ase.calculators.calculator import Calculator, all_changes
 from ase.stress import full_3x3_to_voigt_6_stress
+
+from fairchem.core.common.distutils import parse_device
 
 if TYPE_CHECKING:
     from os import PathLike
@@ -261,12 +264,18 @@ class _NValChemiDFTD3Calculator(Calculator):
             raise ValueError(f"cutoff must be positive, got {cutoff!r}")
         if not 0.0 <= smoothing_fraction < 1.0:
             raise ValueError(
-                "smoothing_fraction must be in [0, 1), got " f"{smoothing_fraction!r}"
+                f"smoothing_fraction must be in [0, 1), got {smoothing_fraction!r}"
             )
 
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.device = torch.device(device)
+        self.device = parse_device(device)
+        if self.device.type not in {"cpu", "cuda"}:
+            raise ValueError(
+                "The nvalchemiops DFT-D3 backend supports only CPU and CUDA, "
+                f"not {self.device.type!r}. Use device='cpu' for the D3 "
+                "calculator when the wrapped UMA calculator runs on XPU."
+            )
         self.functional = functional
         self.damping_parameters = _DFTD3_BJ_PARAMETERS[functional]
         self.cutoff = float(cutoff)
@@ -429,8 +438,9 @@ class DFTD3Calculator(Calculator):
         calculator: Base ASE calculator whose predictions receive the D3 term.
         functional: DFT-D3(BJ) parameterization, either ``"r2scan"`` or
             ``"pbe"``.
-        device: Torch device for D3. Defaults to CUDA when available, otherwise
-            CPU.
+        device: Torch device for D3 (CPU or CUDA). Defaults to CUDA when
+            available, otherwise CPU. This device is independent of the base
+            calculator; use ``device="cpu"`` to add D3 to an XPU UMA calculator.
         cutoff: D3 neighbor cutoff in Angstrom. Defaults to 15 Å.
         smoothing_fraction: Fraction of the cutoff over which C5 smoothing is
             applied. Defaults to 0.2 (the outer 20% of the cutoff).
@@ -458,6 +468,7 @@ class DFTD3Calculator(Calculator):
     ) -> None:
         super().__init__()
         self.contributions: dict[str, tuple[Any, Any]] = {}
+        self._base_snapshot = self._dispersion_snapshot = None
         self.base_calculator = calculator
         self.dispersion_calculator = _NValChemiDFTD3Calculator(
             functional,
@@ -474,6 +485,29 @@ class DFTD3Calculator(Calculator):
             if prop in dispersion_properties
         ]
 
+    def reset(self):
+        super().reset()
+        self._base_snapshot = self._dispersion_snapshot = None
+        self.contributions = {}
+
+    def check_state(self, atoms: Atoms, tol: float = 1e-15) -> list[str]:
+        from fairchem.core.calculate.ase_calculator import (
+            _child_cache_changes,
+            _model_input_changes,
+        )
+
+        changes = super().check_state(atoms, tol)
+        return (
+            changes
+            or _model_input_changes(self.atoms, atoms)
+            or _child_cache_changes(
+                self.base_calculator, self._base_snapshot, atoms, tol
+            )
+            or _child_cache_changes(
+                self.dispersion_calculator, self._dispersion_snapshot, atoms, tol
+            )
+        )
+
     def calculate(
         self,
         atoms: Atoms | None = None,
@@ -484,17 +518,22 @@ class DFTD3Calculator(Calculator):
         Evaluate each calculator once and directly add common results.
         """
 
+        from fairchem.core.calculate.ase_calculator import _child_cache_snapshot
+
         self.contributions = {}
+        self.results = {}
         super().calculate(atoms, properties, system_changes)
         if self.atoms is None:
             raise ValueError("An Atoms object is required.")
+        self.atoms.info = copy.deepcopy(self.atoms.info)
         if properties is None:
             properties = self.implemented_properties
 
         self.base_calculator.calculate(self.atoms, properties, system_changes)
         self.dispersion_calculator.calculate(self.atoms, properties, system_changes)
 
-        self.results = {}
+        results = {}
+        contributions = {}
         for prop in self.implemented_properties:
             if not (
                 prop in self.base_calculator.results
@@ -510,8 +549,12 @@ class DFTD3Calculator(Calculator):
                     base_result = full_3x3_to_voigt_6_stress(base_result)
                 if np.shape(dispersion_result) == (3, 3):
                     dispersion_result = full_3x3_to_voigt_6_stress(dispersion_result)
-            self.results[prop] = base_result + dispersion_result
-            self.contributions[prop] = (base_result, dispersion_result)
+            results[prop] = base_result + dispersion_result
+            contributions[prop] = (base_result, dispersion_result)
+        self.results = results
+        self.contributions = contributions
+        self._base_snapshot = _child_cache_snapshot(self.base_calculator)
+        self._dispersion_snapshot = _child_cache_snapshot(self.dispersion_calculator)
 
     @property
     def functional(self) -> str:

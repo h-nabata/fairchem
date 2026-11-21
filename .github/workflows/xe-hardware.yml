@@ -1,0 +1,146 @@
+name: Xe hardware validation
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [intel-xpu-fp32, main]
+    paths:
+      - "src/fairchem/core/**"
+      - "tests/core/calculate/test_requested_properties.py"
+      - "tests/core/components/test_batch_server_interop.py"
+      - "tests/core/datasets/test_atomic_data_interop.py"
+      - "tests/core/scripts/test_benchmark_xpu_batch.py"
+      - "tests/core/common/test_distributed_subgroup_audit.py"
+      - "tests/core/components/test_batch_server_live_cpu.py"
+      - ".github/workflows/xe-hardware.yml"
+  push:
+    branches: [intel-xpu-fp32]
+
+permissions:
+  contents: read
+
+jobs:
+  cpu-communication:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTHONPATH: ${{ github.workspace }}/src:${{ github.workspace }}
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      RAY_USAGE_STATS_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install CPU PyTorch and portable runtime dependencies
+        run: |
+          python -m pip install uv
+          uv pip install --system --index-url https://download.pytorch.org/whl/cpu 'torch==2.15.0+cpu'
+          python - <<'PYDEPS' > "$RUNNER_TEMP/fairchem-cpu-deps.txt"
+          import tomllib
+          from pathlib import Path
+          project = tomllib.loads(Path("packages/fairchem-core-xpu/pyproject.toml").read_text())["project"]
+          for requirement in project["dependencies"]:
+              if not requirement.startswith(("torch==", "triton-xpu")):
+                  print(requirement)
+          print(*project["optional-dependencies"]["ray"], "pytest", "syrupy", "pymatgen", "pyarrow", sep="\n")
+          PYDEPS
+          uv pip install --system -r "$RUNNER_TEMP/fairchem-cpu-deps.txt"
+      - name: Run portable regression tests
+        run: |
+          python -m pytest -q tests/core/calculate/test_requested_properties.py \
+            tests/core/components/test_batch_server_interop.py \
+            tests/core/datasets/test_atomic_data_interop.py \
+            tests/core/scripts/test_benchmark_xpu_batch.py
+      - name: Exercise real Gloo process groups and a local Ray Serve deployment
+        run: |
+          python -m pytest -q tests/core/common/test_distributed_subgroup_audit.py \
+            tests/core/components/test_batch_server_live_cpu.py
+
+  two-b70:
+    if: github.repository == 'h-nabata/fairchem' && github.ref == 'refs/heads/intel-xpu-fp32' && vars.XE_B70_CI == 'true'
+    runs-on: [self-hosted, linux, xe-b70-dual]
+    timeout-minutes: 120
+    env:
+      PYTHONPATH: src:.
+      HF_HUB_OFFLINE: "1"
+      MODEL: ${{ vars.XE_B70_CHECKPOINT }}
+      TRITON_INTEL_FAST_MATH: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check the installed driver, Intel Triton and local weights
+        run: |
+          test -f "$MODEL"
+          mkdir -p results
+          python - <<'PY'
+          import torch
+          import triton.language.extra.intel.libdevice
+          assert torch.xpu.device_count() >= 2
+          for i in (0, 1):
+              name = torch.xpu.get_device_name(i)
+              print(i, name)
+              assert "B70" in name.upper()
+          PY
+      - name: Verify cross-device kernels, derivatives and cross-stream replay
+        run: |
+          python -m pytest -q --junitxml=results/kernels.xml \
+            tests/core/models/uma/test_xpu_kernel_device_scope.py::test_native_xpu1_kernels_with_xpu0_current \
+            tests/core/models/uma/test_xpu_radial_kernels.py::test_actual_xpu_forward_force_and_hvp \
+            tests/core/models/uma/test_portable_fused_backend.py::test_xpu_csr_cache_cross_stream_reuse \
+            tests/core/units/mlip_unit/test_inference_runtime.py::test_xpu_numeric_graph_values_gradients_and_two_submission_streams
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+          cases = ET.parse("results/kernels.xml").findall(".//testcase")
+          assert len(cases) >= 7 and all(c.find("skipped") is None for c in cases)
+          PY
+      - name: Compare FP32, FP64, graph replay and compiled blocks with CPU
+        run: |
+          for precision in float32 float64; do
+            python -m fairchem.core.scripts.validate_xpu --model "$MODEL" --device xpu:1 \
+              --dtype "$precision" --compare-merged --stress --hvp --output "results/$precision.json"
+          done
+          for mode in graph compile; do
+            options=(--xpu-graph)
+            if [[ "$mode" == compile ]]; then options=(--compile --compile-scope blocks); fi
+            python -m fairchem.core.scripts.validate_xpu --model "$MODEL" --device xpu:0 \
+              --compare-merged "${options[@]}" --case periodic --neighbor-skin 0.5 \
+              --geometry-workloads subskin rebuild strain --output "results/$mode.json"
+          done
+      - name: Compare Xe profiles with the pinned physical reference
+        if: vars.XE_B70_BASELINE != ''
+        env:
+          BASELINE: ${{ vars.XE_B70_BASELINE }}
+          CHECKPOINT_ID: ${{ vars.XE_B70_CHECKPOINT_ID }}
+        run: |
+          test -f "$BASELINE"
+          test -n "$CHECKPOINT_ID"
+          status=0
+          for pair in xpu:FP32 xpu-fp64:FP64 xpu-int8:TF32; do
+            profile=${pair%:*}
+            tier=${pair#*:}
+            python -m fairchem.core.regression_suite fast "$profile" --run-on local --device xpu:1 \
+              --suite prediction-fidelity --baseline "$BASELINE" --checkpoint "$MODEL" \
+              --minimum-tier "$tier" --checkpoint-id "$CHECKPOINT_ID" --no-wandb --format json > "results/reference-$profile.json" || status=1
+          done
+          exit "$status"
+      - name: Record omitted physical-reference comparison
+        if: vars.XE_B70_BASELINE == ''
+        run: |
+          echo 'Pinned physical-reference comparison was not run (XE_B70_BASELINE is unset).' >> "$GITHUB_STEP_SUMMARY"
+      - name: Measure single-card and independent dual-card batch throughput
+        run: |
+          for count in 1 2; do
+            devices=(xpu:0)
+            if [[ "$count" == 2 ]]; then devices+=(xpu:1); fi
+            python -m fairchem.core.scripts.benchmark_xpu_batch --checkpoint "$MODEL" \
+              --devices "${devices[@]}" --output "results/batch-$count.json"
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xe-hardware-validation
+          path: results

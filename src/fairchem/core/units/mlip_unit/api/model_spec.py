@@ -19,6 +19,7 @@ from typing import Any, Literal
 
 import torch
 
+from fairchem.core.common.distutils import parse_device
 from fairchem.core.units.mlip_unit.api.inference import (
     InferenceSettings,
     guess_inference_settings,
@@ -112,7 +113,7 @@ def _canonicalize_device(device: str | None) -> str | None:
     if device is None:
         return None
     try:
-        return str(torch.device(device))
+        return str(parse_device(device))
     except (RuntimeError, TypeError, ValueError) as err:
         raise ValueError(
             f"device must be a valid torch device, got {device!r}"
@@ -166,6 +167,9 @@ class ModelSpec:
         object.__setattr__(self, "device", _canonicalize_device(self.device))
 
         settings = copy.deepcopy(guess_inference_settings(self.inference_settings))
+        # Callers can edit the mutable settings before building a spec. Freeze
+        # the normalized policy that the eventual predictor will actually load.
+        settings.__post_init__()
         overrides = (
             copy.deepcopy(self.overrides) if self.overrides is not None else None
         )
@@ -205,6 +209,16 @@ class ModelSpec:
         short_name = (short_name or "model")[:48]
         return f"{short_name}-{digest}"
 
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, ModelSpec):
+            return NotImplemented
+        # Public settings/overrides are convenience copies and can be edited.
+        # Equality must use the same frozen policy as hashing and model loading.
+        return (
+            self.model_id == other.model_id
+            and self._canonical_config == other._canonical_config
+        )
+
     def __hash__(self) -> int:
         """
         Hash by ``model_id`` so specs can key sets and dicts.
@@ -214,8 +228,8 @@ class ModelSpec:
         unhashable ``InferenceSettings``, making every instance unhashable
         despite ``frozen=True`` advertising the opposite.
 
-        ``model_id`` is derived from exactly the fields ``__eq__`` compares, so
-        equal specs always hash equal.
+        ``model_id`` and ``__eq__`` use the same canonical snapshot, so equal
+        specs always hash equal even after a public convenience copy is edited.
         """
         return hash(self.model_id)
 
@@ -236,6 +250,13 @@ class ModelSpec:
                 diagnose than an immediate failure.
         """
         if self.device is not None:
+            if torch.device(self.device).type == "xpu":
+                raise ValueError(
+                    "XPU model serving through Ray is not supported by this "
+                    "implementation: device allocation and isolation are "
+                    "CUDA-specific. Use a local MLIPPredictUnit or "
+                    "FAIRChemCalculator with device='xpu:<index>' instead."
+                )
             if (
                 torch.device(self.device).type == "cuda"
                 and not torch.cuda.is_available()

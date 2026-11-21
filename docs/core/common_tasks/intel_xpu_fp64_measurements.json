@@ -1,0 +1,433 @@
+{
+  "audit_date": "2026-11-10 Asia/Tokyo",
+  "baseline_commit": "0b30a9fdfab64a837bdd798001e7b64ec3399f33",
+  "upstream_main": "36b17c6dca30fd95f0f154837ab297191974a4c1",
+  "scope": "CPU-only component measurements on a shared executor. No native CUDA/XPU, production checkpoint, GPU throughput or peak VRAM validation. See audit for metric definitions.",
+  "embedding": {
+    "baseline_commit": "0b30a9fdfab64a837bdd798001e7b64ec3399f33",
+    "torch": "2.15.0+cpu",
+    "platform": "Linux-6.18.57-x86_64-with-glibc2.39",
+    "threads": 2,
+    "device": "cpu",
+    "positional_spin": [
+      {
+        "dtype": "torch.float32",
+        "batch": 1,
+        "width": 32,
+        "before_nonzero_calls": 1,
+        "before_median_us": 57.15253699997902,
+        "before_iqr_us": 14.91735575018538,
+        "after_nonzero_calls": 0,
+        "after_median_us": 41.7193190000944,
+        "after_iqr_us": 9.20666749993871,
+        "speedup": 1.3699297680254487
+      },
+      {
+        "dtype": "torch.float32",
+        "batch": 1024,
+        "width": 32,
+        "before_nonzero_calls": 1,
+        "before_median_us": 1106.2214999810749,
+        "before_iqr_us": 841.3886499965882,
+        "after_nonzero_calls": 0,
+        "after_median_us": 678.6929998270352,
+        "after_iqr_us": 2238.697999928263,
+        "speedup": 1.6299291436083696
+      },
+      {
+        "dtype": "torch.float32",
+        "batch": 65536,
+        "width": 32,
+        "before_nonzero_calls": 1,
+        "before_median_us": 36859.51199986448,
+        "before_iqr_us": 27900.066999904993,
+        "after_nonzero_calls": 0,
+        "after_median_us": 15950.69500012869,
+        "after_iqr_us": 12506.411999765987,
+        "speedup": 2.310840499399374
+      },
+      {
+        "dtype": "torch.float64",
+        "batch": 1,
+        "width": 32,
+        "before_nonzero_calls": 1,
+        "before_median_us": 29.34711049999805,
+        "before_iqr_us": 5.515061750145373,
+        "after_nonzero_calls": 0,
+        "after_median_us": 30.601031999822226,
+        "after_iqr_us": 9.324796999862883,
+        "speedup": 0.959023555158811
+      },
+      {
+        "dtype": "torch.float64",
+        "batch": 1024,
+        "width": 32,
+        "before_nonzero_calls": 1,
+        "before_median_us": 3116.6746000053536,
+        "before_iqr_us": 2164.8575749964034,
+        "after_nonzero_calls": 0,
+        "after_median_us": 3608.5674000105428,
+        "after_iqr_us": 2206.536699986828,
+        "speedup": 0.8636875121124932
+      },
+      {
+        "dtype": "torch.float64",
+        "batch": 65536,
+        "width": 32,
+        "before_nonzero_calls": 1,
+        "before_median_us": 122016.35200017336,
+        "before_iqr_us": 47004.0700000709,
+        "after_nonzero_calls": 0,
+        "after_median_us": 124423.67399989962,
+        "after_iqr_us": 18000.15300011637,
+        "speedup": 0.9806522189681667
+      }
+    ],
+    "checkpoint_node_input_storage": [
+      {
+        "dtype": "torch.float32",
+        "nodes": 4096,
+        "edges": 32768,
+        "channels": 16,
+        "spherical_coefficients": 9,
+        "chunk_edges": 2048,
+        "chunks": 16,
+        "before_unique_node_buffers": 16,
+        "before_retained_node_bytes": 37748736,
+        "after_unique_node_buffers": 1,
+        "after_retained_node_bytes": 2359296
+      },
+      {
+        "dtype": "torch.float64",
+        "nodes": 4096,
+        "edges": 32768,
+        "channels": 16,
+        "spherical_coefficients": 9,
+        "chunk_edges": 2048,
+        "chunks": 16,
+        "before_unique_node_buffers": 16,
+        "before_retained_node_bytes": 75497472,
+        "after_unique_node_buffers": 1,
+        "after_retained_node_bytes": 4718592
+      }
+    ],
+    "scope": "CPU microbenchmarks only; not GPU or whole-model throughput. Memory is distinct full node-feature input storage retained by checkpoint after forward, not total peak RAM/VRAM. New and old layers share identical weights."
+  },
+  "verlet": {
+    "torch": "2.15.0+cpu",
+    "threads": 2,
+    "device": "cpu",
+    "scope": "Warm Verlet get_graph only; exact unchanged topology. Shared executor timings; cumulative positive profiler allocations are not peak memory/RSS/VRAM. Native GPU not measured.",
+    "records": [
+      {
+        "dtype": "torch.float32",
+        "atoms": 4096,
+        "candidate_edges": 143360,
+        "physical_edges": 114688,
+        "cutoff": 5.2,
+        "skin": 0.4,
+        "max_neighbors": 300,
+        "median_ms": {
+          "baseline": 18.77141249997294,
+          "revised": 20.080260999975508
+        },
+        "samples_ms": {
+          "baseline": [
+            95.84392000010666,
+            21.362807000059547,
+            23.950176999960604,
+            16.790061999927275,
+            16.466127000057895,
+            18.309584000007817,
+            17.064016000176707,
+            100.89238000000478,
+            19.23324099993806,
+            15.652565000209506
+          ],
+          "revised": [
+            20.934066999870993,
+            23.30810599983124,
+            16.100025000014284,
+            12.8597970001465,
+            15.81052799997451,
+            21.260973999915223,
+            19.226455000080023,
+            25.04278699984752,
+            14.246063999962644,
+            43.636212000137675
+          ]
+        },
+        "cumulative_positive_pytorch_cpu_allocation_bytes": {
+          "baseline": 35246201,
+          "revised": 24924281
+        },
+        "cache_stats": {
+          "rebuilds": 1,
+          "hits": 13,
+          "tie_fallbacks": 0,
+          "cap_fallbacks": 0,
+          "boundary_fallbacks": 0,
+          "candidate_edges": 143360,
+          "entries": 1
+        }
+      },
+      {
+        "dtype": "torch.float64",
+        "atoms": 4096,
+        "candidate_edges": 143360,
+        "physical_edges": 114688,
+        "cutoff": 5.2,
+        "skin": 0.4,
+        "max_neighbors": 300,
+        "median_ms": {
+          "baseline": 21.45972350001557,
+          "revised": 18.458613499888088
+        },
+        "samples_ms": {
+          "baseline": [
+            21.870841999998447,
+            20.709209999949962,
+            20.593626000163567,
+            22.280124999952022,
+            22.91105300014351,
+            21.495020999964254,
+            21.43956200006869,
+            20.271064000098704,
+            21.47988499996245,
+            21.264051999878575
+          ],
+          "revised": [
+            18.5283740001978,
+            18.49942299986651,
+            16.52512900000147,
+            18.417803999909665,
+            17.91244499986533,
+            20.463438999968275,
+            18.5338960000081,
+            18.13333900008729,
+            17.731768999965425,
+            18.609626999932516
+          ]
+        },
+        "cumulative_positive_pytorch_cpu_allocation_bytes": {
+          "baseline": 64213118,
+          "revised": 43569278
+        },
+        "cache_stats": {
+          "rebuilds": 1,
+          "hits": 13,
+          "tie_fallbacks": 0,
+          "cap_fallbacks": 0,
+          "boundary_fallbacks": 0,
+          "candidate_edges": 143360,
+          "entries": 1
+        }
+      }
+    ]
+  },
+  "saved_features": {
+    "torch": "2.15.0+cpu",
+    "device": "cpu",
+    "threads": 2,
+    "scope": "FP64 learned saved-activation storage to FP32; primitive pack/unpack plus random tiny UMA E/F/stress; shared executor timings, no GPU/physical accuracy claim",
+    "primitive": {
+      "elements": 1048576,
+      "source_bytes": 8388608,
+      "compressed_bytes": 4194304,
+      "scale_bytes": 8,
+      "pack_ms": 9.795219000011457,
+      "unpack_ms": 11.48851899984038
+    },
+    "tiny_uma": {
+      "seed": 41,
+      "atoms": 3,
+      "layers": 1,
+      "sphere_channels": 4,
+      "min_elements": 1,
+      "manifest": {
+        "dtype": "fp32",
+        "source_dtype": "float64",
+        "forward_unchanged": true,
+        "derivatives_approximate": true,
+        "min_elements": 1,
+        "module_count": 7,
+        "modules": [
+          "edge_degree_embedding.rad_func.net.2",
+          "edge_degree_embedding.rad_func.net.5",
+          "blocks.0.edge_wise.act",
+          "blocks.0.edge_wise.so2_conv_1.rad_func.net.2",
+          "blocks.0.edge_wise.so2_conv_1.rad_func.net.5",
+          "blocks.0.atom_wise.grid_mlp.1",
+          "blocks.0.atom_wise.grid_mlp.3"
+        ]
+      },
+      "max_absolute_errors": {
+        "energy": 0.0,
+        "forces": 2.886280624225801e-11,
+        "stress": 4.6825585943433e-13,
+        "hessian": 2.2071894312247764e-10
+      },
+      "timing": {
+        "properties": [
+          "energy",
+          "forces",
+          "stress"
+        ],
+        "reference_ms": 11.364721500058295,
+        "compressed_ms": 11.496328000021094
+      }
+    }
+  },
+  "imports": {
+    "environment": "Python 3.12, PyTorch 2.15.0+cpu, OMP_NUM_THREADS=1",
+    "before_actual_three_runs": {
+      "core": {
+        "first_import_seconds": [
+          10.217312,
+          6.219032,
+          7.664647
+        ],
+        "peak_rss_kib": [
+          545500,
+          546440,
+          548248
+        ]
+      },
+      "registry": {
+        "first_import_seconds": [
+          9.362778,
+          24.53779,
+          11.096843
+        ],
+        "peak_rss_kib": [
+          546144,
+          544160,
+          546100
+        ]
+      },
+      "calculator": {
+        "first_import_seconds": [
+          8.168521,
+          13.289735,
+          20.562652
+        ],
+        "peak_rss_kib": [
+          547820,
+          544956,
+          544992
+        ]
+      }
+    },
+    "baseline_initializer_module_count_probe": {
+      "method": "Fresh subprocess executes the two unchanged HEAD initializer sources with SourceFileLoader; all other files use the working tree.",
+      "core": {
+        "fairchem_modules": 65,
+        "all_modules": 4298,
+        "torch": true,
+        "ray_serve": true,
+        "batch_server": true
+      },
+      "registry": {
+        "fairchem_modules": 65,
+        "all_modules": 4298,
+        "torch": true,
+        "ray_serve": true,
+        "batch_server": true
+      },
+      "calculator": {
+        "fairchem_modules": 65,
+        "all_modules": 4298,
+        "torch": true,
+        "ray_serve": true,
+        "batch_server": true
+      }
+    },
+    "after_three_runs": {
+      "core": {
+        "first_import_seconds": [
+          0.074811,
+          0.148855,
+          0.082981
+        ],
+        "cached_import_microseconds": [
+          0.721,
+          0.814,
+          0.772
+        ],
+        "peak_rss_kib": [
+          14080,
+          14080,
+          14080
+        ],
+        "fairchem_modules": 2,
+        "all_modules": 161,
+        "torch": false,
+        "ray_serve": false,
+        "batch_server": false
+      },
+      "registry": {
+        "first_import_seconds": [
+          0.142716,
+          0.071336,
+          0.190014
+        ],
+        "cached_import_microseconds": [
+          0.775,
+          0.757,
+          0.699
+        ],
+        "peak_rss_kib": [
+          14080,
+          14080,
+          14080
+        ],
+        "fairchem_modules": 4,
+        "all_modules": 163,
+        "torch": false,
+        "ray_serve": false,
+        "batch_server": false
+      },
+      "calculator": {
+        "first_import_seconds": [
+          6.648038,
+          6.545054,
+          7.932954
+        ],
+        "cached_import_microseconds": [
+          2.294,
+          2.062,
+          2.542
+        ],
+        "peak_rss_kib": [
+          544916,
+          544064,
+          542448
+        ],
+        "fairchem_modules": 57,
+        "all_modules": 4267,
+        "torch": true,
+        "ray_serve": true,
+        "batch_server": false
+      }
+    }
+  },
+  "cpu_probe": {
+    "probe": {
+      "passed": true,
+      "device": "cpu",
+      "dtype": "float64",
+      "reported_has_fp64": null,
+      "checks": [
+        "matmul",
+        "index_add",
+        "geometry",
+        "first_derivative",
+        "second_derivative"
+      ],
+      "preserves_sub_fp32_bits": true
+    },
+    "torch": "2.15.0+cpu",
+    "cuda_available": false,
+    "xpu_available": false
+  }
+}
