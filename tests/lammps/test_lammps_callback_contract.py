@@ -7,6 +7,7 @@ LICENSE file in the root directory of this source tree.
 
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 from typing import ClassVar
 
@@ -15,7 +16,7 @@ import pytest
 import torch
 from ase import Atoms
 
-pytest.importorskip("lammps")
+lammps = pytest.importorskip("lammps")
 from fairchem.lammps.lammps_fc import run_lammps_with_fairchem  # noqa: E402
 
 from fairchem.core.calculate.ase_calculator import FAIRChemCalculator  # noqa: E402
@@ -211,3 +212,87 @@ def test_barostat_requires_stress(tmp_path):
     script = write_script(tmp_path, "fix int all npt temp 300 300 .1 iso 0 0 1\nrun 0")
     with pytest.raises((RuntimeError, ValueError), match="compute_stress"):
         run_lammps_with_fairchem(BondPredictor(), script, "omat", compute_stress=False)
+
+
+def test_multiline_print_does_not_execute_its_content(tmp_path):
+    output = tmp_path / "multiline.txt"
+    command = (
+        f'print """first line\nrun 1 # literal content\nlast line""" file "{output}"\n'
+        "run 0"
+    )
+    predictor = BondPredictor()
+    lmp = run_lammps_with_fairchem(predictor, write_script(tmp_path, command), "omat")
+    try:
+        if lmp.extract_setting("world_rank") == 0:
+            assert "run 1 # literal content" in output.read_text()
+            assert len(predictor.inputs) == 1
+    finally:
+        lmp.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="backslash is a Windows path separator")
+def test_include_preserves_literal_backslash(tmp_path):
+    child = tmp_path / r"child\file.in"
+    child.write_text("run 0\n")
+    # Unlike shell syntax, LAMMPS leaves an unquoted backslash literal.
+    command = f"include {child}"
+    lmp = run_lammps_with_fairchem(
+        BondPredictor(), write_script(tmp_path, command), "omat"
+    )
+    try:
+        assert lmp.get_thermo("pe") == pytest.approx(0.125)
+    finally:
+        lmp.close()
+
+
+def test_nonperiodic_callback_preserves_fp64_and_owns_positions(tmp_path):
+    script = write_script(
+        tmp_path,
+        "run 0",
+    )
+    script.write_text(
+        script.read_text()
+        .replace("boundary p p p", "boundary f f f")
+        .replace("2.25 1 1", "2.2500000000123 1 1")
+    )
+    predictor = BondPredictor()
+    lmp = run_lammps_with_fairchem(predictor, script, "omat", compute_stress=False)
+    try:
+        if lmp.extract_setting("world_rank") == 0:
+            positions = predictor.inputs[0].pos
+            assert positions.dtype == torch.float64
+            assert positions[0, 0].item() == 2.2500000000123
+        lmp.command("displace_atoms all move 0.01 0 0 units box")
+        if lmp.extract_setting("world_rank") == 0:
+            assert positions[0, 0].item() == 2.2500000000123
+    finally:
+        lmp.close()
+
+
+@pytest.mark.parametrize(
+    "commands, expected",
+    [
+        ("# comment &\nprint before file OUTPUT\nprint after append OUTPUT", "after\n"),
+        ("print abc'd#e'f file OUTPUT", "abc'd#e'f\n"),
+        ('print """beg  \nmid &\nend""" file OUTPUT', "beg\nmid end\n"),
+    ],
+)
+def test_script_lexical_edges_match_native_lammps(tmp_path, commands, expected):
+    output = tmp_path / "parser.txt"
+    path = tmp_path / "parser.in"
+    path.write_text(commands.replace("OUTPUT", f'"{output}"') + "\n")
+    native = lammps.lammps(cmdargs=["-screen", "none", "-log", "none"])
+    try:
+        native.file(str(path))
+        is_root = native.extract_setting("world_rank") == 0
+        if is_root:
+            assert output.read_text() == expected
+            output.unlink()
+    finally:
+        native.close()
+    wrapped = run_lammps_with_fairchem(BondPredictor(), path, "omat")
+    try:
+        if is_root:
+            assert output.read_text() == expected
+    finally:
+        wrapped.close()

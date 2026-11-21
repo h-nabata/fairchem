@@ -265,6 +265,7 @@ class FAIRChemCalculator(Calculator):
             AtomicData.from_ase,
             task_name=self.task_name,
             r_data_keys=["spin", "charge"],
+            read_labels=False,
             **_predictor_graph_options(predict_unit),
         )
 

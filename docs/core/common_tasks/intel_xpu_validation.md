@@ -124,7 +124,12 @@ call counts include eager bypasses during derivative evaluation.
 The batch benchmark runs serial and packed requests in each independent
 process, synchronizes the selected cards, and counts total structures over the
 shared elapsed interval. Run it again with a single device for the one-card
-comparison. The Ray serving benchmark supports CPU and CUDA. Its per-concurrency
+comparison. Use `--dtype float64` to benchmark both the model and its input
+geometry in FP64; specify separate parity tolerances with `--energy-atol` and
+`--force-atol` as needed. The default remains FP32. When using `--structure`,
+the loader consumes at most the requested number of frames, cycling from the
+beginning if the file provides fewer. The Ray serving benchmark supports CPU
+and CUDA. Its per-concurrency
 speedup uses the same structures in its local serial measurement. Each
 successful predictor invocation contributes an identifier to its outputs so the
 report can count a single packed call serving multiple clients. The identifier

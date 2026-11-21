@@ -12,7 +12,7 @@ import weakref
 from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from threading import Event
+from threading import Event, Lock
 from types import SimpleNamespace
 from typing import ClassVar
 from unittest.mock import Mock
@@ -46,6 +46,120 @@ def _server():
     server = BatchPredictServerMixin()
     server.split_oom_batch = True
     return server
+
+
+@pytest.mark.parametrize("initial_gpu_count", [0, 1])
+def test_deployment_defaults_do_not_leak_between_apps(initial_gpu_count):
+    actor_options = {"num_cpus": 0.5}
+    config = batch_server.DeploymentConfig(ray_actor_options=actor_options)
+    first = batch_server._prepare_deployment_config(config, initial_gpu_count, "first")
+    second = batch_server._prepare_deployment_config(
+        config, 1 - initial_gpu_count, "second"
+    )
+
+    assert config.ray_actor_options is actor_options
+    assert actor_options == {"num_cpus": 0.5}
+    assert first.ray_actor_options["num_gpus"] == initial_gpu_count
+    assert second.ray_actor_options["num_gpus"] == 1 - initial_gpu_count
+
+
+@pytest.mark.parametrize("key", ["num_cpus", "num_gpus"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -0.5, "1", True])
+def test_invalid_actor_resources_fail_before_startup(key, value):
+    with pytest.raises(ValueError, match=key):
+        batch_server._prepare_deployment_config(
+            {"ray_actor_options": {key: value}}, 0, "test"
+        )
+
+
+@pytest.mark.parametrize(
+    "autoscaling",
+    [
+        dict(min_replicas=3, max_replicas=8),
+        SimpleNamespace(min_replicas=3, max_replicas=8),
+    ],
+)
+def test_startup_uses_actual_autoscaling_minimum(autoscaling):
+    assert batch_server._effective_replicas({"autoscaling_config": autoscaling}) == 3
+
+
+def test_batch_size_counts_nodes_without_tensor_values():
+    class Sample:
+        def __init__(self, num_nodes):
+            self.num_nodes = num_nodes
+
+        @property
+        def natoms(self):
+            raise AssertionError("Batch sizing must not inspect tensor values")
+
+    assert batch_server._batch_atom_count([Sample(2), Sample(7)]) == 9
+    assert batch_server._batch_atom_count([]) == 0
+
+
+def test_concurrent_batch_apps_initialize_ray_once(monkeypatch):
+    entered_init = Event()
+    entered_second_call = Event()
+    release_init = Event()
+    state = {"initialized": False, "init_calls": 0, "start_calls": 0}
+
+    def init(**kwargs):
+        assert kwargs["num_cpus"] == 1
+        assert type(kwargs["num_cpus"]) is int
+        state["init_calls"] += 1
+        entered_init.set()
+        assert release_init.wait(timeout=5)
+        state["initialized"] = True
+
+    def start(**kwargs):
+        assert kwargs["proxy_location"] == "Disabled"
+        state["start_calls"] += 1
+
+    monkeypatch.setattr(
+        batch_server,
+        "ray",
+        SimpleNamespace(
+            is_initialized=lambda: state["initialized"],
+            LoggingConfig=dict,
+            init=init,
+            available_resources=lambda: {"CPU": 4},
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        batch_server,
+        "serve",
+        SimpleNamespace(schema=SimpleNamespace(LoggingConfig=dict), start=start),
+    )
+
+    class StartupLock:
+        # Observe that the second app reaches the shared startup lock while
+        # the first app is still inside ray.init.
+        def __init__(self):
+            self.lock = Lock()
+
+        def __enter__(self):
+            if entered_init.is_set():
+                entered_second_call.set()
+            self.lock.acquire()
+
+        def __exit__(self, *args):
+            self.lock.release()
+
+    monkeypatch.setattr(batch_server, "_RAY_STARTUP_LOCK", StartupLock())
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(batch_server._init_ray_and_serve, {"num_cpus": 0.5}, 1)
+        try:
+            assert entered_init.wait(timeout=5)
+            second = executor.submit(
+                batch_server._init_ray_and_serve, {"num_cpus": 0.5}, 1
+            )
+            assert entered_second_call.wait(timeout=5)
+        finally:
+            release_init.set()
+        first.result()
+        second.result()
+
+    assert state == {"initialized": True, "init_calls": 1, "start_calls": 2}
 
 
 def test_split_outputs_own_storage_and_preserve_atom_system_shapes():

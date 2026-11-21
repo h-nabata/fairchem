@@ -34,7 +34,7 @@ Please note the following differences from regular LAMMPS workflows:
 :::
 
 - We currently only support `metal` [units](https://docs.lammps.org/units.html), i.e., energy in `eV` and forces in `eV/A`
-- The driver runs each command separately so a failed prediction stops subsequent commands. It handles `include` (paths relative to the LAMMPS working directory) and `&` continuations. Use direct `run`, `minimize`, or `rerun` commands. Nested execution via `if`, `jump`, `partition`, `python`, `run ... every`, and variable-generated command names is unsupported. The fix ID `ext_fc` is reserved.
+- The driver runs each command separately so a failed prediction stops subsequent commands. It handles `include` (paths relative to the LAMMPS working directory), `&` continuations, and multiline arguments in triple double quotes. Use direct `run`, `minimize`, or `rerun` commands. Nested execution via `if`, `jump`, `partition`, `python`, `run ... every`, and variable-generated command names is unsupported. The fix ID `ext_fc` is reserved.
 - The predictor supplies the virial for pressure in both fixed and variable cells. Choose `compute_stress=false` only for a fixed-cell simulation that uses energy and forces exclusively. Pressure reported in this mode omits the model virial.
 - A multi-rank LAMMPS instance requires a matching mpi4py installation. The driver collects all owned atoms on rank zero and sends the predicted forces back by atom ID. Model evaluation and whole-system graph memory are centralized on that rank. The CLI initializes model weights there. Python callers can pass a zero-argument predictor factory for the same behavior. The predictor can distribute its own work across GPUs independently.
 - Users should **NOT** define other types of forces such as "pair_style", "bond_style" in their scripts. These forces will get added together with UMA forces and most likely produce false results
@@ -66,7 +66,7 @@ Assuming you have a classic LAMMPS .in script, make the following changes:
 
 1. Remove all other forces from your LAMMPS script (e.g., pair_style, etc.)
 2. Make sure the units are in "metal"
-3. Make sure there is only 1 run command at the bottom of the script, if you have multiple run segments, ie: NVT followed by NPT, you can separate them into separate scripts
+3. Use direct commands for each run segment (for example, NVT followed by NPT), rather than nested commands or `run ... every`.
 
 To run, use the Python entrypoint `lmp_fc` (shortcut name for the [python lammps_fc.py script](https://github.com/facebookresearch/fairchem/pull/1454)):
 

@@ -421,7 +421,8 @@ def test_invalid_graph_replacement_is_atomic():
     data.update_batch_edges(edges, offsets, torch.tensor([2]))
     with pytest.raises(ValueError):
         data.update_batch_edges(edges + 1, offsets, torch.tensor([2]))
-    assert data.edge_index is edges and data.cell_offsets is offsets
+    assert data.edge_index is edges
+    assert data.cell_offsets is offsets
     assert data.nedges.tolist() == [2]
 
 
@@ -451,3 +452,58 @@ def test_ase_isotope_bits_and_implicit_masses_survive_model_dtype_changes():
         for restored, original in zip(data.to_ase(), (natural, heavy), strict=True):
             assert restored.has("masses") == original.has("masses")
             np.testing.assert_array_equal(restored.get_masses(), original.get_masses())
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_structure_only_graph_keeps_nonperiodic_pos_exact_and_owned(dtype):
+    atoms = molecule("H2O")
+    atoms.set_cell([[8.5, 2.7, -0.1], [0.2, 11.4, 2.1], [1.9, -3.7, 4.5]])
+    atoms.info.update(energy=3.5, forces=np.ones_like(atoms.positions))
+    positions = atoms.get_positions()
+    cell = np.array(atoms.cell, copy=True)
+    graph = AtomicData.from_ase(atoms, target_dtype=dtype, read_labels=False)
+    torch.testing.assert_close(
+        graph.pos, torch.tensor(positions, dtype=dtype), rtol=0, atol=0
+    )
+    assert graph.get("energy") is None
+    assert graph.get("forces") is None
+
+    graph.pos[0, 0] = 99.0
+    graph.cell[0, 0, 0] = 88.0
+    graph.atomic_numbers[0] = 7
+    np.testing.assert_array_equal(atoms.positions, positions)
+    np.testing.assert_array_equal(atoms.cell, cell)
+    assert atoms.numbers[0] == 8
+
+    labeled = AtomicData.from_ase(atoms, target_dtype=dtype)
+    assert labeled.energy.item() == 3.5
+    torch.testing.assert_close(labeled.forces, torch.ones_like(labeled.pos))
+
+
+@pytest.mark.parametrize("invalid", ["positions", "cell"])
+def test_atomic_data_rejects_nonfinite_geometry_before_periodic_linear_algebra(invalid):
+    atoms = molecule("H2O")
+    atoms.set_cell([10.0, 10.0, 10.0])
+    atoms.pbc = (True, False, False)
+    if invalid == "positions":
+        atoms.positions[0, 0] = np.nan
+    else:
+        atoms.cell[0, 0] = np.inf
+    with pytest.raises(ValueError, match="positions and cell vectors must be finite"):
+        AtomicData.from_ase(atoms)
+
+
+@pytest.mark.parametrize("strict", [None, False, True])
+def test_ase_pymatgen_external_graph_owns_cpu_factories(strict):
+    pytest.importorskip("pymatgen")
+    atoms = molecule("H2O")
+    atoms.set_cell([12.0, 12.0, 12.0])
+    settings = dict(r_edges=True, max_neigh=10, enforce_max_neighbors_strictly=strict)
+    reference = AtomicData.from_ase(atoms, **settings)
+    with torch.device("meta"):
+        actual = AtomicData.from_ase(atoms, **settings)
+    assert actual.edge_index.device.type == "cpu"
+    assert actual.cell_offsets.device.type == "cpu"
+    assert actual.edge_index.shape[1] > 0
+    torch.testing.assert_close(actual.edge_index, reference.edge_index)
+    torch.testing.assert_close(actual.cell_offsets, reference.cell_offsets)

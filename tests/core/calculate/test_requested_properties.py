@@ -10,8 +10,10 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 from ase.build import molecule
+from ase.calculators.singlepoint import SinglePointCalculator
 
 from fairchem.core.calculate.ase_calculator import FAIRChemCalculator
 from fairchem.core.units.mlip_unit.api.inference import InferenceSettings
@@ -49,6 +51,7 @@ class RecordingPredictor:
 def test_ase_requests_only_needed_derivatives_and_retains_valid_results():
     predictor = RecordingPredictor()
     atoms = molecule("H2O")
+    atoms.set_cell([10.0, 10.0, 10.0])
     atoms.calc = FAIRChemCalculator(predictor, task_name="omol")
     energy = atoms.get_potential_energy()
     assert predictor.requests == [("energy",)]
@@ -72,8 +75,38 @@ def test_ase_legacy_predictor_signature_remains_supported():
     predict = predictor.predict
     predictor.predict = lambda data: predict(data)
     atoms = molecule("H2O")
+    atoms.set_cell([10.0, 10.0, 10.0])
     atoms.calc = FAIRChemCalculator(predictor, task_name="omol")
     atoms.get_forces()
     atoms.get_stress()
     atoms.get_potential_energy()
     assert predictor.requests == [None]
+
+
+@pytest.mark.parametrize("reference", ["stale_calculator", "annotation"])
+def test_ase_inference_ignores_invalid_reference_labels(reference):
+    predictor = RecordingPredictor()
+    atoms = molecule("H2O")
+    if reference == "stale_calculator":
+        atoms.calc = SinglePointCalculator(atoms, energy=123.0)
+        atoms.positions[0, 0] += 0.25
+    else:
+        atoms.info["forces"] = "an annotation, not a numerical training label"
+    calculator = FAIRChemCalculator(predictor, task_name="omol")
+    calculator.calculate(atoms, properties=("energy", "forces"))
+    assert predictor.requests == [("energy", "forces")]
+    np.testing.assert_allclose(calculator.results["forces"], -2 * atoms.positions)
+    assert calculator.results["energy"] == pytest.approx(
+        np.square(atoms.positions).sum()
+    )
+
+
+def test_ase_rejects_explicit_zero_volume_stress_without_entering_predictor():
+    predictor = RecordingPredictor()
+    atoms = molecule("H2O")
+    atoms.calc = FAIRChemCalculator(predictor, task_name="omol")
+    with pytest.raises(ValueError, match="finite nonzero volume"):
+        atoms.get_stress()
+    assert not predictor.requests
+    assert np.isfinite(atoms.get_potential_energy())
+    assert predictor.requests == [("energy",)]

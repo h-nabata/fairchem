@@ -13,8 +13,9 @@ import logging
 import math
 import time
 from collections import OrderedDict, defaultdict, deque
+from collections.abc import Mapping
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from multiprocessing import cpu_count
 from numbers import Integral, Real
 from statistics import median
@@ -110,6 +111,12 @@ DEFAULT_MAX_BATCH_SIZE = 512
 DEFAULT_BATCH_WAIT_TIMEOUT_S = 0.1
 MAX_NUM_MODELS_PER_REPLICA = 3
 MODEL_SPEC_CACHE_CAPACITY = MAX_NUM_MODELS_PER_REPLICA * 4
+_RAY_STARTUP_LOCK = Lock()
+
+
+def _batch_atom_count(batch: list[AtomicData]) -> int:
+    """Count atoms using tensor shapes, without reductions or device synchronization."""
+    return sum(sample.num_nodes for sample in batch)
 
 
 @dataclass
@@ -642,9 +649,7 @@ class BatchPredictServer(BatchPredictServerMixin):
             "BatchPredictServer initialized with predict_unit from object store"
         )
 
-    @serve.batch(
-        batch_size_fn=lambda batch: sum(sample.natoms.sum() for sample in batch).item()
-    )
+    @serve.batch(batch_size_fn=_batch_atom_count)
     async def predict(
         self,
         data_list: list[AtomicData],
@@ -764,7 +769,7 @@ class MultiplexedBatchPredictServer(BatchPredictServerMixin):
         return True
 
     @serve.batch(
-        batch_size_fn=lambda batch: sum(sample.natoms.sum() for sample in batch).item(),
+        batch_size_fn=_batch_atom_count,
         max_concurrent_batches=1,
     )
     async def predict(
@@ -960,13 +965,26 @@ def _init_ray_and_serve(
 
     requested_cpus = cpus_per_actor * num_replicas
 
-    if not ray.is_initialized():
-        ray.init(
-            log_to_driver=False,
-            logging_config=ray.LoggingConfig(log_level="WARNING"),
-            num_cpus=requested_cpus,
+    # Deployment locks are per app, but the Ray driver and Serve controller
+    # are shared. Serialize their initialization across concurrent batchers.
+    with _RAY_STARTUP_LOCK:
+        if not ray.is_initialized():
+            ray.init(
+                log_to_driver=False,
+                logging_config=ray.LoggingConfig(log_level="WARNING"),
+                # Actors may reserve fractional CPUs, but a local Ray
+                # node's total capacity must be an integer.
+                num_cpus=math.ceil(requested_cpus),
+            )
+            logging.info("Ray initialized")
+
+        # Always enforce proxy_location, even if Serve was started earlier.
+        # Batch clients use Python handles and don't need port 8000.
+        serve.start(
+            proxy_location="Disabled",
+            logging_config=serve.schema.LoggingConfig(log_level="WARNING"),
         )
-        logging.info("Ray initialized")
+        logging.info("Ray Serve started (proxy_location=Disabled)")
 
     # If the deployment's CPU request exceeds what's currently available,
     # replicas will queue until capacity frees up. Warn (don't raise)
@@ -986,18 +1004,6 @@ def _init_ray_and_serve(
             "ray_actor_options['num_cpus'] / num_replicas."
         )
 
-    # ``serve.start`` is idempotent for matching options. We always call it so
-    # that ``proxy_location`` is enforced (``serve.status()`` returns OK even
-    # when serve isn't running yet, so it can't be used as a "started" probe).
-    # Clients use Python deployment handles (``serve.get_app_handle``), not HTTP,
-    # so disable the HTTP proxy entirely. This avoids ProxyActor startup
-    # failures on worker nodes where port 8000 is already bound.
-    serve.start(
-        proxy_location="Disabled",
-        logging_config=serve.schema.LoggingConfig(log_level="WARNING"),
-    )
-    logging.info("Ray Serve started (proxy_location=Disabled)")
-
 
 def _effective_replicas(deployment_config: dict) -> int:
     """
@@ -1011,10 +1017,11 @@ def _effective_replicas(deployment_config: dict) -> int:
     ac = deployment_config.get("autoscaling_config") or {}
     if ac:
         for key in ("min_replicas", "max_replicas"):
-            if key in ac:
+            value = ac.get(key) if isinstance(ac, Mapping) else getattr(ac, key, None)
+            if value is not None:
                 try:
-                    return max(1, int(ac[key]))
-                except (TypeError, ValueError):
+                    return max(1, int(value))
+                except (TypeError, ValueError, OverflowError):
                     pass
     nr = deployment_config.get("num_replicas")
     if isinstance(nr, int):
@@ -1051,8 +1058,20 @@ def _prepare_deployment_config(
             f"({default_basis}). Pass num_gpus or set "
             "ray_actor_options['num_gpus'] to override."
         )
-    deployment_config.ray_actor_options = actor_opts
-    return deployment_config
+    for key in ("num_cpus", "num_gpus"):
+        if key not in actor_opts:
+            continue
+        value = actor_opts[key]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, Real)
+            or value < 0
+            or not math.isfinite(value)
+        ):
+            raise ValueError(
+                f"ray_actor_options[{key!r}] must be a finite nonnegative number"
+            )
+    return replace(deployment_config, ray_actor_options=actor_opts)
 
 
 def _check_predict_unit_device(predict_unit: MLIPPredictUnit, num_gpus: float) -> None:
@@ -1442,7 +1461,9 @@ def setup_multiplexed_batch_predict_server(
             (or, if Ray is not connected yet, from the driver's own CUDA
             visibility). Pass it explicitly to pin a value, to request more
             than one GPU per replica, or when connecting to a cluster whose
-            GPU workers have not joined yet.
+            GPU workers have not joined yet. An explicit value in
+            ``deployment_config["ray_actor_options"]["num_gpus"]`` wins over
+            this argument.
 
     Returns:
         Ray Serve deployment handle.

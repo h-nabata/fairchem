@@ -128,7 +128,17 @@ class TrajectoryFrame:
                 )
                 raise
 
-        stress = property_value("stress", atoms.get_stress)
+        # ASE may complete missing cell vectors for other operations, but
+        # stress and its derived pressure require a real physical volume.
+        # This guards only the optional stress read; energy and force failures
+        # must still surface, including for invalid periodic geometries.
+        cell = atoms.cell.copy()
+        volume = cell.volume if np.isfinite(cell).all() else 0.0
+        stress = (
+            property_value("stress", atoms.get_stress)
+            if np.isfinite(volume) and volume > 0
+            else None
+        )
         energy = property_value("energy", atoms.get_potential_energy)
         forces = property_value("forces", atoms.get_forces)
         velocities = atoms.get_velocities()
@@ -167,7 +177,7 @@ class TrajectoryFrame:
             time=time,
             atomic_numbers=atoms.get_atomic_numbers().copy(),
             positions=atoms.get_positions().copy(),
-            cell=atoms.get_cell()[:].copy(),
+            cell=cell.array,
             pbc=np.array(atoms.get_pbc()),
             velocities=velocities,
             energy=energy,

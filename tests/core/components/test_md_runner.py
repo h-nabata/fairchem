@@ -26,6 +26,7 @@ import pytest
 from ase import Atoms, units
 from ase.build import bulk
 from ase.calculators.emt import EMT
+from ase.calculators.singlepoint import SinglePointCalculator
 from ase.constraints import (
     FixAtoms,
     FixBondLengths,
@@ -619,6 +620,71 @@ def test_nullable_trajectory_schema(tmp_path, interval):
     assert all(row["stress"] is None for row in rows)
 
 
+class _StrictCellStressEMT(EMT):
+    """Model the FAIRChemCalculator stress contract without loading a checkpoint."""
+
+    def get_stress(self, atoms=None):
+        if atoms is None:
+            atoms = self.atoms
+        volume = atoms.cell.volume
+        if not np.isfinite(volume) or volume <= 0:
+            raise ValueError("Stress requires a cell with finite nonzero volume")
+        return super().get_stress(atoms)
+
+
+@pytest.mark.parametrize(
+    ("cell", "pbc"),
+    [
+        ([0, 0, 0], False),
+        ([5, 6, 0], [True, True, False]),
+        ([5, 0, 0], [True, False, False]),
+        ([[5, 0, 0], [0, 6, 0], [5, 6, 0]], [True, True, False]),
+    ],
+)
+def test_frame_omits_stress_without_physical_volume(cell, pbc):
+    class EnergyForceOnly(SinglePointCalculator):
+        def get_stress(self, atoms=None):
+            raise AssertionError("Must not ask for stress without physical volume")
+
+    atoms = Atoms(
+        "H2",
+        positions=[[0, 0, 0], [0.75, 0, 0]],
+        cell=cell,
+        pbc=pbc,
+    )
+    atoms.calc = EnergyForceOnly(atoms, energy=-1.0, forces=np.zeros((2, 3)))
+    frame = TrajectoryFrame.from_atoms(atoms, step=7)
+    assert frame.energy is not None
+    assert frame.forces.shape == (2, 3)
+    assert frame.stress is None
+    assert frame.pressure is None
+    npt.assert_array_equal(frame.cell, atoms.cell.array)
+    npt.assert_array_equal(frame.pbc, atoms.pbc)
+
+
+@pytest.mark.parametrize("pbc", [False, [True, True, False], True])
+def test_frame_keeps_stress_when_physical_volume_exists(pbc):
+    class KnownStressEMT(EMT):
+        def get_stress(self, atoms=None):
+            return np.arange(6, dtype=float)
+
+    atoms = Atoms("Cu", cell=[5, 6, 7], pbc=pbc, calculator=KnownStressEMT())
+    frame = TrajectoryFrame.from_atoms(atoms, step=7)
+    npt.assert_array_equal(frame.stress, np.arange(6))
+    assert frame.pressure == pytest.approx(-1 / units.bar)
+
+
+def test_frame_propagates_stress_failure_for_valid_cell():
+    class BrokenStressEMT(EMT):
+        def get_stress(self, atoms=None):
+            raise ValueError("stress kernel failed")
+
+    atoms = Atoms("Cu", cell=[5, 6, 7], pbc=True, calculator=BrokenStressEMT())
+    with pytest.raises(ValueError, match="stress kernel failed") as error:
+        TrajectoryFrame.from_atoms(atoms, step=7)
+    assert "stress at MD step 7" in error.value.__notes__[0]
+
+
 def test_frame_reports_calculation_failure():
     atoms = Atoms("H2", positions=[[0, 0, 0], [0.75, 0, 0]], calculator=EMT())
     atoms.info["sid"] = "molecule"
@@ -680,7 +746,7 @@ def test_same_directory_restarts_match_constrained_nve(tmp_path):
     def run(directory, steps, load=False, interval=None):
         checkpoint = tmp_path / "checkpoint"
         runner = MDRunner(
-            EMT(),
+            _StrictCellStressEMT(),
             VelocityVerletThermostat(),
             atoms.copy(),
             steps=steps,
@@ -703,6 +769,8 @@ def test_same_directory_restarts_match_constrained_nve(tmp_path):
     reference_frames = pd.read_parquet(reference_dir / "trajectory.parquet")
     frames = pd.read_parquet(tmp_path / "trajectory.parquet")
     assert list(frames.step) == list(range(10))
+    assert frames["stress"].isna().all()
+    assert frames["pressure"].isna().all()
     for name in ("energy", "kinetic_energy"):
         npt.assert_array_equal(frames[name], reference_frames[name])
     for name in ("positions", "forces"):

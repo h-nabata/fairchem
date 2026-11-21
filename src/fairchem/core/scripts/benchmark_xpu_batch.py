@@ -15,17 +15,28 @@ import math
 import multiprocessing
 import time
 from concurrent.futures import ProcessPoolExecutor
+from contextlib import closing, suppress
 from dataclasses import replace
+from itertools import islice
 from pathlib import Path
 
 import torch
 from ase.build import bulk
-from ase.io import read
+from ase.io import iread
 
 from fairchem.core.calculate import pretrained_mlip
 from fairchem.core.common.distutils import resolve_xpu_device
 from fairchem.core.datasets.atomic_data import AtomicData, atomicdata_list_to_batch
-from fairchem.core.units.mlip_unit.api.inference import inference_settings_xpu
+from fairchem.core.units.mlip_unit.api.inference import (
+    inference_settings_fp64,
+    inference_settings_xpu,
+)
+
+
+def _read_frames(path, limit):
+    # No need to retain (or construct) frames that cannot enter the workload.
+    with closing(iread(path, index=":")) as frames:
+        return list(islice(frames, limit))
 
 
 def _parity(serial, packed, atom_counts, energy_atol, force_atol):
@@ -87,6 +98,7 @@ def _worker(
     force_atol=1e-4,
     barrier=None,
     failed=None,
+    dtype="float32",
 ):
     try:
         return _measure(
@@ -100,10 +112,13 @@ def _worker(
             energy_atol,
             force_atol,
             failed,
+            dtype,
         )
     except BaseException:
         if barrier is not None:
-            barrier.abort()
+            # If the manager already exited, keep the original worker failure.
+            with suppress(Exception):
+                barrier.abort()
         raise
 
 
@@ -118,12 +133,17 @@ def _measure(
     energy_atol=1e-3,
     force_atol=1e-4,
     failed=None,
+    dtype="float32",
 ):
     device = resolve_xpu_device(device)
+    settings = replace(
+        inference_settings_fp64() if dtype == "float64" else inference_settings_xpu(),
+        merge_mole=False,
+    )
     predictor = pretrained_mlip.get_predict_unit(
         checkpoint,
         device=device,
-        inference_settings=replace(inference_settings_xpu(), merge_mole=False),
+        inference_settings=settings,
     )
     for atoms in structures:
         predictor.validate_atoms_data(atoms, task)
@@ -131,8 +151,9 @@ def _measure(
         AtomicData.from_ase(
             atoms,
             task_name=task,
-            target_dtype=torch.float32,
+            target_dtype=settings.base_precision_dtype,
             r_data_keys=["spin", "charge"],
+            read_labels=False,
         )
         for atoms in structures
     ]
@@ -146,6 +167,7 @@ def _measure(
     report = {
         "device": device,
         "device_name": torch.xpu.get_device_name(device),
+        "dtype": dtype,
         "systems_per_iteration": len(items),
         "natoms": atom_counts,
         "parity": parity,
@@ -172,10 +194,10 @@ def _measure(
             for item in inputs:
                 predictor.predict(item, **options)
         torch.xpu.synchronize(device)
+        torch.xpu.reset_peak_memory_stats(device)
         if barrier is not None:
             barrier.wait(timeout=1800)
         start = time.monotonic()
-        torch.xpu.reset_peak_memory_stats(device)
         for _ in range(repeats):
             for item in inputs:
                 predictor.predict(item, **options)
@@ -198,6 +220,12 @@ def main(argv=None):
         "--structure", type=Path, help="Read all frames of this ASE file"
     )
     parser.add_argument("--task", default="omat")
+    parser.add_argument(
+        "--dtype",
+        choices=("float32", "float64"),
+        default="float32",
+        help="model and input-geometry precision (default: float32)",
+    )
     parser.add_argument(
         "--energy-atol",
         type=float,
@@ -225,7 +253,7 @@ def main(argv=None):
     if len(set(devices)) != len(devices):
         parser.error("each process requires a distinct XPU")
     frames = (
-        read(args.structure, index=":")
+        _read_frames(args.structure, args.systems)
         if args.structure
         else [
             bulk("Cu", cubic=True),
@@ -253,7 +281,7 @@ def main(argv=None):
     # Every worker measures the identical workload. A spawn context prevents
     # the child from inheriting initialized accelerator state from its parent.
     if len(devices) == 1:
-        rows = [_worker(args.checkpoint, devices[0], *common)]
+        rows = [_worker(args.checkpoint, devices[0], *common, dtype=args.dtype)]
     else:
         ctx = multiprocessing.get_context("spawn")
         with (
@@ -263,7 +291,15 @@ def main(argv=None):
             barrier = manager.Barrier(len(devices))
             failed = manager.Event()
             pending = [
-                pool.submit(_worker, args.checkpoint, device, *common, barrier, failed)
+                pool.submit(
+                    _worker,
+                    args.checkpoint,
+                    device,
+                    *common,
+                    barrier,
+                    failed,
+                    dtype=args.dtype,
+                )
                 for device in devices
             ]
             rows = [future.result() for future in pending]
@@ -271,6 +307,7 @@ def main(argv=None):
         "workers": rows,
         "checkpoint": args.checkpoint,
         "task": args.task,
+        "dtype": args.dtype,
         "warmup": args.warmup,
         "repeats": args.repeats,
         "passed": all(row["parity"]["passed"] for row in rows),

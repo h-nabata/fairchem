@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import logging
 import os
-import shlex
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -250,7 +249,13 @@ class FixExternalCallback:
                 **self.graph_options,
             )
         else:
-            wrapped = wrap_positions(x, cell=cell[0].numpy(), pbc=periodicity, eps=0)
+            # The callback owns no LAMMPS coordinate memory. Keep an independent
+            # copy while avoiding a solve/reconstruction for nonperiodic systems.
+            wrapped = (
+                wrap_positions(x, cell=cell[0].numpy(), pbc=periodicity, eps=0)
+                if any(periodicity)
+                else x.copy()
+            )
             data = atomic_data_from_lammps_data(
                 wrapped,
                 atomic_numbers,
@@ -367,6 +372,75 @@ class FixExternalCallback:
                 f[:] = np.nan
 
 
+_TRIPLE_QUOTE = '"""'
+
+
+def _scan_input_quotes(line, quote=None):
+    """Track an open LAMMPS quote, ignoring comments outside quotes."""
+    index = 0
+    while index < len(line):
+        if quote is not None:
+            end = line.find(quote, index)
+            if end == -1:
+                return quote, len(line)
+            index = end + len(quote)
+            quote = None
+        elif line[index] == "#":
+            return quote, index
+        elif line[index] in ("'", '"'):
+            quote = (
+                _TRIPLE_QUOTE if line.startswith(_TRIPLE_QUOTE, index) else line[index]
+            )
+            index += len(quote)
+        else:
+            index += 1
+    return quote, len(line)
+
+
+def _logical_commands(lines):
+    """Join continued lines without evaluating later commands after a failure."""
+    parts = []
+    quote = None
+    for raw_line in lines:
+        line = raw_line.rstrip()
+        quote, _ = _scan_input_quotes(line, quote)
+        # Native Input::file trims each physical line and consumes a trailing
+        # ampersand before testing for an open triple quote.
+        if line.endswith("&"):
+            parts.append(line[:-1])
+        elif quote == _TRIPLE_QUOTE:
+            parts.extend((line, "\n"))
+        else:
+            parts.append(line)
+            yield "".join(parts)
+            parts.clear()
+            quote = None
+    if parts:
+        raise ValueError("Unterminated LAMMPS command continuation or triple quote")
+
+
+def _literal_command_words(line, *, limit=None):
+    """Inspect literal LAMMPS arguments without applying shell escape rules."""
+    words = []
+    _, comment = _scan_input_quotes(line)
+    line = line[:comment]
+    while (limit is None or len(words) < limit) and (line := line.lstrip()):
+        if line[0] in ("'", '"'):
+            quote = _TRIPLE_QUOTE if line.startswith(_TRIPLE_QUOTE) else line[0]
+            end = line.find(quote, len(quote))
+            if end == -1:
+                raise ValueError("Unmatched quote in LAMMPS command")
+            words.append(line[len(quote) : end])
+            line = line[end + len(quote) :]
+            if line and not line[0].isspace():
+                raise ValueError("LAMMPS argument quote must be followed by whitespace")
+        else:
+            word = line.split(maxsplit=1)[0]
+            words.append(word)
+            line = line[len(word) :]
+    return words
+
+
 class _FairChemLammps(lammps):
     """Execute through a Python error boundary for every simulation command."""
 
@@ -397,16 +471,8 @@ class _FairChemLammps(lammps):
         self.commands_list(source.splitlines())
 
     def commands_list(self, lines):
-        pending = ""
-        for raw_line in lines:
-            line = raw_line.rstrip()
-            if line.endswith("&") and not line.lstrip().startswith("#"):
-                pending += line[:-1]
-                continue
-            self.command(pending + line)
-            pending = ""
-        if pending:
-            raise ValueError("Unterminated LAMMPS command continuation")
+        for line in _logical_commands(lines):
+            self.command(line)
 
     def command(self, line):
         if not line:
@@ -414,12 +480,12 @@ class _FairChemLammps(lammps):
         callback = self._fc_callback
         if callback.error is not None:
             raise callback.error
-        words = shlex.split(line, comments=True, posix=True)
+        words = _literal_command_words(line, limit=1)
         if not words:
             return
         command = words[0]
         if command == "include":
-            args = shlex.split(self.expand(line), comments=True, posix=True)
+            args = _literal_command_words(self.expand(line))
             if len(args) != 2:
                 raise ValueError(f"Expected a single LAMMPS include filename: {line}")
             self.file(args[1])
@@ -427,7 +493,7 @@ class _FairChemLammps(lammps):
         if (
             command in {"jump", "if", "python", "partition"}
             or "$" in command
-            or (command == "run" and "every" in words[1:])
+            or (command == "run" and "every" in _literal_command_words(line)[1:])
         ):
             raise ValueError(
                 f"Unsupported nested LAMMPS command in FAIRChem script: {line}"
@@ -439,12 +505,12 @@ class _FairChemLammps(lammps):
             and self.extract_box()[-1]
         ):
             raise ValueError("Cell-changing simulations require compute_stress=True")
-        if (
-            command in {"fix", "unfix", "fix_modify"}
-            and len(words) > 1
-            and self.expand(words[1]) == FIX_EXT_ID
-        ):
-            raise ValueError(f"LAMMPS fix ID {FIX_EXT_ID!r} is reserved by FAIRChem")
+        if command in {"fix", "unfix", "fix_modify"}:
+            args = _literal_command_words(line, limit=2)
+            if len(args) > 1 and self.expand(args[1]) == FIX_EXT_ID:
+                raise ValueError(
+                    f"LAMMPS fix ID {FIX_EXT_ID!r} is reserved by FAIRChem"
+                )
         try:
             super().command(line)
         finally:

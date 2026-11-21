@@ -199,8 +199,8 @@ def get_neighbors_pymatgen(
 
     # Pymatgen searches in double precision. Obtain a superset and apply the
     # same squared-distance predicate and shell cap as graph v2 in model dtype.
-    pos = torch.as_tensor(atoms.get_positions(), dtype=target_dtype)
-    cell = torch.as_tensor(np.asarray(atoms.cell), dtype=target_dtype)
+    pos = torch.as_tensor(atoms.get_positions(), dtype=target_dtype, device="cpu")
+    cell = torch.as_tensor(np.asarray(atoms.cell), dtype=target_dtype, device="cpu")
     eps = torch.finfo(target_dtype).eps
     scale = cutoff + (float(pos.abs().max()) if atoms.pbc.any() and len(pos) else 0)
     _c_index, _n_index, _offsets, _ = struct.get_neighbor_list(
@@ -208,10 +208,10 @@ def get_neighbors_pymatgen(
     )
     order = np.argsort(_c_index, kind="stable")
     _c_index, _n_index, _offsets = _c_index[order], _n_index[order], _offsets[order]
-    shifts = torch.as_tensor(_offsets, dtype=target_dtype) @ cell
+    shifts = torch.as_tensor(_offsets, dtype=target_dtype, device="cpu") @ cell
     squared = (pos[_c_index] - (pos[_n_index] + shifts)).square().sum(-1)
     selected = torch.where((squared > 0) & (squared <= cutoff * cutoff))[0]
-    centers = torch.as_tensor(_c_index)[selected].long()
+    centers = torch.as_tensor(_c_index, dtype=torch.long, device="cpu")[selected]
     squared = squared[selected]
     if enforce_max_neighbors_strictly is None:
         # The original standalone converter uses Python slicing, including for
@@ -228,7 +228,7 @@ def get_neighbors_pymatgen(
         n_distance = np.sqrt(d2[kept])
     else:
         keep, _ = get_max_neighbors_mask(
-            torch.tensor([len(atoms)]),
+            torch.tensor([len(atoms)], dtype=torch.long, device="cpu"),
             centers,
             squared,
             max_neigh,
@@ -257,7 +257,9 @@ def reshape_features(
 ):
     """Stack center and neighbor index and reshapes distances,
     takes in np.arrays and returns torch tensors"""
-    edge_index = torch.LongTensor(np.vstack((n_index, c_index)))
+    edge_index = torch.as_tensor(
+        np.vstack((n_index, c_index)), dtype=torch.long, device="cpu"
+    )
     edge_distances = torch.tensor(n_distance, dtype=target_dtype, device="cpu")
     cell_offsets = torch.tensor(offsets, dtype=target_dtype, device="cpu")
 
@@ -511,9 +513,25 @@ class AtomicData:
         target_dtype: torch.dtype = torch.float32,
         external_graph_method: ExternalGraphMethod | str = ExternalGraphMethod.PYMATGEN,
         enforce_max_neighbors_strictly: bool | None = None,
+        read_labels: bool = True,
     ) -> AtomicData:
-        atoms = input_atoms.copy()
-        calc = input_atoms.calc
+        """
+        Convert an ASE structure to model tensors.
+
+        Set read_labels=False for inference that uses no reference energy,
+        forces or stress. Structural metadata is still retained.
+        """
+        # Only the code paths that change ASE geometry need an Atoms copy.
+        atoms = (
+            input_atoms.copy()
+            if r_edges or molecule_cell_size is not None
+            else input_atoms
+        )
+        if (
+            not np.isfinite(atoms.positions).all()
+            or not np.isfinite(atoms.cell.array).all()
+        ):
+            raise ValueError("Atomic positions and cell vectors must be finite")
         if np.all(np.asarray(atoms.pbc)) and atoms.cell.volume == 0:
             raise ValueError("A fully periodic structure requires a nonsingular cell")
         # TODO: maybe compute a safe cell size if not provided.
@@ -524,23 +542,25 @@ class AtomicData:
             # create a molecule box with the molecule centered on it if specified
             atoms.center(vacuum=(molecule_cell_size))
             atoms.pbc = np.array([True, True, True])
-        atomic_numbers = np.array(atoms.get_atomic_numbers(), copy=True)
-        pos = np.array(atoms.get_positions(), copy=True)
+        atomic_numbers = atoms.get_atomic_numbers()
+        pos = atoms.get_positions()
         pbc = np.array(atoms.pbc, copy=True)
+        is_periodic = pbc.any()
         physical_cell = atoms.cell.copy()
-        if pbc.any() and np.linalg.matrix_rank(physical_cell.array[pbc]) < pbc.sum():
+        if is_periodic and np.linalg.matrix_rank(physical_cell.array[pbc]) < pbc.sum():
             raise ValueError(
                 "Periodic lattice vectors must span a nonsingular subspace"
             )
         search_cell = physical_cell.copy()
-        if pbc.any() and physical_cell.volume == 0:
+        if is_periodic and physical_cell.volume == 0:
             search_cell[~pbc] = 0
         search_cell = search_cell.complete()
-        pos = wrap_positions(pos, search_cell, pbc=pbc, eps=0)
+        if is_periodic:
+            pos = wrap_positions(pos, search_cell, pbc=pbc, eps=0)
         # Keep the supplied physical volume for slabs/chains. A cell-less
         # nonperiodic molecule retains its historical completed model cell;
         # that completion has no physical molecular volume.
-        cell = np.array(physical_cell if pbc.any() else search_cell, copy=True)
+        cell = np.array(physical_cell if is_periodic else search_cell, copy=True)
 
         atomic_numbers = torch.from_numpy(atomic_numbers).long()
         pos = torch.from_numpy(pos)
@@ -563,7 +583,9 @@ class AtomicData:
             # Constraints must not restore the original unwrapped geometry.
             atoms.set_positions(pos.numpy(), apply_constraint=False)
             atoms.set_cell(
-                torch.as_tensor(np.asarray(search_cell)).to(target_dtype).numpy(),
+                torch.as_tensor(
+                    np.asarray(search_cell), dtype=target_dtype, device="cpu"
+                ).numpy(),
                 apply_constraint=False,
             )
             if external_graph_method == ExternalGraphMethod.PYMATGEN:
@@ -613,21 +635,23 @@ class AtomicData:
         # Explicit info labels take precedence. Validate only calculator labels
         # actually read, against the original ASE geometry (before wrapping).
         results = {}
-        if isinstance(calc, (SinglePointCalculator, SinglePointDFTCalculator)):
-            requested = {"energy"}
-            if r_forces:
-                requested.add("forces")
-            if r_stress:
-                requested.add("stress")
-            keys = (requested & calc.results.keys()) - atoms.info.keys()
-            if keys and (changes := calc.check_state(input_atoms)):
-                raise ValueError(
-                    f"Stale single-point labels after changes to {', '.join(changes)}"
-                )
-            results.update({key: calc.results[key] for key in keys})
-        for key in ("energy", "forces", "stress"):
-            if key in atoms.info:
-                results[key] = atoms.info[key]
+        if read_labels:
+            calc = input_atoms.calc
+            if isinstance(calc, (SinglePointCalculator, SinglePointDFTCalculator)):
+                requested = {"energy"}
+                if r_forces:
+                    requested.add("forces")
+                if r_stress:
+                    requested.add("stress")
+                keys = (requested & calc.results.keys()) - atoms.info.keys()
+                if keys and (changes := calc.check_state(input_atoms)):
+                    raise ValueError(
+                        f"Stale single-point labels after changes to {', '.join(changes)}"
+                    )
+                results.update({key: calc.results[key] for key in keys})
+            for key in ("energy", "forces", "stress"):
+                if key in atoms.info:
+                    results[key] = atoms.info[key]
         energy = (
             torch.tensor(results["energy"], dtype=target_dtype, device="cpu").reshape(1)
             if results.get("energy") is not None
