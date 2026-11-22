@@ -762,7 +762,11 @@ def test_conservative_predictor_is_invariant_to_large_lattice_image(
         str(checkpoint),
         device="cpu",
         inference_settings=InferenceSettings(
-            execution_mode=execution_mode, external_graph_gen=external, hessian_chunk_size=2
+            execution_mode=execution_mode,
+            external_graph_gen=external,
+            hessian_chunk_size=2,
+            activation_checkpointing=execution_mode == "general",
+            merge_mole=execution_mode == "umas_fast_portable",
         ),
     )
     props = ("energy", "forces", "stress", "hessian", "hessian_vector_product")
