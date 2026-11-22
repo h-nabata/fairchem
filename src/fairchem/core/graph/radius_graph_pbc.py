@@ -15,7 +15,11 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
-from fairchem.core.graph.geometry import needs_wide_image_math, wide_image_device
+from fairchem.core.graph.geometry import (
+    WIDE_TRANSLATION_SCALE,
+    needs_wide_image_math,
+    wide_image_device,
+)
 from fairchem.core.graph.portable_search import (
     _borrow_integer_cartesian_table,
     alternative_candidates,
@@ -267,16 +271,24 @@ def periodic_search_frame(data, flags, *, search_cell=None):
                 data.natoms, output_size=len(data.pos)
             )
         pos = data.pos.to(torch.promote_types(data.pos.dtype, cell.dtype))
-        # Center the search frame on the origin. Wrapping a tiny negative
-        # coordinate to one whole cell can round the displacement away in FP32.
         if len(cell) == 1:
             frac = pos @ reciprocal[0].T.to(pos)
-            fractional_images = torch.where(flags, frac.round(), 0)
         else:
             frac = (reciprocal[batch].to(pos) @ pos.unsqueeze(-1)).squeeze(-1)
-            fractional_images = torch.where(
-                flags.expand(len(cell), -1)[batch], frac.round(), 0
-            )
+        # Preserve the original [0, 1) frame and its edge ordering on ordinary
+        # cells. For a long lattice vector use the nearest origin so a small
+        # negative coordinate does not become a poorly resolved positive one.
+        long_axis = cell.detach().abs().amax(dim=-1) >= WIDE_TRANSLATION_SCALE
+        if len(cell) > 1:
+            long_axis = long_axis[batch]
+            flags_per_atom = flags.expand(len(cell), -1)[batch]
+        else:
+            flags_per_atom = flags
+        lower = frac.floor()
+        # If the subtracted fractional part rounds to exactly 1, the upper
+        # origin retains a representable residual that would otherwise vanish.
+        images = torch.where(long_axis, frac.round(), lower + (frac - lower == 1))
+        fractional_images = torch.where(flags_per_atom, images, 0)
     if pos.dtype == torch.float32 and bool(
         needs_wide_image_math(fractional_images, cell)
     ):

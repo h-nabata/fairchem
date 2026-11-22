@@ -355,3 +355,18 @@ def test_centered_local_frame_preserves_both_cutoff_directions(
     torch.testing.assert_close(
         graph["edge_distance"], pos.new_tensor(expected), atol=1e-12, rtol=1e-6
     )
+
+
+def test_compact_and_long_axes_choose_independent_periodic_origins():
+    # Ordinary compact-cell coordinates retain their historical frame and edge
+    # traversal for FP32 model reductions. Only the long (y) axis needs centering.
+    pos = torch.tensor([[17.0, -0.25, 30.0], [12.1, 0.25, -1e-8]])
+    cell = torch.diag(pos.new_tensor([24.0, 1e7, 24.0])).unsqueeze(0)
+    data = SimpleNamespace(pos=pos, cell=cell, natoms=torch.tensor([2]))
+    local, images, _ = radius_graph_pbc.periodic_search_frame(
+        data, torch.ones((1, 3), dtype=torch.bool)
+    )
+    torch.testing.assert_close(images, torch.tensor([[0, 0, 1], [0, 0, 0]]))
+    torch.testing.assert_close(
+        local, pos.new_tensor([[17.0, -0.25, 6.0], [12.1, 0.25, -1e-8]]), atol=0, rtol=0
+    )

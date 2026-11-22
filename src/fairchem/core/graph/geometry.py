@@ -12,6 +12,9 @@ import torch
 from ase.geometry import complete_cell
 from ase.geometry.minkowski_reduction import minkowski_reduce
 
+# FP32 spacing reaches roughly 0.002 Å for Cartesian values at this scale.
+WIDE_TRANSLATION_SCALE = 16384
+
 
 def needs_wide_image_math(images, lattice_rows):
     """Detect image IDs or Cartesian translations that lose local FP32 precision."""
@@ -20,7 +23,7 @@ def needs_wide_image_math(images, lattice_rows):
     widths = (
         lattice_rows.detach().abs().reshape(-1, images.shape[-1], 3).amax(dim=(0, 2))
     )
-    limits = 16384 / widths.clamp_min(1)
+    limits = WIDE_TRANSLATION_SCALE / widths.clamp_min(1)
     return (images.abs() >= limits).any()
 
 
