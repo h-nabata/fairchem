@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Literal
 import torch
 
 from fairchem.core.common import gp_utils
+from fairchem.core.graph.compute import EdgeVirial
 from fairchem.core.models.uma.nn.approximate_ops import (
     compensated_node_sum,
     compensated_reduction_enabled,
@@ -259,6 +260,54 @@ def compute_forces(
     return forces
 
 
+def _virial_products(gradient, coordinates, batch, num_systems):
+    """Sum FP64 outer products without constructing a [N,3,3] array."""
+    g, r = gradient.double(), coordinates.double()
+    if num_systems == 1:
+        return torch.stack(
+            [(col[:, None] * r).sum(0) for col in g.unbind(1)]
+        ).unsqueeze(0)
+    return torch.stack(
+        [
+            r.new_zeros(num_systems, 3).index_add_(0, batch, col[:, None] * r)
+            for col in g.unbind(1)
+        ],
+        dim=1,
+    )
+
+
+def _edge_virial_gradients(energy, pos, cell, batch, edges, training, retain_graph):
+    # A homogeneous strain sends each real edge d to d @ (I + epsilon).
+    # The strain derivative is the sum of outer products of d and dE/dd.
+    # The edge adjoints are already traversed during the force backward.
+    if edges.risk is None:
+        grad_pos, grad_edge = _energy_gradients(
+            energy, (pos, edges.vectors), training, retain_graph=retain_graph
+        )
+        virial = _virial_products(grad_edge, edges.vectors, edges.systems, len(cell))
+    else:
+        grad_pos, grad_cell, grad_edge = _energy_gradients(
+            energy, (pos, cell, edges.vectors), training, retain_graph=retain_graph
+        )
+        # Select before products. A drifting trajectory can have overflowing or
+        # cancelling coordinate moments that must never enter the batched sum.
+        edge_ids = edges.risk[edges.systems].nonzero().flatten()
+        atom_ids = (~edges.risk[batch]).nonzero().flatten()
+        virial = _virial_products(
+            torch.cat((grad_edge[edge_ids], grad_pos[atom_ids])),
+            torch.cat((edges.vectors[edge_ids], pos[atom_ids])),
+            torch.cat((edges.systems[edge_ids], batch[atom_ids])),
+            len(cell),
+        )
+        compact_cell_grad = grad_cell.masked_fill(edges.risk[:, None, None], 0).double()
+        cell_virial = (cell.double().unsqueeze(3) * compact_cell_grad.unsqueeze(2)).sum(
+            1
+        )
+        # Atomic/edge products above use g.T @ r. Match their orientation here.
+        virial = virial + cell_virial.mT
+    return grad_pos, virial
+
+
 def compute_forces_and_stress(
     energy_part: torch.Tensor,
     pos: torch.Tensor,
@@ -267,7 +316,7 @@ def compute_forces_and_stress(
     training: bool = True,
     *,
     retain_graph: bool = False,
-    edge_strain: torch.Tensor | None = None,
+    edge_strain: torch.Tensor | EdgeVirial | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute forces and stress from energy using autograd.
 
@@ -288,8 +337,8 @@ def compute_forces_and_stress(
         batch: Batch indices mapping each node to its system, shape [N].
         training: Whether to create graph for higher-order gradients.
         retain_graph: Keep the shared backbone graph for another head.
-        edge_strain: Zero strain applied to the actual edge vectors before
-            evaluating the energy, when absolute-coordinate virials would cancel.
+        edge_strain: Real-edge derivative inputs or explicit zero strain, when
+            absolute-coordinate virials would cancel.
 
     Returns:
         A tuple of (forces, stress) where:
@@ -310,6 +359,13 @@ def compute_forces_and_stress(
         raise ValueError(
             f"Stress requires a finite, nonzero cell volume for systems {invalid}"
         )
+
+    if isinstance(edge_strain, EdgeVirial):
+        grad_pos, virial = _edge_virial_gradients(
+            energy_part, pos, cell, batch, edge_strain, training, retain_graph
+        )
+        stress = (virial + virial.mT) * 0.5 / volume[:, None, None]
+        return -grad_pos, stress.reshape(-1, 9)
 
     if edge_strain is not None:
         grad_pos, grad_strain = _energy_gradients(
@@ -335,21 +391,7 @@ def compute_forces_and_stress(
         per_atom = grads[0].unsqueeze(2) * pos.unsqueeze(1)
         pos_virial, _ = reduce_node_to_system(per_atom, batch, num_systems)
     else:
-        g, r = grads[0].double(), pos.double()
-        if num_systems == 1:
-            pos_virial = torch.stack(
-                [(col[:, None] * r).sum(0) for col in g.unbind(1)]
-            ).unsqueeze(0)
-        else:
-            # Limit temporaries to three components per atom, even for large
-            # batches. Communicate the completed virial only once per GP rank.
-            pos_virial = torch.stack(
-                [
-                    r.new_zeros(num_systems, 3).index_add_(0, batch, col[:, None] * r)
-                    for col in g.unbind(1)
-                ],
-                dim=1,
-            )
+        pos_virial = _virial_products(grads[0], pos, batch, num_systems)
         if gp_utils.initialized():
             pos_virial = gp_utils.reduce_from_model_parallel_region(pos_virial)
 
