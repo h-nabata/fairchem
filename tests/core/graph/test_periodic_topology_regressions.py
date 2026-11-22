@@ -25,6 +25,7 @@ from fairchem.core.graph.compute import (
 )
 from fairchem.core.graph.neighbor_cache import VerletNeighborCache
 from fairchem.core.models.uma.escn_md import eSCNMDBackbone
+from fairchem.core.models.uma.outputs import compute_forces_and_stress
 from tests.core.graph.test_radius_graph_memory import _LargestTensor
 
 
@@ -448,6 +449,92 @@ def test_local_edge_strain_preserves_virial_for_mixed_translated_systems(mode):
         assert cache.hits == 1
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64], ids=["fp32", "fp64"])
+@pytest.mark.parametrize("device", ["cpu", "xpu"])
+def test_external_stress_batch_matches_independent_virials_and_training_gradients(
+    dtype, device
+):
+    if device == "xpu" and not torch.xpu.is_available():
+        pytest.skip("Requires a real Intel XPU")
+    # The two dimers have identical local vectors, including shear components.
+    # The first crosses a normal cell boundary. The second spans 33,333,333
+    # cells. The isolated atom has no real edges and also triggers the guard.
+    cases = ((2.75, 0.5, 1), (32768.0, None, 0), (0.25, 1e8, -33333333))
+
+    def evaluate(systems):
+        coordinates = []
+        forward, offsets = [], []
+        counts = []
+        for left, right, image in systems:
+            first = len(coordinates)
+            coordinates.append([left, 0.125, 0.25])
+            counts.append(1 if right is None else 2)
+            if right is not None:
+                coordinates.append([right, 0.5, 0.75])
+                forward.append([first + 1, first])
+                offsets.append([image, 0, 0])
+        pos = torch.tensor(coordinates, requires_grad=True, dtype=dtype, device=device)
+        cell = (
+            torch.diag(pos.new_tensor([3, 4, 6]))
+            .repeat(len(systems), 1, 1)
+            .requires_grad_()
+        )
+        counts = torch.tensor(counts, device=device)
+        batch = torch.arange(len(systems), device=device).repeat_interleave(counts)
+        # Interleave edges belonging to different systems at the external API.
+        edges = torch.tensor(forward, dtype=torch.long, device=device).reshape(-1, 2).T
+        images = torch.tensor(offsets, dtype=torch.long, device=device).reshape(-1, 3)
+        graph = eSCNMDBackbone._generate_graph(
+            SimpleNamespace(
+                otf_graph=False,
+                cutoff=2,
+                regress_config=SimpleNamespace(direct_stress=False),
+            ),
+            {
+                "pos": pos,
+                "cell": cell,
+                "batch": batch,
+                "edge_index": torch.cat([edges, edges.flip(0)], dim=1),
+                "cell_offsets": torch.cat([images, -images]),
+                "nedges": (counts - 1) * 2,
+                "_resolved_requested_properties": {"stress"},
+            },
+        )
+        if len(systems) > 1:
+            # The compact dimer must retain the ordinary position/cell route.
+            assert graph["edge_strain"].risk.tolist() == [False, True, True]
+        vectors = graph["edge_distance_vec"]
+        energy = graph["edge_distance"].square() * vectors.square().sum(dim=1) / 2
+        if "edge_valid" in graph:
+            energy = energy[graph["edge_valid"]]
+        forces, stress = compute_forces_and_stress(
+            energy.sum(),
+            pos,
+            cell,
+            batch,
+            training=True,
+            edge_strain=graph.get("edge_strain"),
+        )
+        # Reverse through the force and stress graphs independently.
+        curvature = torch.autograd.grad(forces.square().sum(), pos, retain_graph=True)[
+            0
+        ]
+        stress_gradient = torch.autograd.grad(stress.sum(), pos)[0]
+        return forces, stress.reshape(-1, 3, 3), curvature, stress_gradient
+
+    mixed = evaluate(cases)
+    independent = [evaluate([case]) for case in cases]
+    for actual, separate in zip(mixed, zip(*independent, strict=True), strict=True):
+        torch.testing.assert_close(actual, torch.cat(separate))
+
+    local = mixed[1].new_tensor([0.75, 0.375, 0.5])
+    # E = |d|⁴ per dimer, so dE/dε = 4 |d|² (d⊗d).
+    expected = 4 * local.square().sum() * torch.outer(local, local) / 72
+    torch.testing.assert_close(
+        mixed[1], torch.stack([expected, 0 * expected, expected])
+    )
+
+
 def test_edge_strain_keeps_small_graph_and_supports_empty_large_partition():
     cell = torch.eye(3).unsqueeze(0)
     pos = torch.zeros((2, 3))
@@ -500,3 +587,52 @@ def test_local_strain_matches_fixed_fractional_shear_and_training_derivative():
     torch.testing.assert_close(shear, finite_difference, rtol=1e-10, atol=1e-10)
     (training_gradient,) = torch.autograd.grad(shear, scale)
     torch.testing.assert_close(training_gradient, scale.new_tensor(0.75))
+
+
+def test_external_stress_reuses_image_decision_and_updates_it_each_forward(monkeypatch):
+    from fairchem.core.models.uma import escn_md
+
+    backbone = SimpleNamespace(
+        otf_graph=False,
+        regress_config=SimpleNamespace(direct_stress=False),
+    )
+    pos = torch.tensor([[0.25, 0.0, 0.0], [1.0, 0.0, 0.0]], requires_grad=True)
+    cell = torch.diag(torch.tensor([3.0, 6.0, 6.0])).unsqueeze(0).requires_grad_()
+    offsets = torch.zeros(2, 3, dtype=torch.long)
+    data = {
+        "pos": pos,
+        "cell": cell,
+        "edge_index": torch.tensor([[1, 0], [0, 1]]),
+        "cell_offsets": offsets,
+        "nedges": torch.tensor([2]),
+        "batch": torch.zeros(2, dtype=torch.long),
+        "_resolved_requested_properties": {"stress"},
+    }
+    geometry = escn_md.external_edge_geometry
+    wide_inputs = []
+
+    def observe(*args, **kwargs):
+        wide_inputs.append(bool(kwargs["_wide_images"]))
+        return geometry(*args, **kwargs)
+
+    monkeypatch.setattr(escn_md, "external_edge_geometry", observe)
+    # Reuse the same input tensors as in an MD loop. The vacuum axis can
+    # require a stable virial even when no edge crosses that axis.
+    for height, x, image in (
+        (6, 1, 0),
+        (65536, 1, 0),
+        (6, 100000000, -33333333),
+        (6, 1, 0),
+    ):
+        with torch.no_grad():
+            cell[0, 2, 2] = height
+            pos[1, 0] = x
+            offsets[:, 0] = offsets.new_tensor([image, -image])
+        graph = escn_md.eSCNMDBackbone._generate_graph(backbone, data)
+        torch.testing.assert_close(
+            graph["edge_distance_vec"][:, 0],
+            pos.new_tensor([0.75, -0.75]),
+            rtol=0,
+            atol=0,
+        )
+    assert wide_inputs == [False, False, True, False]

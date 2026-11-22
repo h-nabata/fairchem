@@ -58,6 +58,15 @@ partial-periodic cell can be used for energy and forces. For compatibility,
 Any stress calculated directly with that model cell refers to the completed
 volume, which need not correspond to a physical volume of the molecule.
 
+For conservative UMA stress on a single device, each structure in a batch
+uses the virial appropriate to its coordinates, cell, and periodic image
+offsets. For a structure with large translations, the model contracts local
+edge vectors with their energy gradients in FP64. Other structures use the
+usual position and cell gradients. A single backward pass supplies the forces
+and the gradients for both virials. With an external neighbor list, the model
+evaluates the image precision requirement once per forward, so changes to
+positions, cells, or image offsets take effect on the next call.
+
 An input larger than a budget is rejected before prediction. These limits never
 truncate model neighbors. `max_edges` can additionally limit graph size:
 

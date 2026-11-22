@@ -16,6 +16,11 @@ from ase.geometry.minkowski_reduction import minkowski_reduce
 WIDE_TRANSLATION_SCALE = 16384
 
 
+def image_precision_limits(lattice_widths):
+    """Per-axis image magnitudes at which FP32 can lose local precision."""
+    return WIDE_TRANSLATION_SCALE / lattice_widths.clamp_min(1)
+
+
 def needs_wide_image_math(images, lattice_rows):
     """Detect image IDs or Cartesian translations that lose local FP32 precision."""
     # Bound each periodic axis separately: a long vacuum axis with zero
@@ -23,8 +28,10 @@ def needs_wide_image_math(images, lattice_rows):
     widths = (
         lattice_rows.detach().abs().reshape(-1, images.shape[-1], 3).amax(dim=(0, 2))
     )
-    limits = WIDE_TRANSLATION_SCALE / widths.clamp_min(1)
-    return (images.abs() >= limits).any()
+    # Cast integer IDs before abs: the most negative signed integer has no
+    # positive representation. All IDs near the threshold are exact in FP32.
+    values = images if images.is_floating_point() else images.float()
+    return (values.abs() >= image_precision_limits(widths)).any()
 
 
 def wide_image_device(device):

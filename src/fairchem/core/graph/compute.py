@@ -8,12 +8,13 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
 from fairchem.core.graph.geometry import (
     WIDE_TRANSLATION_SCALE,
+    image_precision_limits,
     needs_wide_image_math,
     wide_image_device,
 )
@@ -230,25 +231,63 @@ def filter_edges_by_node_partition(
     return edge_index, cell_offsets, new_neighbors
 
 
-def edge_strain_for_stress(graph, pos, cell, atom_batch, *, cell_offsets=None):
-    """Introduce a homogeneous strain on real edge vectors when virials risk cancellation.
+class EdgeVirial(NamedTuple):
+    """Real edges before padding or reordering, for the zero-strain derivative."""
 
-    At fixed topology each edge transforms as d -> d(I + strain). Differentiating
-    this local expression avoids subtracting large independent coordinate and cell
-    moments. The energy still depends on the caller's original positions and cells.
+    vectors: torch.Tensor
+    systems: torch.Tensor | None
+    risk: torch.Tensor | None  # None means every system uses its local edges.
+
+
+def edge_strain_for_stress(
+    graph,
+    pos,
+    cell,
+    atom_batch,
+    *,
+    cell_offsets=None,
+    stress_risk=None,
+    selective=False,
+):
+    """Prepare the symmetric strain derivative for potentially cancelling virials.
+
+    The selective single-device path retains the real Cartesian edge vectors so
+    the head can contract their adjoints only for affected structures. The
+    explicit-strain path also exposes a differentiable strain tensor to callers.
     """
-    if not len(cell):
+    if not len(cell) or stress_risk is False:
         return None
-    # Use full, unpartitioned inputs so that graph-parallel ranks, including
-    # those with no real edges, select the same backward collective.
-    with torch.no_grad():
-        large = (pos.abs() >= WIDE_TRANSLATION_SCALE).any() | (
-            cell.abs() >= WIDE_TRANSLATION_SCALE
-        ).any()
-        if cell_offsets is not None and cell_offsets.numel():
-            large = large | needs_wide_image_math(cell_offsets, cell)
-        if not bool(large):
-            return None
+    if stress_risk is None:
+        if selective:
+            _, stress_risk = stress_geometry_risks(
+                pos, cell, atom_batch, graph["edge_index"], cell_offsets
+            )
+            if stress_risk is False:
+                return None
+        else:
+            # All GP ranks must see the full inputs, even ranks without edges.
+            with torch.no_grad():
+                large = (pos.abs() >= WIDE_TRANSLATION_SCALE).any() | (
+                    cell.abs() >= WIDE_TRANSLATION_SCALE
+                ).any()
+                if cell_offsets is not None and cell_offsets.numel():
+                    large = large | needs_wide_image_math(cell_offsets, cell)
+                if not bool(large):
+                    return None
+    if selective:
+        vectors = graph["edge_distance_vec"]
+        if not vectors.requires_grad:
+            vectors = vectors.detach().requires_grad_()
+            graph["edge_distance_vec"] = vectors
+        # Both radial and angular derivatives must pass through these exact
+        # vectors, including for filtered, cached and externally supplied edges.
+        graph["edge_distance"] = vectors.norm(dim=-1)
+        systems = atom_batch[graph["edge_index"][1]].long() if len(cell) > 1 else None
+        return EdgeVirial(
+            vectors,
+            systems,
+            None if stress_risk is True or len(cell) == 1 else stress_risk,
+        )
 
     strain = torch.zeros_like(cell, dtype=torch.float64, requires_grad=True)
     vectors = graph["edge_distance_vec"]
@@ -271,18 +310,102 @@ def edge_strain_for_stress(graph, pos, cell, atom_batch, *, cell_offsets=None):
     return strain
 
 
-def external_edge_geometry(pos, edges, cell, cells, counts):
+def _external_image_risks(cell_abs, atom_batch, edge_index, offsets):
+    limits = image_precision_limits(cell_abs.amax(-1))
+    wide = None
+    if offsets.device.type == "cpu" and not torch.compiler.is_compiling():
+        # A signed range per axis avoids an [edges, 3] temporary and handles
+        # the most negative signed image ID. Ordinary CPU batches stop here.
+        low, high = torch.aminmax(offsets, dim=0)
+        bound = limits.amin(0)
+        wide = ((low <= -bound) | (high >= bound)).any()
+        if len(limits) == 1 or not bool(wide):
+            return wide, wide
+
+    # Group by the edge's actual owner; an empty system keeps zero peaks.
+    # Integer IDs near the maximum threshold of 16384 are exact in FP32.
+    images = offsets if offsets.is_floating_point() else offsets.float()
+    images = images.abs()
+    if len(limits) == 1:
+        wide = (images.amax(0) >= limits[0]).any()
+        return wide, wide
+    owner = atom_batch[edge_index[1]].long()
+    peaks = images.new_zeros((len(limits), 3))
+    peaks.scatter_reduce_(0, owner[:, None].expand_as(images), images, "amax")
+    risk = (peaks >= limits).any(1)
+    if wide is None:
+        # Preserve the existing batch-wide precision gate for edge geometry.
+        wide = (peaks.amax(0) >= limits.amin(0)).any()
+    return wide, risk
+
+
+@torch.no_grad()
+def stress_geometry_risks(pos, cell, atom_batch, edge_index=None, cell_offsets=None):
+    """Classify image arithmetic and the stress route for this forward pass.
+
+    Image translation uses a batch-wide bound. Each stress virial uses the
+    actual lattice of the edge's system. A bool denotes a homogeneous batch.
+    """
+    large_coords = pos.detach().abs() >= WIDE_TRANSLATION_SCALE
+    cell_abs = cell.detach().abs()
+    large_cell = cell_abs >= WIDE_TRANSLATION_SCALE
+    any_stress = large_cell.any() | large_coords.any()
+    wide_images = None
+    image_risk = None
+    if cell_offsets is not None and cell_offsets.numel():
+        wide_images, image_risk = _external_image_risks(
+            cell_abs, atom_batch, edge_index, cell_offsets.detach()
+        )
+        any_stress = any_stress | image_risk.any()
+
+    if cell.device.type == "cpu" or torch.compiler.is_compiling():
+        if not bool(any_stress):
+            return wide_images, False
+        if len(cell) == 1:
+            return wide_images, True
+
+    if len(cell) == 1:
+        cell_risk = any_stress.reshape(1)
+    else:
+        cell_risk = large_cell.any(dim=(1, 2))
+        if image_risk is not None:
+            cell_risk = cell_risk | image_risk
+        cell_risk.scatter_reduce_(0, atom_batch.long(), large_coords.any(-1), "amax")
+    if cell.device.type != "cpu" and not torch.compiler.is_compiling():
+        # One transfer selects native/wide edge geometry and ordinary/local
+        # virials for the batch, including the all-local fast path.
+        count = cell_risk.sum()
+        if wide_images is None:
+            num_local = int(count)
+        else:
+            flag, num_local = torch.stack((wide_images.to(count.dtype), count)).tolist()
+            wide_images = bool(flag)
+        if num_local == 0 or num_local == len(cell):
+            return wide_images, num_local != 0
+    elif bool(cell_risk.all()):
+        return wide_images, True
+    return wide_images, cell_risk
+
+
+def external_edge_geometry(pos, edges, cell, cells, counts, *, _wide_images=None):
     """Cancel large image translations before rounding to the model dtype."""
     if pos.dtype != cell.dtype:
         dtype = torch.promote_types(pos.dtype, cell.dtype)
         vectors, shifts = external_edge_geometry(
-            pos.to(dtype), edges, cell.to(dtype), cells, counts
+            pos.to(dtype),
+            edges,
+            cell.to(dtype),
+            cells,
+            counts,
+            _wide_images=_wide_images if dtype == cell.dtype else None,
         )
         return vectors, shifts.to(cell)
     if pos.dtype == torch.float32 and cells.numel():
         # Even an exactly representable floating image ID can produce a
         # rounded Cartesian shift when multiplied by a nonbinary cell vector.
-        large = needs_wide_image_math(cells, cell)
+        large = (
+            needs_wide_image_math(cells, cell) if _wide_images is None else _wide_images
+        )
         if torch.compiler.is_compiling():
             # torch.cond does not propagate higher-order derivatives on the
             # supported PyTorch versions. Choose the forward value without AD;

@@ -35,6 +35,7 @@ from fairchem.core.graph.compute import (
     filter_edges_by_node_partition,
     generate_graph,
     spatially_order_graph,
+    stress_geometry_risks,
 )
 from fairchem.core.models.base import HeadInterface, supports_graph_retention
 from fairchem.core.models.uma.common.quaternion.quaternion_wigner_utils import (
@@ -756,6 +757,11 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
                 node_partition.numel() > 0
             ), "Looks like there are no atoms in this graph parallel partition. Cannot proceed"
 
+        needs_strain = (
+            "stress" in data_dict.get("_resolved_requested_properties", ())
+            and not self.regress_config.direct_stress
+        )
+        stress_risk = None
         if self.otf_graph:
             pbc = None
             if self.always_use_pbc:
@@ -813,8 +819,22 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
                 edges, cells, counts = filter_edges_by_node_partition(
                     node_partition, edges, cells, counts, len(data_dict["pos"])
                 )
+            wide_images = None
+            if needs_strain and node_partition is None:
+                wide_images, stress_risk = stress_geometry_risks(
+                    data_dict["pos"],
+                    data_dict["cell"],
+                    data_dict["batch"],
+                    edges,
+                    cells,
+                )
             vectors, _ = external_edge_geometry(
-                data_dict["pos"], edges, data_dict["cell"], cells, counts
+                data_dict["pos"],
+                edges,
+                data_dict["cell"],
+                cells,
+                counts,
+                _wide_images=wide_images,
             )
             graph_dict = {
                 "edge_index": edges,
@@ -822,16 +842,15 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
                 "edge_distance_vec": vectors,
             }
 
-        if (
-            "stress" in data_dict.get("_resolved_requested_properties", ())
-            and not self.regress_config.direct_stress
-        ):
+        if needs_strain:
             strain = edge_strain_for_stress(
                 graph_dict,
                 data_dict["pos"],
                 data_dict["cell"],
                 data_dict["batch"],
                 cell_offsets=None if self.otf_graph else data_dict["cell_offsets"],
+                stress_risk=stress_risk,
+                selective=node_partition is None,
             )
             if strain is not None:
                 graph_dict["edge_strain"] = strain
