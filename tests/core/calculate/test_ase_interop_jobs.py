@@ -28,7 +28,10 @@ from fairchem.core.calculate.ase_calculator import (
     FormationEnergyCalculator,
     pretrained_mlip,
 )
-from fairchem.core.units.mlip_unit.api.inference import InferenceSettings
+from fairchem.core.units.mlip_unit.api.inference import (
+    InferenceSettings,
+    validate_uma_atoms_data,
+)
 
 
 class BufferPredictor:
@@ -98,6 +101,20 @@ def test_metadata_arrays_and_nested_mutation_do_not_contaminate_cache():
     atoms.info["charge"] = 1
     before = atoms.calc.results["energy"]
     assert atoms.get_potential_energy() == pytest.approx(before + 1)
+
+
+@pytest.mark.parametrize(("field", "invalid"), [("charge", False), ("spin", 1.0)])
+def test_cached_result_revalidates_charge_and_spin_types(field, invalid):
+    predictor = BufferPredictor()
+    predictor.validate_atoms_data = validate_uma_atoms_data
+    atoms = _atoms()
+    atoms.calc = FAIRChemCalculator(predictor, task_name="omol")
+    energy = atoms.get_potential_energy()
+    atoms.info[field] = invalid
+    with pytest.raises(TypeError, match=f"Invalid type for {field}"):
+        atoms.get_potential_energy()
+    atoms.info[field] = int(invalid)
+    assert atoms.get_potential_energy() == energy
 
 
 @pytest.mark.parametrize("formation", [False, True])

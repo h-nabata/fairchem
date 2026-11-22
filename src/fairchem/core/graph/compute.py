@@ -346,6 +346,17 @@ def stress_geometry_risks(pos, cell, atom_batch, edge_index=None, cell_offsets=N
     Image translation uses a batch-wide bound. Each stress virial uses the
     actual lattice of the edge's system. A bool denotes a homogeneous batch.
     """
+    if torch.compiler.is_compiling():
+        # A captured graph must keep the same derivative inputs as coordinates
+        # move between periodic images. Local edge virials are valid for every
+        # system. Only the geometry precision gate needs a data-dependent value.
+        wide_images = (
+            needs_wide_image_math(cell_offsets, cell)
+            if cell_offsets is not None and cell_offsets.numel()
+            else None
+        )
+        return wide_images, True
+
     large_coords = pos.detach().abs() >= WIDE_TRANSLATION_SCALE
     cell_abs = cell.detach().abs()
     large_cell = cell_abs >= WIDE_TRANSLATION_SCALE
@@ -358,7 +369,7 @@ def stress_geometry_risks(pos, cell, atom_batch, edge_index=None, cell_offsets=N
         )
         any_stress = any_stress | image_risk.any()
 
-    if cell.device.type == "cpu" or torch.compiler.is_compiling():
+    if cell.device.type == "cpu":
         if not bool(any_stress):
             return wide_images, False
         if len(cell) == 1:
@@ -371,7 +382,7 @@ def stress_geometry_risks(pos, cell, atom_batch, edge_index=None, cell_offsets=N
         if image_risk is not None:
             cell_risk = cell_risk | image_risk
         cell_risk.scatter_reduce_(0, atom_batch.long(), large_coords.any(-1), "amax")
-    if cell.device.type != "cpu" and not torch.compiler.is_compiling():
+    if cell.device.type != "cpu":
         # One transfer selects native/wide edge geometry and ordinary/local
         # virials for the batch, including the all-local fast path.
         count = cell_risk.sum()
@@ -438,21 +449,30 @@ def _wide_external_geometry(pos, edges, cell, cells, counts):
     shifts = edge_cell_offsets(
         cell.to(device=device, dtype=torch.float64), cells.to(device), counts.to(device)
     )
-    return (wide_pos[row] - wide_pos[col] + shifts).to(pos), shifts.to(cell)
+    vectors = _translated_edge_vectors(wide_pos[row], wide_pos[col], shifts)
+    return vectors.to(pos), shifts.to(cell)
 
 
 def _native_external_geometry(pos, edges, cell, cells, counts):
     shifts = edge_cell_offsets(cell, cells, counts)
-    source, target = pos[edges[0]], pos[edges[1]]
-    # Keep the original operation order except when the endpoint difference
-    # and image shift cancel to a small residual.
+    return _translated_edge_vectors(pos[edges[0]], pos[edges[1]], shifts), shifts
+
+
+def _translated_edge_vectors(source, target, shifts):
+    # Near cancellation, add the smallest term last. In particular, when both
+    # endpoints have a large common origin, subtract them before adding the
+    # shift: applying it to either large endpoint can round away a short bond.
     direct = source - target + shifts
+    source_abs, target_abs, shift_abs = source.abs(), target.abs(), shifts.abs()
     translated = torch.where(
-        source.abs() > target.abs(),
+        source_abs > target_abs,
         (source + shifts) - target,
         source - (target - shifts),
     )
-    return torch.where(direct.abs() < shifts.abs() * 0.01, translated, direct), shifts
+    use_translated = (direct.abs() < shift_abs * 0.01) & (
+        shift_abs >= torch.minimum(source_abs, target_abs)
+    )
+    return torch.where(use_translated, translated, direct)
 
 
 def get_pbc_distances(

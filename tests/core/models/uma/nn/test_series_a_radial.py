@@ -116,6 +116,40 @@ def test_element_cache_invalidates_on_mutation_and_dtype_conversion():
     assert all(x.dtype == torch.float32 for x in output)
 
 
+def test_upstream_packed_radial_state_restores_shared_epsilon_and_cache():
+    radial_mlps = [RadialMLP([10, 6, 6, 12]).double() for _ in range(2)]
+    for mlp in radial_mlps:
+        mlp.net[1].eps = mlp.net[4].eps = 0.035
+    radial = UnifiedRadialMLP(radial_mlps)
+    # These fields and persistent buffers are the complete upstream module.
+    state = torch.nn.Module.__getstate__(radial)
+    state["_buffers"] = dict(radial.named_buffers())
+    state["_non_persistent_buffers_set"] = set()
+    for key in (
+        "ln1_eps",
+        "ln2_eps",
+        "hidden2_features",
+        "_element_cache_key",
+        "_element_cache_owners",
+        "_element_cache_event",
+    ):
+        del state[key]
+    restored = UnifiedRadialMLP.__new__(UnifiedRadialMLP)
+    restored.__setstate__(state)
+
+    distance = torch.randn(3, 4, dtype=torch.float64, requires_grad=True)
+    source, target = (torch.randn(4, 3, dtype=torch.float64) for _ in range(2))
+    actual, expected = _decomposed(restored, distance, source, target)
+    for i, (a, b) in enumerate(zip(actual, expected)):
+        direct = radial_mlps[i](
+            torch.cat((distance, source[[0, 3, 1]], target[[1, 2, 0]]), dim=-1)
+        )
+        torch.testing.assert_close(a, direct)
+        torch.testing.assert_close(b, direct)
+    assert restored.state_dict().keys() == radial.state_dict().keys()
+    assert copy.deepcopy(restored)._source_table is None
+
+
 def test_element_cache_never_retains_a_differentiable_tape():
     _, unified = _radial()
     source = torch.randn(4, 3, dtype=torch.float64, requires_grad=True)
@@ -339,6 +373,12 @@ def test_norm_silu_gradients_jvp_and_saved_activation_storage():
     _, actual_jvp = torch.func.jvp(lambda a: fn(a, weight, bias), (x,), (direction,))
     _, expected_jvp = torch.func.jvp(native, (x,), (direction,))
     torch.testing.assert_close(actual_jvp, expected_jvp)
+    gradient = torch.func.grad(lambda a: fn(a, weight, bias).square().sum())
+    hvp = torch.func.jvp(gradient, (x,), (direction,))[1]
+    reference = torch.autograd.functional.hvp(
+        lambda a: native(a).square().sum(), x, direction
+    )[1]
+    torch.testing.assert_close(hvp, reference)
     torch.testing.assert_close(torch.vmap(lambda a: fn(a, weight, bias))(x), native(x))
 
     def saved_bytes(func):
@@ -353,6 +393,34 @@ def test_norm_silu_gradients_jvp_and_saved_activation_storage():
         return sum(saved)
 
     assert saved_bytes(lambda a: fn(a, weight, bias)) < saved_bytes(native)
+
+
+@pytest.mark.parametrize("active", [(0,), (1,), (2,), (0, 1, 2)])
+def test_norm_silu_raw_forward_ad_and_mixed_derivatives(active):
+    inputs = tuple(
+        torch.randn(shape, dtype=torch.float64, requires_grad=True)
+        for shape in ((2, 3, 5), (5,), (5,))
+    )
+    tangents = [torch.randn_like(value) for value in inputs]
+    with torch.autograd.forward_ad.dual_level():
+        duals = [
+            torch.autograd.forward_ad.make_dual(value, tangents[i])
+            if i in active
+            else value
+            for i, value in enumerate(inputs)
+        ]
+        actual = layer_norm_silu(*duals, 0.003)
+        expected = F.silu(F.layer_norm(duals[0], (5,), *duals[1:], 0.003))
+        actual, expected = map(
+            torch.autograd.forward_ad.unpack_dual, (actual, expected)
+        )
+        torch.testing.assert_close(actual.primal, expected.primal)
+        torch.testing.assert_close(actual.tangent, expected.tangent)
+        for left, right in zip(
+            torch.autograd.grad(actual.tangent.square().sum(), inputs),
+            torch.autograd.grad(expected.tangent.square().sum(), inputs),
+        ):
+            torch.testing.assert_close(left, right)
 
 
 @pytest.mark.parametrize("shape", [(7,), (2, 3, 7)])
@@ -376,6 +444,24 @@ def test_norm_silu_preserves_derivatives_for_partially_frozen_inputs(shape, requ
     for actual_order, expected_order in zip(*derivatives):
         for a, b in zip(actual_order, expected_order):
             torch.testing.assert_close(a, b, rtol=1e-9, atol=1e-10)
+
+
+def test_upstream_cached_angular_block_rebuilds_from_loaded_weights():
+    block = SO2_m_Conv_Block(1, 3, 2, 2, 2).double().requires_grad_(False)
+    state = torch.nn.Module.__getstate__(block)
+    state["_buffers"] = {"_w_block": torch.zeros_like(block._make_w_block())}
+    for key in ("compact_weights", "_w_block_key", "_w_block_owner", "_w_block_event"):
+        del state[key]
+    restored = SO2_m_Conv_Block.__new__(SO2_m_Conv_Block)
+    restored.__setstate__(state)
+    x = torch.randn(4, 2, 6, dtype=torch.float64, requires_grad=True)
+    actual = torch.cat(restored(x), dim=1)
+    expected = torch.cat(block(x), dim=1)
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(
+        torch.autograd.grad(actual.sum(), x)[0],
+        torch.autograd.grad(expected.sum(), x)[0],
+    )
 
 
 def test_block_gemm_preserves_parameter_gradients_and_refreshes_frozen_cache():

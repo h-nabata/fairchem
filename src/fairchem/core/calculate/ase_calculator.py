@@ -173,7 +173,12 @@ def _fixed_mask(atoms):
 
 
 def _model_input_changes(previous, atoms):
-    if not _metadata_equal(previous.info, atoms.info):
+    # UMA validates charge and spin types. Numerically equal values such as
+    # 1 and True must still pass that validation before using cached results.
+    if any(
+        type(previous.info.get(key)) is not type(atoms.info.get(key))
+        for key in ("charge", "spin")
+    ) or not _metadata_equal(previous.info, atoms.info):
         return ["info"]
     if ("tags" in atoms.arrays or "tags" in previous.arrays) and not np.array_equal(
         previous.get_tags(), atoms.get_tags()

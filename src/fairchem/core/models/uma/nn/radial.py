@@ -33,7 +33,6 @@ class _LayerNormSiLU(torch.autograd.Function):
     def setup_context(ctx, inputs, output):
         x, weight, bias, eps = inputs
         ctx.save_for_backward(x, weight, bias)
-        ctx.save_for_forward(x, weight, bias)
         ctx.eps = eps
 
     @staticmethod
@@ -52,33 +51,25 @@ class _LayerNormSiLU(torch.autograd.Function):
         )
         return grad_x, grad_weight, grad_bias, None
 
-    @staticmethod
-    def jvp(ctx, tangent_x, tangent_weight, tangent_bias, tangent_eps):
-        x, weight, bias = ctx.saved_tensors
-        inputs = (x, weight, bias)
-        tangents = tuple(
-            tangent if tangent is not None else torch.zeros_like(primal)
-            for tangent, primal in zip(
-                (tangent_x, tangent_weight, tangent_bias), inputs
-            )
-        )
-
-        def native(x, weight, bias):
-            return torch.nn.functional.silu(
-                torch.nn.functional.layer_norm(x, (x.shape[-1],), weight, bias, ctx.eps)
-            )
-
-        return torch.func.jvp(native, inputs, tangents)[1]
-
 
 def layer_norm_silu(x, weight, bias, eps):
     """
     Normalize and activate while retaining only the input for force backward.
     """
-    # Dynamo does not capture custom jvp; capturing a custom reverse adjoint
-    # also loses double-backward support on some Torch releases. Let the
-    # compiler fuse native operators and manage saved activations instead.
-    if torch.compiler.is_compiling() or x.dtype not in (torch.float32, torch.float64):
+    # Capturing a custom reverse adjoint loses double-backward support on some
+    # Torch releases. Let the compiler fuse native operators instead.
+    # Native operations propagate an active forward-AD level directly. Starting
+    # another jvp inside a custom Function fails for make_dual callers.
+    # Nested torch.func transforms can hide the dual inside an outer wrapper.
+    if (
+        torch.compiler.is_compiling()
+        or x.dtype not in (torch.float32, torch.float64)
+        or torch._C._are_functorch_transforms_active()
+        or any(
+            torch.autograd.forward_ad.unpack_dual(value).tangent is not None
+            for value in (x, weight, bias)
+        )
+    ):
         return torch.nn.functional.silu(
             torch.nn.functional.layer_norm(x, (x.shape[-1],), weight, bias, eps)
         )

@@ -32,10 +32,11 @@ class ASELangevinUMARunner(Runner):
         task_name: str = "omat",
         timestep_fs: float = 1.0,
         temp_k: float = 300.0,
-        friction_ps_inv: float = 0.001,
+        friction_ps_inv: float = 1.0,
         steps_total: int = 1000,
         warmup_steps: int = 10,
-        workers: int = 0,
+        workers: int = 1,
+        device: str | None = None,
     ):
         self.atoms_list = atoms_list
         self.timestep_fs = timestep_fs
@@ -46,6 +47,7 @@ class ASELangevinUMARunner(Runner):
         self.settings = settings
         self.model_name = model_name
         self.workers = workers
+        self.device = device
         self.task_name = task_name
 
     def run(self):
@@ -59,7 +61,7 @@ class ASELangevinUMARunner(Runner):
             predictor = pretrained_mlip.get_predict_unit(
                 self.model_name,
                 inference_settings=self.settings,
-                device="cuda",
+                device=self.device,
                 workers=self.workers,
             )
             calc = FAIRChemCalculator(predictor, task_name=self.task_name)
@@ -74,7 +76,7 @@ class ASELangevinUMARunner(Runner):
                 atoms,
                 timestep=self.timestep_fs * units.fs,
                 temperature_K=self.temp_k,
-                friction=self.friction_ps_inv / units.fs,
+                friction=self.friction_ps_inv / (1000 * units.fs),
             )
 
             # Warmup
