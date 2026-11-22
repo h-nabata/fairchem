@@ -733,3 +733,70 @@ def test_ase_external_graph_uses_model_cutoff_and_degenerate_shell_policy():
     backbone.enforce_max_neighbors_strictly = True
     capped = FAIRChemCalculator(predictor, task_name="omol").a2g(atoms)
     assert capped.edge_index.shape[1] == 3
+
+
+@pytest.mark.parametrize("external", [False, True])
+def test_conservative_predictor_is_invariant_to_large_lattice_image(tmp_path, external):
+    from tests.core.models.uma.uma_nitro.nitro_test_utils import (
+        batch,
+        random_checkpoint,
+    )
+
+    torch.manual_seed(42)
+    checkpoint = tmp_path / "model.pt"
+    torch.save(
+        random_checkpoint(
+            num_layers=1,
+            sphere_channels=8,
+            hidden_channels=16,
+            edge_channels=8,
+            num_distance_basis=8,
+            cutoff=1.4,
+        ),
+        checkpoint,
+    )
+    predictor = MLIPPredictUnit(
+        str(checkpoint),
+        device="cpu",
+        inference_settings=InferenceSettings(
+            execution_mode="general", external_graph_gen=external, hessian_chunk_size=2
+        ),
+    )
+    props = ("energy", "forces", "stress", "hessian", "hessian_vector_product")
+
+    def predict(translated, requested=props):
+        # 100000000 = 1 + 33333333 * 3 is exactly representable in FP32.
+        atoms = Atoms(
+            "HC",
+            positions=[
+                [0.25, 0.125, 0.375],
+                [100000000 if translated else 1, 0.5, 0.25],
+            ],
+            cell=[3, 6, 6],
+            pbc=True,
+        )
+        data = batch((atoms, "omat"))
+        # ASE conversion wraps periodic input; external AtomicData and MD
+        # callers can supply the original, unwrapped Cartesian coordinates.
+        data.pos = torch.as_tensor(atoms.positions, dtype=data.pos.dtype).clone()
+        if external:
+            count = 33333333 if translated else 0
+            data.update_batch_edges(
+                torch.tensor([[0, 1], [1, 0]]),
+                torch.tensor([[count, 0, 0], [-count, 0, 0]]),
+                torch.tensor([2]),
+            )
+        data["hessian_vector"] = torch.tensor([[0.3, -0.1, 0.2], [0.8, 0.2, -0.4]])
+        torch.manual_seed(43)
+        return predictor.predict(data, requested_properties=requested)
+
+    reference = predict(False)
+    actual = predict(True)
+    assert reference["stress"].abs().max() > 1e-8
+    for prop in props:
+        torch.testing.assert_close(actual[prop], reference[prop], rtol=3e-5, atol=2e-8)
+    # Requesting stress alone must take the same branch, without a force graph
+    # built for Hessian or HVP.
+    torch.testing.assert_close(
+        predict(True, ("stress",))["stress"], reference["stress"], rtol=3e-5, atol=2e-8
+    )

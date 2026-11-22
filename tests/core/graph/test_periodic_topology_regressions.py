@@ -18,7 +18,11 @@ from fairchem.core.graph import (
     radius_graph_pbc,
     radius_graph_pbc_nvidia,
 )
-from fairchem.core.graph.compute import external_edge_geometry, generate_graph
+from fairchem.core.graph.compute import (
+    edge_strain_for_stress,
+    external_edge_geometry,
+    generate_graph,
+)
 from fairchem.core.graph.neighbor_cache import VerletNeighborCache
 from fairchem.core.models.uma.escn_md import eSCNMDBackbone
 from tests.core.graph.test_radius_graph_memory import _LargestTensor
@@ -370,3 +374,129 @@ def test_compact_and_long_axes_choose_independent_periodic_origins():
     torch.testing.assert_close(
         local, pos.new_tensor([[17.0, -0.25, 6.0], [12.1, 0.25, -1e-8]]), atol=0, rtol=0
     )
+
+
+@pytest.mark.parametrize("mode", ["otf", "cached", "external"])
+def test_local_edge_strain_preserves_virial_for_mixed_translated_systems(mode):
+    # Identical wires at different image origins, plus a molecule translated
+    # as a whole. The correct xx strain derivative is 2 * separation**2.
+    pos = torch.tensor(
+        [
+            [0.25, 0.0, 0.0],
+            [1e8, 0.0, 0.0],
+            [0.25, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [32768.0, 0.0, 0.0],
+            [32769.0, 0.0, 0.0],
+        ],
+        requires_grad=True,
+    )
+    cell = (
+        torch.diag(pos.new_tensor([3.0, 6.0, 6.0]))
+        .expand(3, -1, -1)
+        .clone()
+        .requires_grad_()
+    )
+    counts = torch.tensor([2, 2, 2])
+    data = SimpleNamespace(
+        pos=pos,
+        cell=cell,
+        batch=torch.tensor([0, 0, 1, 1, 2, 2]),
+        natoms=counts,
+        pbc=torch.tensor(
+            [[True, False, False], [True, False, False], [False, False, False]]
+        ),
+    )
+    raw_offsets = None
+    cache = VerletNeighborCache(0.3) if mode == "cached" else None
+    for _ in range(2 if cache is not None else 1):
+        if mode == "external":
+            edges = torch.tensor([[1, 0, 3, 2, 5, 4], [0, 1, 2, 3, 4, 5]])
+            raw_offsets = torch.zeros((6, 3), dtype=torch.long)
+            raw_offsets[:2, 0] = torch.tensor([-33333333, 33333333])
+            vec, _ = external_edge_geometry(pos, edges, cell, raw_offsets, counts)
+            graph = {
+                "edge_index": edges,
+                "edge_distance_vec": vec,
+                "edge_distance": vec.norm(dim=-1),
+            }
+        else:
+            graph = generate_graph(
+                data, 1.1, 8, False, 2, data.pbc, neighbor_cache=cache
+            )
+        strain = edge_strain_for_stress(
+            graph, pos, cell, data.batch, cell_offsets=raw_offsets
+        )
+        energy = graph["edge_distance"].square().sum() / 2
+        gpos, gcell, virial = torch.autograd.grad(
+            energy, (pos, cell, strain), create_graph=True
+        )
+        expected = strain.new_zeros(strain.shape)
+        expected[:, 0, 0] = strain.new_tensor([1.125, 1.125, 2.0])
+        torch.testing.assert_close(virial, expected, atol=0, rtol=0)
+        # Model energy still differentiates against the caller's original
+        # Cartesian position and cell arguments, including the large image.
+        torch.testing.assert_close(
+            gpos[:, 0], pos.new_tensor([-1.5, 1.5, -1.5, 1.5, -2.0, 2.0])
+        )
+        torch.testing.assert_close(gcell[0, 0, 0], pos.new_tensor(-1.5 * 33333333))
+        (hrow,) = torch.autograd.grad(gpos[0, 0], pos)
+        torch.testing.assert_close(
+            hrow[:, 0], pos.new_tensor([2.0, -2.0, 0.0, 0.0, 0.0, 0.0])
+        )
+    if cache is not None:
+        assert cache.hits == 1
+
+
+def test_edge_strain_keeps_small_graph_and_supports_empty_large_partition():
+    cell = torch.eye(3).unsqueeze(0)
+    pos = torch.zeros((2, 3))
+    batch = torch.zeros(2, dtype=torch.long)
+    vec = pos.new_empty((0, 3))
+    distances = vec.new_empty(0)
+    graph = {
+        "edge_index": torch.empty(2, 0, dtype=torch.long),
+        "edge_distance_vec": vec,
+        "edge_distance": distances,
+    }
+    assert edge_strain_for_stress(graph, pos, cell, batch) is None
+    assert graph["edge_distance"] is distances
+    assert graph["edge_distance_vec"] is vec
+    # The trigger is global across graph-parallel ranks, including a rank with
+    # no edges, and it can originate solely in the external lattice shifts.
+    strain = edge_strain_for_stress(
+        graph, pos, cell, batch, cell_offsets=torch.tensor([[100000, 0, 0]])
+    )
+    (gradient,) = torch.autograd.grad(graph["edge_distance"].sum(), strain)
+    torch.testing.assert_close(gradient, torch.zeros_like(strain))
+
+
+def test_local_strain_matches_fixed_fractional_shear_and_training_derivative():
+    pos = torch.tensor([[0.25, 0.0, 0.0], [1e8, 0.5, 0.25]], requires_grad=True)
+    cell = torch.diag(pos.new_tensor([3.0, 6.0, 6.0])).unsqueeze(0).requires_grad_()
+    data = SimpleNamespace(
+        pos=pos,
+        cell=cell,
+        natoms=torch.tensor([2]),
+        batch=torch.zeros(2, dtype=torch.long),
+        pbc=torch.tensor([[True, False, False]]),
+    )
+    graph = generate_graph(data, 1.1, 8, False, 2, data.pbc)
+    strain = edge_strain_for_stress(graph, pos, cell, data.batch)
+    scale = torch.tensor(1.5, requires_grad=True)
+    energy = scale * graph["edge_distance_vec"].square().sum() / 2
+    (virial,) = torch.autograd.grad(energy, strain, create_graph=True)
+    direction = strain.new_tensor([[0.0, 0.5, 0.0], [0.5, 0.0, 0.0], [0.0, 0.0, 0.0]])
+    shear = (virial[0] * direction).sum()
+    # Independently strain the exact, wrapped Cartesian separation. Both atoms
+    # and the lattice follow the affine shear (fixed fractional coordinates).
+    local = strain.new_tensor([0.75, 0.5, 0.25])
+    step = 1e-4
+
+    def strained_energy(t):
+        return scale.double() * (local + t * (local @ direction)).square().sum()
+
+    finite_difference = (strained_energy(step) - strained_energy(-step)) / (2 * step)
+    torch.testing.assert_close(shear, finite_difference, rtol=1e-10, atol=1e-10)
+    (training_gradient,) = torch.autograd.grad(shear, scale)
+    torch.testing.assert_close(training_gradient, scale.new_tensor(0.75))

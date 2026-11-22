@@ -238,6 +238,14 @@ class eSCNMDMoeBackbone(eSCNMDBackbone, MOLEInterface):
     def set_MOLE_sizes(self, nsystems, batch_full, edge_index):
         if self.num_experts == 0:
             return
+        if nsystems == 1:
+            # Every local edge belongs to this system, including padding. The
+            # count is host shape metadata even for a graph-parallel partition.
+            with torch.inference_mode(False):
+                self.global_mole_tensors.mole_sizes = torch.full(
+                    (1,), edge_index.shape[1], dtype=torch.int, device="cpu"
+                )
+            return
         with (
             torch.inference_mode(False),
             torch.autocast(device_type=batch_full.device.type, enabled=False),

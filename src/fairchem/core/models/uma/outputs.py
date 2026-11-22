@@ -267,6 +267,7 @@ def compute_forces_and_stress(
     training: bool = True,
     *,
     retain_graph: bool = False,
+    edge_strain: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute forces and stress from energy using autograd.
 
@@ -287,6 +288,8 @@ def compute_forces_and_stress(
         batch: Batch indices mapping each node to its system, shape [N].
         training: Whether to create graph for higher-order gradients.
         retain_graph: Keep the shared backbone graph for another head.
+        edge_strain: Zero strain applied to the actual edge vectors before
+            evaluating the energy, when absolute-coordinate virials would cancel.
 
     Returns:
         A tuple of (forces, stress) where:
@@ -307,6 +310,19 @@ def compute_forces_and_stress(
         raise ValueError(
             f"Stress requires a finite, nonzero cell volume for systems {invalid}"
         )
+
+    if edge_strain is not None:
+        grad_pos, grad_strain = _energy_gradients(
+            energy_part,
+            (pos, edge_strain),
+            create_graph=training,
+            retain_graph=retain_graph,
+        )
+        if gp_utils.initialized():
+            grad_pos = gp_utils.reduce_from_model_parallel_region(grad_pos)
+            grad_strain = gp_utils.reduce_from_model_parallel_region(grad_strain)
+        virial = (grad_strain + grad_strain.mT) * 0.5
+        return -grad_pos, (virial / volume[:, None, None]).reshape(-1, 9)
 
     grads = _energy_gradients(
         energy_part, (pos, cell), create_graph=training, retain_graph=retain_graph

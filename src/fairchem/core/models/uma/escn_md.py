@@ -30,6 +30,7 @@ from fairchem.core.common.registry import registry
 from fairchem.core.common.utils import conditional_grad
 from fairchem.core.graph.compute import (
     canonicalize_external_edges,
+    edge_strain_for_stress,
     external_edge_geometry,
     filter_edges_by_node_partition,
     generate_graph,
@@ -821,6 +822,20 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
                 "edge_distance_vec": vectors,
             }
 
+        if (
+            "stress" in data_dict.get("_resolved_requested_properties", ())
+            and not self.regress_config.direct_stress
+        ):
+            strain = edge_strain_for_stress(
+                graph_dict,
+                data_dict["pos"],
+                data_dict["cell"],
+                data_dict["batch"],
+                cell_offsets=None if self.otf_graph else data_dict["cell_offsets"],
+            )
+            if strain is not None:
+                graph_dict["edge_strain"] = strain
+
         if getattr(self, "graph_edge_order", "original") == "spatial":
             if gp_utils.initialized():
                 raise ValueError("Spatial edge ordering requires a single-device graph")
@@ -1081,6 +1096,8 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
             "node_embedding": x_message,
             "batch": data_dict["batch"],
         }
+        if "edge_strain" in graph_dict:
+            out["edge_strain"] = graph_dict["edge_strain"]
         return out
 
     @property
@@ -1353,6 +1370,7 @@ class MLP_EFS_Head(nn.Module, HeadInterface):
                 batch=data["batch_full"],  # use batch_full to work with GP reduction
                 training=create_graph,
                 retain_graph=retain_graph,
+                edge_strain=emb.get("edge_strain"),
             )
             emit("stress", stress)
         elif (
