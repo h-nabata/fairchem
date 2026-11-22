@@ -61,6 +61,9 @@ def _assert_hessian_matches_forces(
                 forces.append(result["forces"].reshape(ndof))
             columns.append((forces[1] - forces[0]) / (2 * eps))
     numerical = torch.stack(columns, dim=1)
+    # Water has coupled coordinates. Catch a missing force response even if the
+    # same regression also makes the analytical Hessian identically zero.
+    assert numerical.triu(diagonal=1).abs().max() > atol
     torch.testing.assert_close(hessian[0], numerical, rtol=rtol, atol=atol)
 
 
@@ -116,7 +119,8 @@ def test_hessian_vs_numerical(pretrained_checkpoint):
     _assert_hessian_matches_forces(data, unit, atol=1e-4, rtol=1e-3)
 
 
-def test_periodic_hessian_vs_numerical_cpu():
+@pytest.mark.parametrize("vmap", [True, False])
+def test_periodic_hessian_vs_numerical_cpu(vmap):
     from tests.core.units.mlip_unit.test_predict_interoperability import (
         _public_predictor,
     )
@@ -124,6 +128,7 @@ def test_periodic_hessian_vs_numerical_cpu():
     unit = _public_predictor()
     unit.inference_settings.base_precision_dtype = torch.float64
     unit.model.double().eval()
+    unit.model.module.backbone.regress_config.hessian_vmap = vmap
     atoms = molecule("H2O")
     atoms.set_cell([[2.74, 0, 0], [0.14, 2.81, 0], [0.11, 0.21, 2.89]])
     atoms.pbc = True

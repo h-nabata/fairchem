@@ -736,7 +736,10 @@ def test_ase_external_graph_uses_model_cutoff_and_degenerate_shell_policy():
 
 
 @pytest.mark.parametrize("external", [False, True])
-def test_conservative_predictor_is_invariant_to_large_lattice_image(tmp_path, external):
+@pytest.mark.parametrize("execution_mode", ["general", "umas_fast_portable"])
+def test_conservative_predictor_is_invariant_to_large_lattice_image(
+    tmp_path, external, execution_mode
+):
     from tests.core.models.uma.uma_nitro.nitro_test_utils import (
         batch,
         random_checkpoint,
@@ -759,7 +762,7 @@ def test_conservative_predictor_is_invariant_to_large_lattice_image(tmp_path, ex
         str(checkpoint),
         device="cpu",
         inference_settings=InferenceSettings(
-            execution_mode="general", external_graph_gen=external, hessian_chunk_size=2
+            execution_mode=execution_mode, external_graph_gen=external, hessian_chunk_size=2
         ),
     )
     props = ("energy", "forces", "stress", "hessian", "hessian_vector_product")
