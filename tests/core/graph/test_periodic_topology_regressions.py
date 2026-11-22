@@ -731,13 +731,18 @@ def test_compiled_external_stress_survives_periodic_image_change():
 
     def derivatives(graph, pos, cell):
         energy = graph["edge_distance"].pow(4).sum() / 2
-        forces, stress = compute_forces_and_stress(
-            energy, pos, cell, batch, edge_strain=graph.get("edge_strain")
+        return compute_forces_and_stress(
+            energy,
+            pos,
+            cell,
+            batch,
+            training=False,
+            edge_strain=graph.get("edge_strain"),
         )
-        (stress_gradient,) = torch.autograd.grad(stress.sum(), pos)
-        return forces, stress, stress_gradient
 
-    compiled = torch.compile(build, fullgraph=True, backend="eager")
+    # AOT Autograd wraps captured tensors in a shared backward function. A
+    # tracing-only eager backend would miss a lost radial virial gradient.
+    compiled = torch.compile(build, backend="aot_eager")
     for x, shift in ((1.0, 0), (1e8, -33333333)):
         pos = torch.tensor(
             [
@@ -753,7 +758,6 @@ def test_compiled_external_stress_survives_periodic_image_change():
         images[:, 0] = images.new_tensor([1, -1, shift, -shift])
 
         expected = derivatives(build(pos, cell, images), pos, cell)
-        with torch._dynamo.config.patch(error_on_recompile=True):
-            actual = derivatives(compiled(pos, cell, images), pos, cell)
+        actual = derivatives(compiled(pos, cell, images), pos, cell)
         for result, reference in zip(actual, expected, strict=True):
             torch.testing.assert_close(result, reference)

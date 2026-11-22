@@ -239,6 +239,11 @@ class EdgeVirial(NamedTuple):
     risk: torch.Tensor | None  # None means every system uses its local edges.
 
 
+# The edge vectors (or explicit strain) are derivative inputs for the head.
+# Keep them upstream of the compiled radial and angular operations. An AOT
+# graph can otherwise return both the vectors and their norms as sibling
+# outputs, losing the radial contribution when differentiating by the vectors.
+@torch.compiler.disable
 def edge_strain_for_stress(
     graph,
     pos,
@@ -339,6 +344,7 @@ def _external_image_risks(cell_abs, atom_batch, edge_index, offsets):
     return wide, risk
 
 
+@torch.compiler.disable
 @torch.no_grad()
 def stress_geometry_risks(pos, cell, atom_batch, edge_index=None, cell_offsets=None):
     """Classify image arithmetic and the stress route for this forward pass.
@@ -346,17 +352,6 @@ def stress_geometry_risks(pos, cell, atom_batch, edge_index=None, cell_offsets=N
     Image translation uses a batch-wide bound. Each stress virial uses the
     actual lattice of the edge's system. A bool denotes a homogeneous batch.
     """
-    if torch.compiler.is_compiling():
-        # A captured graph must keep the same derivative inputs as coordinates
-        # move between periodic images. Local edge virials are valid for every
-        # system. Only the geometry precision gate needs a data-dependent value.
-        wide_images = (
-            needs_wide_image_math(cell_offsets, cell)
-            if cell_offsets is not None and cell_offsets.numel()
-            else None
-        )
-        return wide_images, True
-
     large_coords = pos.detach().abs() >= WIDE_TRANSLATION_SCALE
     cell_abs = cell.detach().abs()
     large_cell = cell_abs >= WIDE_TRANSLATION_SCALE
