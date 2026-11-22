@@ -72,6 +72,8 @@ def _energy_gradients(
     energy: torch.Tensor,
     inputs: tuple[torch.Tensor, ...],
     create_graph: bool,
+    *,
+    retain_graph: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     """
     Differentiate energy, including constant/unused coordinate components.
@@ -80,7 +82,11 @@ def _energy_gradients(
         raise ValueError("Derivative inputs must have requires_grad=True")
     if energy.requires_grad:
         gradients = torch.autograd.grad(
-            energy.sum(), inputs, create_graph=create_graph, allow_unused=True
+            energy.sum(),
+            inputs,
+            create_graph=create_graph,
+            retain_graph=retain_graph or create_graph,
+            allow_unused=True,
         )
     else:
         gradients = (None,) * len(inputs)
@@ -228,6 +234,8 @@ def compute_forces(
     energy_part: torch.Tensor,
     pos: torch.Tensor,
     training: bool = True,
+    *,
+    retain_graph: bool = False,
 ) -> torch.Tensor:
     """Compute forces as negative gradient of energy with respect to positions.
 
@@ -235,11 +243,14 @@ def compute_forces(
         energy_part: System-level energy before GP reduction, shape [num_systems].
         pos: Atomic positions, shape [N, 3].
         training: Whether to create graph for higher-order gradients.
+        retain_graph: Keep the shared backbone graph for another head.
 
     Returns:
         Forces tensor of shape [N, 3].
     """
-    (grad,) = _energy_gradients(energy_part, (pos,), create_graph=training)
+    (grad,) = _energy_gradients(
+        energy_part, (pos,), create_graph=training, retain_graph=retain_graph
+    )
     forces = torch.neg(grad)
 
     if gp_utils.initialized():
@@ -254,6 +265,9 @@ def compute_forces_and_stress(
     cell: torch.Tensor,
     batch: torch.Tensor,
     training: bool = True,
+    *,
+    retain_graph: bool = False,
+    edge_strain: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute forces and stress from energy using autograd.
 
@@ -273,6 +287,9 @@ def compute_forces_and_stress(
         cell: Unit cell vectors, shape [num_systems, 3, 3].
         batch: Batch indices mapping each node to its system, shape [N].
         training: Whether to create graph for higher-order gradients.
+        retain_graph: Keep the shared backbone graph for another head.
+        edge_strain: Zero strain applied to the actual edge vectors before
+            evaluating the energy, when absolute-coordinate virials would cancel.
 
     Returns:
         A tuple of (forces, stress) where:
@@ -294,7 +311,22 @@ def compute_forces_and_stress(
             f"Stress requires a finite, nonzero cell volume for systems {invalid}"
         )
 
-    grads = _energy_gradients(energy_part, (pos, cell), create_graph=training)
+    if edge_strain is not None:
+        grad_pos, grad_strain = _energy_gradients(
+            energy_part,
+            (pos, edge_strain),
+            create_graph=training,
+            retain_graph=retain_graph,
+        )
+        if gp_utils.initialized():
+            grad_pos = gp_utils.reduce_from_model_parallel_region(grad_pos)
+            grad_strain = gp_utils.reduce_from_model_parallel_region(grad_strain)
+        virial = (grad_strain + grad_strain.mT) * 0.5
+        return -grad_pos, (virial / volume[:, None, None]).reshape(-1, 9)
+
+    grads = _energy_gradients(
+        energy_part, (pos, cell), create_graph=training, retain_graph=retain_graph
+    )
     num_systems = cell.shape[0]
 
     # The strict virial needs FP64 products as well as an FP64 sum: large
@@ -344,6 +376,8 @@ def compute_hessian_vmap(
     pos: torch.Tensor,
     create_graph: bool,
     chunk_size: int | None = 64,
+    *,
+    retain_graph: bool = False,
 ) -> torch.Tensor:
     """
     Compute Hessian rows in bounded vectorized blocks.
@@ -390,7 +424,7 @@ def compute_hessian_vmap(
                 negative_forces,
                 pos,
                 grad_outputs=vec,
-                retain_graph=create_graph or stop < n_dof,
+                retain_graph=retain_graph or create_graph or stop < n_dof,
                 create_graph=create_graph,
                 allow_unused=True,
             )[0]
@@ -416,6 +450,8 @@ def compute_hessian_loop(
     forces_flat: torch.Tensor,
     pos: torch.Tensor,
     create_graph: bool,
+    *,
+    retain_graph: bool = False,
 ) -> torch.Tensor:
     """Compute Hessian using a loop over force components.
 
@@ -426,6 +462,7 @@ def compute_hessian_loop(
         forces_flat: Flattened forces tensor, shape [N*3].
         pos: Atomic positions, shape [N, 3].
         create_graph: Whether to create graph for third-order derivatives.
+        retain_graph: Keep the shared backbone graph for another head.
 
     Returns:
         Hessian matrix of shape [N*3, N*3].
@@ -445,7 +482,7 @@ def compute_hessian_loop(
         gradient = torch.autograd.grad(
             -forces_flat[i],
             pos,
-            retain_graph=create_graph or i < n_forces - 1,
+            retain_graph=retain_graph or create_graph or i < n_forces - 1,
             create_graph=create_graph,
             allow_unused=True,
         )[0]
@@ -464,6 +501,8 @@ def compute_hessian(
     vmap: bool = True,
     training: bool = False,
     chunk_size: int | None = 64,
+    *,
+    retain_graph: bool = False,
 ) -> torch.Tensor:
     """Compute Hessian matrix as second derivative of energy w.r.t. positions.
 
@@ -476,6 +515,7 @@ def compute_hessian(
         vmap: Whether to use vectorized mapping (faster but higher memory).
         training: Whether to create graph for third-order derivatives.
         chunk_size: Maximum vmap rows per backward block. None selects all rows.
+        retain_graph: Keep the shared backbone graph for another head.
 
     Returns:
         Hessian matrix of shape [1, N*3, N*3] (batch dim always 1 since
@@ -495,10 +535,16 @@ def compute_hessian(
 
     if vmap:
         hessian = compute_hessian_vmap(
-            forces_flat, pos, create_graph=training, chunk_size=chunk_size
+            forces_flat,
+            pos,
+            create_graph=training,
+            chunk_size=chunk_size,
+            retain_graph=retain_graph,
         )
     else:
-        hessian = compute_hessian_loop(forces_flat, pos, create_graph=training)
+        hessian = compute_hessian_loop(
+            forces_flat, pos, create_graph=training, retain_graph=retain_graph
+        )
 
     return hessian.unsqueeze(0)
 

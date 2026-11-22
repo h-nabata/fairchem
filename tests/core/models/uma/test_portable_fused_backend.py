@@ -122,6 +122,28 @@ def test_producer_gradcheck_and_gradgradcheck():
         torch.testing.assert_close(a, b)
 
 
+def test_consumer_builds_one_topology_for_inference_tensor(monkeypatch):
+    from fairchem.core.models.uma.nn import portable_wigner
+
+    original = portable_wigner.get_csr_topology
+    lookups = []
+
+    def lookup(target, nodes):
+        lookups.append(nodes)
+        return original(target, nodes)
+
+    monkeypatch.setattr(portable_wigner, "get_csr_topology", lookup)
+    with torch.inference_mode():
+        target = torch.tensor([2, 0, 2])
+        groups = [torch.randn(3, size) for size in (3, 4, 2)]
+        matrix = torch.randn(3, 35)
+        actual = consumer_reference(*groups, matrix, target, 4, 1)
+        torch.testing.assert_close(
+            actual, _consumer_dense(*groups, matrix, target, 4, 1)
+        )
+    assert lookups == [4]
+
+
 def test_consumer_gradcheck_and_gradgradcheck():
     torch.manual_seed(13)
     target = torch.tensor([2, 0, 2])

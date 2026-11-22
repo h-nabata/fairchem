@@ -12,6 +12,25 @@ import torch
 from ase.geometry import complete_cell
 from ase.geometry.minkowski_reduction import minkowski_reduce
 
+# FP32 spacing reaches roughly 0.002 Å for Cartesian values at this scale.
+WIDE_TRANSLATION_SCALE = 16384
+
+
+def needs_wide_image_math(images, lattice_rows):
+    """Detect image IDs or Cartesian translations that lose local FP32 precision."""
+    # Bound each periodic axis separately: a long vacuum axis with zero
+    # translation should not send an ordinary slab calculation to FP64.
+    widths = (
+        lattice_rows.detach().abs().reshape(-1, images.shape[-1], 3).amax(dim=(0, 2))
+    )
+    limits = WIDE_TRANSLATION_SCALE / widths.clamp_min(1)
+    return (images.abs() >= limits).any()
+
+
+def wide_image_device(device):
+    # Portable inference must work on XPU devices without native FP64.
+    return device if device.type in {"cpu", "cuda"} else torch.device("cpu")
+
 
 def wrap_positions(
     pos: np.ndarray | torch.Tensor,
@@ -22,7 +41,7 @@ def wrap_positions(
     Wrap positions into the unit cell along periodic dimensions.
 
     Equivalent to ase.geometry.wrap_positions with eps=0.  Dispatches to a
-    pure-torch path for tensor inputs (stays on GPU, no autograd break) and
+    pure-torch path for tensor inputs (preserves gradients) and
     a pure-numpy path for array inputs.
 
     Args:
@@ -64,12 +83,37 @@ def wrap_positions_torch(
 
     Args:
         pos: Cartesian positions, shape (n_atoms, 3).
-        cell: Per-atom unit cells with rows as lattice vectors, (n_atoms, 3, 3).
-        pbc: Per-atom periodic flags, shape (n_atoms, 3).
+        cell: Per-atom cells of shape (n_atoms, 3, 3), or (1, 3, 3) when shared.
+        pbc: Per-atom flags of shape (n_atoms, 3), or (1, 3) for a shared cell.
 
     Returns:
         Wrapped positions, shape (n_atoms, 3).
     """
+    if len(cell) == len(pbc) == 1:
+        if not bool(pbc.any()):
+            return pos.clone()
+        basis = cell[0]
+        with torch.no_grad():
+            missing = (basis == 0).all(dim=-1)
+            if bool(missing.any()):
+                if bool((missing & pbc[0]).any()):
+                    raise ValueError("Periodic lattice vectors must be nonzero")
+                active = basis[~missing]
+                q, r = torch.linalg.qr(active.T, mode="reduced")
+                frac = torch.zeros_like(pos)
+                frac[:, ~missing] = torch.linalg.solve(r, q.T @ pos.T).T
+            else:
+                # One factorization with N right-hand sides for a shared cell.
+                frac = torch.linalg.solve(basis.T, pos.T).T
+            images = torch.where(pbc, frac.floor(), 0)
+        if pos.dtype == torch.float32 and bool(needs_wide_image_math(images, basis)):
+            device = wide_image_device(pos.device)
+            return wrap_positions_torch(
+                pos.to(device, torch.float64),
+                cell.to(device, torch.float64),
+                pbc.to(device),
+            ).to(pos)
+        return pos - images @ basis
     periodic = pbc.any(dim=1)
     if not bool(periodic.any()):
         return pos.clone()
@@ -109,6 +153,13 @@ def wrap_positions_torch(
                 active_cell.transpose(1, 2), active_pos.unsqueeze(-1)
             ).squeeze(-1)
         images = torch.where(pbc[periodic], frac.floor(), 0)
+    if pos.dtype == torch.float32 and bool(needs_wide_image_math(images, active_cell)):
+        device = wide_image_device(pos.device)
+        return wrap_positions_torch(
+            pos.to(device, torch.float64),
+            cell.to(device, torch.float64),
+            pbc.to(device),
+        ).to(pos)
     result = pos.clone()
     result[periodic] = active_pos - (images.unsqueeze(1) @ active_cell).squeeze(1)
     return result
@@ -218,9 +269,8 @@ def minimum_image_displacement(
             lengths = cells.diagonal(dim1=-2, dim2=-1)[local][:, axes]
             if bool((lengths == 0).any()):
                 raise ValueError("Periodic lattice vectors must be nonzero")
-            wrapped = vectors.clone()
             coordinates = vectors[:, axes]
-            wrapped[:, axes] = coordinates - (coordinates / lengths).round() * lengths
+            frac = coordinates / lengths
         else:
             if len(axes) > 1:
                 if minkowski_op is None:
@@ -235,6 +285,25 @@ def minimum_image_displacement(
             else:
                 dual = torch.linalg.solve(basis @ basis.transpose(1, 2), basis)
             frac = (dual[local] @ vectors.unsqueeze(-1)).squeeze(-1)
+        if dtype == torch.float32 and bool(needs_wide_image_math(frac, cells[:, axes])):
+            device = wide_image_device(dr.device)
+            # Reduce from the original cell, before any FP32 rounding.
+            ops = (
+                None
+                if minkowski_op is None
+                else minkowski_op[sys_indices].to(device, torch.float64)
+            )
+            wrapped = minimum_image_displacement(
+                vectors.to(device, torch.float64),
+                cell[sys_indices].to(device, torch.float64),
+                pbc[sys_indices].to(device),
+                local.to(device),
+                ops,
+            ).to(dr)
+        elif pattern >= 8:
+            wrapped = vectors.clone()
+            wrapped[:, axes] = coordinates - frac.round() * lengths
+        else:
             image = (frac + 0.5).floor()
             centered = vectors - (image.unsqueeze(1) @ basis[local]).squeeze(1)
             wrapped = centered
@@ -293,16 +362,12 @@ def _wrap_torch(
     cell: torch.Tensor,
     pbc: torch.Tensor | bool,
 ) -> torch.Tensor:
-    """Single-system torch wrap, broadcasting a (3, 3) cell to per-atom."""
-    n = pos.shape[0]
-    cell_batched = torch.as_tensor(cell, dtype=pos.dtype, device=pos.device)
-    cell_batched = cell_batched.unsqueeze(0).expand(n, -1, -1)
-    if isinstance(pbc, bool):
-        pbc_tensor = pos.new_full((n, 3), pbc, dtype=torch.bool)
-    else:
-        pbc_tensor = torch.as_tensor(pbc, dtype=torch.bool, device=pos.device)
-        if pbc_tensor.dim() < 2:
-            pbc_tensor = pbc_tensor.expand(n, 3)
-        elif pbc_tensor.dim() == 2 and pbc_tensor.shape[0] == 1:
-            pbc_tensor = pbc_tensor.expand(n, -1)
-    return wrap_positions_torch(pos, cell_batched, pbc_tensor)
+    """Single-system torch wrap with one shared lattice."""
+    shared = torch.as_tensor(cell, dtype=pos.dtype, device=pos.device).reshape(1, 3, 3)
+    flags = torch.as_tensor(pbc, dtype=torch.bool, device=pos.device)
+    if flags.ndim == 0:
+        flags = flags.expand(3)
+    flags = torch.atleast_2d(flags)
+    if len(flags) > 1:
+        shared = shared.expand(len(pos), -1, -1)
+    return wrap_positions_torch(pos, shared, flags)

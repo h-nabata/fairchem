@@ -17,6 +17,7 @@ from monty.dev import requires
 from fairchem.core.graph.radius_graph_pbc import (
     complete_periodic_cell,
     get_max_neighbors_mask,
+    periodic_search_frame,
     system_pbc_flags,
     validate_graph_geometry,
     validate_graph_parameters,
@@ -177,13 +178,22 @@ def get_neighbors_nvidia(
     # returned integer shifts back to the caller's original lattice basis.
     cell_basis_signs = None
     neighbor_cell = None
+    images = None
     if bool(pbc.any()):
-        cell = complete_periodic_cell(cell, pbc)
+        search_cell = complete_periodic_cell(cell, pbc)
+        positions, image_ids, _ = periodic_search_frame(
+            data, pbc, search_cell=search_cell
+        )
+        if bool(image_ids.any()):
+            images = image_ids
+        # The native cell-list backend requires nonzero determinants even for
+        # nonperiodic molecules in a batch of structures that includes crystals.
+        cell = torch.where(
+            pbc.any(-1)[:, None, None],
+            search_cell,
+            torch.eye(3, dtype=cell.dtype, device=device),
+        )
         volume = (cell[:, 0] * torch.cross(cell[:, 1], cell[:, 2], dim=-1)).sum(-1)
-        if bool((pbc.any(-1) & ((volume == 0) | ~torch.isfinite(volume))).any()):
-            raise ValueError(
-                "Periodic graph generation requires a nonsingular finite-volume cell"
-            )
         cell_basis_signs = torch.ones((len(cell), 3), dtype=torch.int32, device=device)
         cell_basis_signs[:, 0] = torch.where(volume < 0, -1, 1)
         neighbor_cell = cell * cell_basis_signs.unsqueeze(-1)
@@ -278,6 +288,13 @@ def get_neighbors_nvidia(
         n_index = n_index[mask_num_neighbors]
         distances_sq = distances_sq[mask_num_neighbors]
         offsets = offsets[mask_num_neighbors]
+
+    if images is not None:
+        # Native shifts address the wrapped positions. Return shifts in the
+        # caller's original frame, preserving the native dtype where possible.
+        restored = offsets.long() + (images[c_index] - images[n_index])
+        narrow = restored.to(offsets.dtype)
+        offsets = narrow if torch.equal(narrow.long(), restored) else restored
 
     return c_index, n_index, offsets, distances_sq if return_distances_sq else None
 

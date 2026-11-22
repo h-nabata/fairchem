@@ -28,7 +28,11 @@ from fairchem.core.models.allscaip.utils.data_preprocess import (
     unpad_results,
 )
 from fairchem.core.models.allscaip.utils.nn_utils import get_feedforward
-from fairchem.core.models.base import BackboneInterface, HeadInterface
+from fairchem.core.models.base import (
+    BackboneInterface,
+    HeadInterface,
+    supports_graph_retention,
+)
 from fairchem.core.models.escaip.utils.graph_utils import (
     compilable_scatter,
     get_displacement_and_cell,
@@ -422,8 +426,11 @@ class AllScAIPGradientEnergyForceStressHead(AllScAIPEnergyHead):  # type: ignore
         self.prefix = prefix
         self.wrap_property = wrap_property
 
+    @supports_graph_retention
     @conditional_grad(torch.enable_grad())
-    def forward(self, data, emb) -> dict[str, torch.Tensor]:
+    def forward(
+        self, data, emb, *, retain_graph: bool = False
+    ) -> dict[str, torch.Tensor]:
         if self.prefix:
             energy_key = f"{self.prefix}_energy"
             forces_key = f"{self.prefix}_forces"
@@ -449,6 +456,7 @@ class AllScAIPGradientEnergyForceStressHead(AllScAIPEnergyHead):  # type: ignore
                     [energy_output.sum()],
                     [data["pos_original"], emb["displacement"]],
                     create_graph=self.training,
+                    retain_graph=retain_graph or self.training,
                 )
 
                 forces = torch.neg(grads[0])
@@ -471,7 +479,10 @@ class AllScAIPGradientEnergyForceStressHead(AllScAIPEnergyHead):  # type: ignore
                 forces = (
                     -1
                     * torch.autograd.grad(
-                        energy_output.sum(), data["pos"], create_graph=self.training
+                        energy_output.sum(),
+                        data["pos"],
+                        create_graph=self.training,
+                        retain_graph=retain_graph or self.training,
                     )[0]
                 )
                 outputs[forces_key] = (

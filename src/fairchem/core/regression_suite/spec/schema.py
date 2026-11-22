@@ -187,9 +187,11 @@ class MeasurementRecord:
         values = np.asarray(self.values)
         if values.size == 0 or values.dtype.kind not in "fiu":
             raise RegressionSchemaError(f"{self.observable!r} values must be numeric")
+        with np.errstate(over="ignore"):
+            values = values.astype(np.float64, copy=False)
         if not np.isfinite(values).all():
             raise RegressionSchemaError(f"{self.observable!r} values must be finite")
-        object.__setattr__(self, "values", values.astype(np.float64, copy=False))
+        object.__setattr__(self, "values", values)
 
     @property
     def key(self) -> tuple[str, str, str]:

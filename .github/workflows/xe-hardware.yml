@@ -48,6 +48,25 @@ jobs:
         run: |
           python -m pytest -q tests/core/common/test_distributed_subgroup_audit.py \
             tests/core/components/test_batch_server_live_cpu.py
+      - name: Exercise portable scientific and sampling regressions
+        run: |
+          python -m pytest -q \
+            tests/core/modules/test_loss.py \
+            tests/core/common/test_slurm_rendezvous.py \
+            tests/core/datasets/test_sampler_metadata_audit.py \
+            tests/core/calculate/test_resolve_checkpoint.py \
+            tests/core/calculate/test_xpu_pretrained.py \
+            tests/core/graph/test_geometry.py \
+            tests/core/graph/test_periodic_topology_regressions.py::test_local_edge_strain_preserves_virial_for_mixed_translated_systems \
+            tests/core/graph/test_periodic_topology_regressions.py::test_edge_strain_keeps_small_graph_and_supports_empty_large_partition \
+            tests/core/units/mlip_unit/test_inference_runtime.py::test_conservative_predictor_is_invariant_to_large_lattice_image \
+            tests/core/models/uma/test_precision_contracts.py \
+            tests/core/models/uma/test_moe_routing_memory.py::test_single_system_mole_counts_local_and_padding_edges_from_shape \
+            tests/core/regression_suite/test_measurement_integrity.py \
+            tests/core/units/mlip_unit/test_hessian_predict.py::test_periodic_hessian_vs_numerical_cpu \
+            tests/core/units/mlip_unit/test_task_label_masks.py \
+            tests/core/units/mlip_unit/test_mlip_unit.py::test_full_train_eval_from_cli_aselmdb \
+            tests/core/units/mlip_unit/test_mlip_unit.py::test_full_conserving_mole_eval_from_cli
 
   two-b70:
     if: github.repository == 'h-nabata/fairchem' && github.ref == 'refs/heads/intel-xpu-fp32' && vars.XE_B70_CI == 'true'

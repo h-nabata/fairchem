@@ -14,7 +14,7 @@ import torch
 from ase.build import molecule
 
 from fairchem.core.datasets.atomic_data import AtomicData
-from fairchem.core.models.base import HydraModel
+from fairchem.core.models.base import HydraModel, HydraModelV2, supports_graph_retention
 from fairchem.core.models.uma.escn_md import MLP_EFS_Head, eSCNMDBackbone
 from fairchem.core.models.uma.escn_moe import eSCNMDMoeBackbone
 from fairchem.core.models.uma.nn.mole import MOLE, norm_str_to_fn
@@ -42,6 +42,102 @@ _SMALL = dict(
     direct_forces=False,
 )
 _MOE = dict(num_experts=2, use_composition_embedding=True)
+
+
+def test_head_autocast_follows_input_device_after_migration():
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    class Head(torch.nn.Module):
+        use_amp = True
+
+        def forward(self, data, embeddings):
+            return torch.is_autocast_enabled(data["pos"].device.type)
+
+    model = HydraModelV2(torch.nn.Identity(), {"head": Head()})
+    with FakeTensorMode():
+        for device in ("cpu", "xpu", "cpu"):
+            assert model({"pos": torch.empty(2, 3, device=device)})["head"]
+
+
+@pytest.mark.parametrize("num_heads", [1, 2, 3])
+def test_head_graph_retention_compiles_as_one_graph(num_heads):
+    class Head(torch.nn.Module):
+        use_amp = False
+
+        @supports_graph_retention
+        def forward(self, data, embeddings, *, retain_graph=False):
+            x = embeddings["pos"]
+            return x.square() if retain_graph else x.sin()
+
+    class EnergyOnly(Head):
+        def forward(self, data, embeddings):
+            return embeddings["pos"].sin()
+
+    heads = {str(n): Head() for n in range(num_heads)}
+    if num_heads == 3:
+        heads["1"] = EnergyOnly()
+    model = HydraModelV2(torch.nn.Identity(), heads)
+    data = {"pos": torch.tensor([1.0, 2.0])}
+    compiled = torch.compile(model, fullgraph=True, backend="eager")
+    with torch.no_grad():
+        actual = compiled(data)
+        assert not torch.is_grad_enabled()
+    for index in range(num_heads):
+        retained = index < num_heads - 1 and not isinstance(
+            heads[str(index)], EnergyOnly
+        )
+        value = data["pos"].square() if retained else data["pos"].sin()
+        torch.testing.assert_close(actual[str(index)], value)
+
+
+@pytest.mark.parametrize(
+    "properties",
+    [
+        ("energy", "forces"),
+        ("energy", "stress"),
+        ("hessian_vector_product",),
+        ("hessian", "hessian_vector_product"),
+    ],
+)
+def test_conservative_heads_share_backbone_in_evaluation(properties):
+    torch.manual_seed(401)
+    model = HydraModel(
+        backbone=dict(
+            model="fairchem.core.models.uma.escn_md.eSCNMDBackbone",
+            **_SMALL,
+            regress_stress=True,
+            use_dataset_embedding=False,
+        ),
+        heads={
+            name: {
+                "module": "fairchem.core.models.uma.escn_md.MLP_EFS_Head",
+                "wrap_property": False,
+            }
+            for name in ("first", "second")
+        },
+    ).eval()
+    water = molecule("H2O")
+    water.set_cell([8, 8, 8])
+    inputs = batch((water, "omol"))
+    inputs["_requested_properties"] = properties
+    inputs["hessian_vector"] = torch.rand_like(inputs.pos)
+
+    def run(module):
+        torch.manual_seed(402)
+        return module(inputs.clone())
+
+    with torch.no_grad():
+        outputs = run(model)
+        assert not torch.is_grad_enabled()
+    for name in model.output_heads:
+        independent = copy.deepcopy(model)
+        independent.output_heads = torch.nn.ModuleDict(
+            {name: independent.output_heads[name]}
+        )
+        expected = run(independent)[name]
+        assert set(outputs[name]) == set(properties)
+        for prop in properties:
+            torch.testing.assert_close(outputs[name][prop], expected[prop])
 
 
 def test_overlapping_checkpointed_forwards_keep_input_and_parameter_gradients():

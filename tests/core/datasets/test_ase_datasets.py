@@ -311,3 +311,58 @@ def test_db_ids_distinguish_sources_and_preserve_explicit_identifiers(tmp_path):
     assert dataset[0].sid[0].endswith("first.db#1")
     assert dataset[2].sid[0].endswith("second.db#1")
     assert dataset[1].sid == ["17"]
+
+
+def test_sqlite_id_projection_keeps_selection_and_negative_indexing(
+    tmp_path, monkeypatch
+):
+    from ase import Atoms
+    from ase.db.sqlite import SQLite3Database
+
+    folder = tmp_path / "aselmdb-experiments"
+    folder.mkdir()
+    path = folder / "values.db"
+    database = connect(path)
+    database.write(Atoms("He"))
+    database.write(Atoms("H2"))
+    seen = []
+    select = SQLite3Database.select
+
+    def record(self, *args, **kwargs):
+        seen.append(kwargs)
+        return select(self, *args, **kwargs)
+
+    monkeypatch.setattr(SQLite3Database, "select", record)
+    dataset = AseDBDataset({"src": path})
+    assert seen[0]["columns"] == ["id"]
+    assert not seen[0]["include_data"]
+    assert isinstance(dataset.ids, range)
+    assert dataset.get_atoms(-1).get_chemical_formula() == "H2"
+    assert dataset.get_metadata("natoms", -1) == 2
+    with pytest.raises(IndexError):
+        dataset.get_atoms(-3)
+    filtered = AseDBDataset(
+        {"src": path, "select_args": {"filter": lambda row: row.natoms == 1}}
+    )
+    assert filtered.get_atoms(0).get_chemical_formula() == "He"
+    assert "columns" not in seen[-1]
+
+
+@pytest.mark.parametrize("dataset_type", [AseReadDataset, AseReadMultiStructureDataset])
+@pytest.mark.parametrize("custom_path", [False, True])
+def test_default_ase_directory_ignores_metadata_and_subdirectories(
+    tmp_path, dataset_type, custom_path
+):
+    from ase import Atoms
+
+    (tmp_path / "subdir").mkdir()
+    metadata = tmp_path / ("atom-counts.npz" if custom_path else "metadata.npz")
+    np.savez(metadata, natoms=[2])
+    write(tmp_path / "frame.xyz", Atoms("H2"))
+    config = {"src": tmp_path}
+    if custom_path:
+        config["metadata_path"] = metadata
+    dataset = dataset_type(config)
+    assert len(dataset) == 1
+    assert dataset.get_metadata("natoms", 0) == 2
+    assert dataset.get_atoms(0).get_chemical_formula() == "H2"

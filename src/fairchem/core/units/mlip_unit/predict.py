@@ -36,6 +36,7 @@ from torch.distributed.elastic.utils.distributed import get_free_port
 from torchtnt.framework import PredictUnit, State
 
 from fairchem.core.common import gp_utils
+from fairchem.core.common._exception_frames import clear_exception_tracebacks
 from fairchem.core.common._model_state import MODEL_STATE_LOCK
 from fairchem.core.common.distutils import (
     CURRENT_DEVICE_TYPE_STR,
@@ -445,23 +446,6 @@ def _prepare_inference_gradients(backbone, data: AtomicData) -> None:
         data["cell"].requires_grad_(True)
 
 
-def _clear_exception_tracebacks(error: Exception) -> None:
-    """Release failed-model frames before allocating a fallback model."""
-    pending = [error]
-    seen = set()
-    while pending:
-        current = pending.pop()
-        if id(current) in seen:
-            continue
-        seen.add(id(current))
-        current.__traceback__ = None
-        pending.extend(
-            cause
-            for cause in (current.__cause__, current.__context__)
-            if cause is not None
-        )
-
-
 _REDUCED_PRECISION_WARNING = (
     "Running in a reduced-precision mode: some values, such as higher-order "
     "derivatives and phonon calculations, will be less accurate. For standard "
@@ -676,7 +660,7 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
                 logging.warning(f"UMA Nitro cannot serve this request: {error}.")
                 # Nitro can reject checkpoint tensors after constructing its
                 # backbone. Release that partial model before building Hydra.
-                _clear_exception_tracebacks(error)
+                clear_exception_tracebacks(error)
                 self.inference_settings.nitro = False
                 self._load_hydra_model(checkpoint)
                 self._log_settings_change(before)
@@ -823,7 +807,7 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
         # intermediates through forward/prepare traceback frames. They must be
         # dropped before the replacement model is allocated, including chained
         # kernel errors. The error messages remain available for the warning.
-        _clear_exception_tracebacks(error)
+        clear_exception_tracebacks(error)
         if self.inference_settings.nitro:
             # The same settings without nitro: multigpu, for the default preset.
             self._fall_back_with(
@@ -1365,6 +1349,7 @@ class MLIPPredictUnit(PredictUnit[AtomicData], MLIPPredictUnitProtocol):
                 tasks=self.tasks,
                 device=self.device,
                 dtype=self.inference_settings.base_precision_dtype,
+                undo_element_references=undo_element_references,
             )
             if single_atom_result is not None:
                 if requested is not None:

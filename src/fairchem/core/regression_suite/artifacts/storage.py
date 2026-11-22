@@ -10,12 +10,14 @@ from __future__ import annotations
 # ``MeasurementRecord.values`` is a NumPy array, not a pandas object.
 # ruff: noqa: PD011
 import dataclasses
+import hashlib
 import json
 import os
 import shutil
+import tempfile
 import uuid
 import zipfile
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -32,6 +34,7 @@ from fairchem.core.regression_suite.spec.schema import (
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Mapping, Sequence
+    from typing import BinaryIO
 
 
 def write_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -63,8 +66,9 @@ def staged_directory(
     Yield a sibling directory that becomes ``destination`` if the block succeeds.
 
     Nothing is published when the block fails. An existing destination is
-    replaced only with ``replace``, and restored if the swap fails. Unlike
-    ``tempfile`` directories, the result gets the usual umask permissions.
+    replaced only with ``replace``, and restored if the swap fails. If the
+    filesystem also refuses the restore, the backup stays beside the output.
+    The staged directory gets the usual umask permissions.
     """
     destination = Path(destination)
     if destination.exists() and not replace:
@@ -83,10 +87,11 @@ def staged_directory(
             if previous.exists():
                 os.rename(previous, destination)
             raise
+        if previous.exists():
+            shutil.rmtree(previous)
     finally:
-        for path in (temporary, previous):
-            if path.exists():
-                shutil.rmtree(path)
+        if temporary.exists():
+            shutil.rmtree(temporary)
 
 
 ArtifactPath = Path | zipfile.Path
@@ -214,6 +219,46 @@ def write_reference(
     return manifest
 
 
+def _read_manifest(source: ArtifactPath, expected_hash: str | None) -> dict[str, Any]:
+    manifest_path = source / "manifest.json"
+    if not manifest_path.is_file():
+        raise RegressionSchemaError(f"reference is incomplete: {source}")
+    manifest = load_sealed(manifest_path, "reference_hash", "reference manifest")
+    if expected_hash is not None and manifest["reference_hash"] != expected_hash:
+        raise RegressionSchemaError("reference hash differs from the pinned baseline")
+    if (
+        manifest.get("schema") != REFERENCE_SCHEMA
+        or manifest["schema_version"] != SCHEMA_VERSION
+    ):
+        raise RegressionSchemaError("reference schema version is unsupported")
+    if manifest.get("record_count") != len(manifest["records"]):
+        raise RegressionSchemaError("reference record count differs from its manifest")
+    return manifest
+
+
+@contextmanager
+def _verified_values(path: ArtifactPath, expected_hash: str) -> Iterator[BinaryIO]:
+    with ExitStack() as stack:
+        source = stack.enter_context(path.open("rb"))
+        if isinstance(path, zipfile.Path):
+            # NumPy seeks within the NPZ file. Rewinding a compressed outer
+            # member would decompress its prefix again for each backward seek.
+            handle = stack.enter_context(
+                tempfile.SpooledTemporaryFile(max_size=8 << 20)
+            )
+            digest = hashlib.sha256()
+            while chunk := source.read(1 << 20):
+                digest.update(chunk)
+                handle.write(chunk)
+        else:
+            handle = source
+            digest = hashlib.file_digest(source, "sha256")
+        if digest.hexdigest() != expected_hash:
+            raise RegressionSchemaError("reference values file hash is invalid")
+        handle.seek(0)
+        yield handle
+
+
 def load_reference(
     directory: str | ArtifactPath,
     *,
@@ -223,18 +268,29 @@ def load_reference(
     Load a verified reference artifact and its full-resolution records.
     """
     source = Path(directory) if isinstance(directory, str) else directory
-    manifest = load_reference_manifest(source, expected_hash=expected_hash)
+    manifest = _read_manifest(source, expected_hash)
     with (
-        (source / str(manifest["values_file"])).open("rb") as handle,
+        _verified_values(
+            source / manifest["values_file"], manifest["values_sha256"]
+        ) as handle,
         np.load(handle, allow_pickle=False) as arrays,
     ):
-        records = [
-            MeasurementRecord(
-                values=arrays[item["array_key"]].copy(),
-                **{field: item[field] for field in _RECORD_FIELDS},
+        records = []
+        for item in manifest["records"]:
+            values = arrays[item["array_key"]]
+            if (
+                list(values.shape) != item["shape"]
+                or values.dtype.name != item["dtype"]
+            ):
+                raise RegressionSchemaError(
+                    "reference array differs from its declared shape or dtype"
+                )
+            records.append(
+                MeasurementRecord(
+                    values=values,
+                    **{field: item[field] for field in _RECORD_FIELDS},
+                )
             )
-            for item in manifest["records"]
-        ]
     return manifest, records
 
 
@@ -245,16 +301,8 @@ def load_reference_manifest(
     Load a reference manifest after checking its hash and its values file.
     """
     source = Path(directory) if isinstance(directory, str) else directory
-    manifest_path = source / "manifest.json"
-    if not manifest_path.is_file():
-        raise RegressionSchemaError(f"reference is incomplete: {source}")
-    manifest = load_sealed(manifest_path, "reference_hash", "reference manifest")
-    if expected_hash is not None and manifest["reference_hash"] != expected_hash:
-        raise RegressionSchemaError("reference hash differs from the pinned baseline")
-    if manifest["schema_version"] != SCHEMA_VERSION:
-        raise RegressionSchemaError("reference schema version is unsupported")
-    values_path = source / str(manifest["values_file"])
-    if file_sha256(values_path) != manifest["values_sha256"]:
+    manifest = _read_manifest(source, expected_hash)
+    if file_sha256(source / manifest["values_file"]) != manifest["values_sha256"]:
         raise RegressionSchemaError("reference values file hash is invalid")
     return manifest
 
@@ -289,18 +337,19 @@ def pack_baseline(artifact_dir: str | Path, destination: str | Path) -> Path:
         with zipfile.ZipFile(temporary, "w", zipfile.ZIP_LZMA) as archive:
             for member in members:
                 archive.write(root / member, member)
-        sealed = zipfile.Path(temporary)
-        for entry in payload["suites"].values():
-            load_reference_manifest(
-                (sealed / entry["reference"]["manifest"]).parent,
-                expected_hash=entry["reference"]["reference_hash"],
-            )
-            for collection in ("profiles", "verifications"):
-                for run in entry[collection].values():
-                    manifest = sealed / run["fragment"]
-                    if file_sha256(manifest) != run["fragment_sha256"]:
-                        raise RegressionSchemaError(f"{run['fragment']} changed")
-                    load_reference_manifest(manifest.parent)
+        with zipfile.ZipFile(temporary) as archive:
+            sealed = zipfile.Path(archive)
+            for entry in payload["suites"].values():
+                load_reference_manifest(
+                    (sealed / entry["reference"]["manifest"]).parent,
+                    expected_hash=entry["reference"]["reference_hash"],
+                )
+                for collection in ("profiles", "verifications"):
+                    for run in entry[collection].values():
+                        manifest = sealed / run["fragment"]
+                        if file_sha256(manifest) != run["fragment_sha256"]:
+                            raise RegressionSchemaError(f"{run['fragment']} changed")
+                        load_reference_manifest(manifest.parent)
         os.replace(temporary, output)
     finally:
         temporary.unlink(missing_ok=True)

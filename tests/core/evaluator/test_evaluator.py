@@ -101,3 +101,22 @@ class TestIS2REEval:
         assert "energy_mae" in self.metrics
         assert "energy_mse" in self.metrics
         assert "energy_within_threshold" in self.metrics
+
+
+def test_rmse_matches_pooled_components_and_exposes_historical_vector_norm():
+    evaluator = Evaluator(eval_metrics={"forces": ["rmse", "mean_euclidean_error"]})
+    pred = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+    label = torch.zeros_like(pred)
+    metrics = evaluator.eval({"forces": pred[:1]}, {"forces": label[:1]})
+    result = evaluator.eval(
+        {"forces": pred[1:]}, {"forces": label[1:]}, prev_metrics=metrics
+    )
+    assert result["forces_rmse"]["numel"] == 6
+    assert result["forces_rmse"]["total"] == 91
+    assert result["forces_rmse"]["metric"] == pytest.approx(np.sqrt(91 / 6))
+    assert result["forces_mean_euclidean_error"]["metric"] == pytest.approx(
+        torch.linalg.vector_norm(pred, dim=1).mean().item()
+    )
+    previous = {"forces_rmse": {"numel": 2, "total": 5.0, "metric": 2.5}}
+    with pytest.raises(ValueError, match="new accumulator"):
+        evaluator.eval({"forces": pred}, {"forces": label}, prev_metrics=previous)

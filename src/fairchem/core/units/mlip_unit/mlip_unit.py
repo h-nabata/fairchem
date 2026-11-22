@@ -14,7 +14,6 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional, Sequence
 
-import numpy as np
 import torch
 import torch.distributed.checkpoint as dcp
 from omegaconf import OmegaConf
@@ -48,6 +47,7 @@ from fairchem.core.common.utils import StrEnum
 from fairchem.core.components.train.train_runner import Checkpointable
 from fairchem.core.datasets.atomic_data import AtomicData
 from fairchem.core.datasets.collaters.mt_collater import MTCollater
+from fairchem.core.modules.evaluator import metric_from_totals
 from fairchem.core.modules.normalization.element_references import (  # noqa: TCH001
     ElementReferences,
 )
@@ -184,44 +184,41 @@ def initialize_finetuning_model(
     return model
 
 
+def _valid_output_mask(batch: AtomicData, task: Task) -> torch.Tensor:
+    valid = torch.isfinite(batch[task.name])
+    if valid.ndim > 1 and valid.shape[1:].numel() == 1:
+        return valid.reshape(valid.shape[0])
+    if task.level == "atom" and task.property == "forces":
+        # Vector metrics require all three components of an atom's force.
+        return valid.flatten(start_dim=1).all(dim=1)
+    return valid
+
+
+def _row_mask(mask, target):
+    return mask.reshape((mask.size(0),) + (1,) * (target.ndim - 1))
+
+
+def _dataset_output_mask(batch, task, valid, name):
+    selected = torch.tensor(
+        [label == name for label in batch.dataset_name],
+        dtype=torch.bool,
+        device=valid.device,
+    )
+    if task.level == "atom":
+        selected = selected[getattr(batch, "batch_full", batch.batch)]
+    return valid & _row_mask(selected, valid)
+
+
 def get_output_mask(batch: AtomicData, task: Task) -> dict[str, torch.Tensor]:
-    """Get a dictionary of boolean masks for each task and dataset in a batch.
-
-    Comment(@abhshkdz): Structures in our `batch` are a mix from various
-    sources, e.g. OC20, OC22, etc. That means for each loss computation,
-    we need to pull out the attribute of interest from each structure.
-    E.g. oc20_energy from OC20 structures, oc22_energy from OC22
-    structures etc. Set up those mappings here. Supports two kinds for
-    now: 1) for each structure-level output, mapping from output head
-    to boolean indexing map for `out` and `batch`, s.t. we can index like
-    batch.oc20_energy[oc20_map] for oc20_energy loss calculation. 2) for
-    each atom-level output, a similar mapping from output head to boolean
-    indexing map. s.t. we can index like batch.oc20_forces[oc20_map].
-    """
-
-    output_masks = {task.name: torch.isfinite(batch[task.name])}
-    if "forces" in task.name:
-        output_masks[task.name] = output_masks[task.name].all(dim=1)
-
-    for dset in set(batch.dataset_name):
-        dset_mask = torch.from_numpy(np.array(batch.dataset_name) == dset).to(
-            batch.pos.device
-        )
-        if task.level == "atom":
-            dset_mask = torch.repeat_interleave(dset_mask, batch.natoms)
-            output_masks[f"{dset}.{task.name}"] = dset_mask & output_masks[task.name]
-        elif "stress" in task.name:
-            assert output_masks[task.name].shape[0] == dset_mask.shape[0]
-            # we need to expand the target mask shape to match the output shape
-            target_shape = output_masks[task.name].shape
-            dset_expanded = dset_mask.view(len(dset_mask), -1).expand(target_shape)
-            output_masks[f"{dset}.{task.name}"] = (
-                dset_expanded & output_masks[task.name]
-            )
-        else:
-            output_masks[f"{dset}.{task.name}"] = dset_mask & output_masks[task.name]
-
-    return output_masks
+    """Return validity masks for the whole batch and each source dataset."""
+    valid = _valid_output_mask(batch, task)
+    return {
+        task.name: valid,
+        **{
+            f"{name}.{task.name}": _dataset_output_mask(batch, task, valid, name)
+            for name in set(batch.dataset_name)
+        },
+    }
 
 
 def get_output_masks(
@@ -249,17 +246,13 @@ def compute_loss(
         dictionary of losses for each task
     """
 
-    batch_size = batch.natoms.numel()
-    num_atoms_in_batch = batch.natoms.sum()
-
     free_mask = batch.fixed == 0
-    output_masks = get_output_masks(batch, tasks)
 
     loss_dict = {}
     for task in tasks:
         # TODO this might be a very expensive clone
         target = batch[task.name].clone()
-        output_mask = output_masks[task.name]
+        output_mask = _valid_output_mask(batch, task)
 
         # element references are applied to the target before normalization
         # TODO the current implementation will not work for single tasks with
@@ -279,13 +272,10 @@ def compute_loss(
         # this is related to how Hydra outputs stuff in nested dicts:
         # ie: oc20_energy.energy
         pred_for_task = predictions[task.name][task.property]
-        if task.level == "atom":
-            pred_for_task = pred_for_task.view(num_atoms_in_batch, -1)
-        else:
-            pred_for_task = pred_for_task.view(batch_size, -1)
+        pred_for_task = pred_for_task.reshape(target.shape[0], -1)
 
         if task.level == "atom" and task.train_on_free_atoms:
-            mult_mask = free_mask & output_mask
+            mult_mask = _row_mask(free_mask, output_mask) & output_mask
         else:
             mult_mask = output_mask
         loss_dict[task.name] = task.loss_fn(
@@ -307,7 +297,7 @@ def compute_metrics(
     predictions: dict[str, torch.Tensor],
     batch: AtomicData,
     dataset_name: str | None = None,
-) -> dict[str:Metrics]:
+) -> dict[str, Metrics]:
     """Compute metrics and update running metrics for a given task
 
     Args:
@@ -315,34 +305,20 @@ def compute_metrics(
         predictions: dictionary of predictions
         batch: data batch
         dataset_name: optional, if given compute metrics for given task using only labels from the given dataset
-        running_metrics: optional dictionary of previous metrics to update.
 
     Returns:
         dictionary of (updated) metrics
     """
-    # output masks include task level mask, and task.dataset level masks.
-    mask_key = task.name if dataset_name is None else f"{dataset_name}.{task.name}"
-    output_mask = get_output_mask(batch, task)[mask_key]
-
-    natoms = torch.repeat_interleave(batch.natoms, batch.natoms)
+    output_mask = _valid_output_mask(batch, task)
+    if dataset_name is not None:
+        output_mask = _dataset_output_mask(batch, task, output_mask, dataset_name)
+    natoms = batch.natoms
     if task.level == "atom":
-        if task.eval_on_free_atoms is True:
-            output_mask = output_mask & (batch.fixed == 0)
+        if task.eval_on_free_atoms:
+            output_mask = output_mask & _row_mask(batch.fixed == 0, output_mask)
+        natoms = natoms[getattr(batch, "batch_full", batch.batch)]
 
-        natoms_masked = natoms[output_mask]
-        output_size = natoms_masked.numel()
-    elif "stress" in task.name:
-        natoms_masked = batch.natoms[output_mask.all(dim=1)]
-        output_size = output_mask.sum()
-    else:
-        natoms_masked = batch.natoms[output_mask]
-        output_size = output_mask.sum()
-
-    # no metrics to report
-    if output_size == 0:
-        return {metric_name: Metrics() for metric_name in task.metrics}
-
-    target_masked = batch[task.name][output_mask]
+    target = batch[task.name]
     pred = predictions[task.name][task.property].clone()
     # denormalize the prediction
     pred = task.normalizer.denorm(pred)
@@ -352,18 +328,20 @@ def compute_metrics(
             batch,
             pred,
         )
+    if pred.shape[0] != target.shape[0] or pred.numel() != target.numel():
+        raise ValueError(
+            f"Shape mismatch for {task.name}: {pred.shape} and {target.shape}"
+        )
+    pred = pred.reshape_as(target)
+    target_masked = target[output_mask]
+    if target_masked.numel() == 0:
+        return {metric_name: Metrics() for metric_name in task.metrics}
     pred_masked = pred[output_mask]
-
-    # reshape: (num_atoms_in_batch, -1) or (num_systems_in_batch, -1)
-    # if task.level == "atom" or "stress" not in task.name:
-    #     # TODO do not reshape based on task.name
-    #     # tensor.view(..., -1) will add an extra dimension even if the input shape is the same as output shape
-    #     # this will cause downstream broadcast operations to be wrong and is dangerous
-    #     target_masked = target_masked.view(output_size, -1)
-
-    assert (
-        target_masked.shape == pred_masked.shape
-    ), f"shape mismatch for {task} target: target: {target_masked.shape}, pred: {pred_masked.shape}"
+    if output_mask.ndim > 1:
+        # Componentwise masks (e.g. partially labeled stresses) select a
+        # flattened set of observations and need one matching atom count each.
+        natoms = _row_mask(natoms, output_mask).expand_as(output_mask)
+    natoms_masked = _row_mask(natoms[output_mask], target_masked)
 
     # TODO need a cleaner interface for this...
     # Lets package up the masked target and prediction into a dictionary,
@@ -658,7 +636,7 @@ class MLIPTrainEvalUnit(
             )
             with tf32_context_manager(self.tf32):
                 flops = get_flops_profile(self.model, data, verbose=True)
-            num_atoms_local = data.natoms.sum().item()
+            num_atoms_local = data.fixed.size(0)
             flops_per_atom_param = flops / self.num_params / num_atoms_local
             if self.logger:
                 self.logger.log_summary(
@@ -770,7 +748,7 @@ class MLIPTrainEvalUnit(
 
             time_delta = time.time() - self.previous_wall_time
             self.previous_wall_time = time.time()
-            num_atoms_local = data.natoms.sum().item()
+            num_atoms_local = data.fixed.size(0)
             num_samples_local = data.natoms.numel()
             should_report = self.logger is not None or step % self.print_every == 0
             # Keep metrics on-device until a logger or console report needs them.
@@ -987,7 +965,10 @@ class MLIPEvalUnit(EvalUnit[AtomicData]):
             task.name: {
                 dataset: {metric: Metrics() for metric in task.metrics}
                 for dataset in filter(
-                    lambda x: any(dset in x for dset in task.datasets), datasets_to_eval
+                    lambda x: any(
+                        x == dset or x.startswith(f"{dset}.") for dset in task.datasets
+                    ),
+                    datasets_to_eval,
                 )
             }
             for task in self.tasks
@@ -1004,7 +985,7 @@ class MLIPEvalUnit(EvalUnit[AtomicData]):
         """Evaluates the model on a batch of data."""
         device = get_device_for_local_rank()
         data = data.to(device)
-        self.total_atoms += data.natoms.sum().item()
+        self.total_atoms += data.pos.size(0)
 
         if (time.time() - self.last_report) > self.report_every:
             seconds_per_step = (time.time() - self.start_time) / max(
@@ -1030,7 +1011,7 @@ class MLIPEvalUnit(EvalUnit[AtomicData]):
 
         # compute the loss
         loss_dict = compute_loss(self.tasks, preds, data)
-        total_loss = sum(loss_dict.values())
+        total_loss = sum(loss_dict.values()).detach()
         self.total_loss_metrics += Metrics(metric=total_loss, total=total_loss, numel=1)
 
         # get the datasets with split names
@@ -1043,7 +1024,9 @@ class MLIPEvalUnit(EvalUnit[AtomicData]):
             # won't compute metrics for those.
             # TODO overhaul the dataset names in task to avoid this filter?
             for dataset in filter(
-                lambda x: any(dset_name in x for dset_name in task.datasets),
+                lambda x: any(
+                    x == dset or x.startswith(f"{dset}.") for dset in task.datasets
+                ),
                 datasets_in_batch,
             ):
                 current_metrics = compute_metrics(task, preds, data, dataset)
@@ -1079,7 +1062,11 @@ class MLIPEvalUnit(EvalUnit[AtomicData]):
                     numel = distutils.all_reduce(
                         metrics.numel, average=False, device=device
                     )
-                    log_dict[f"val/{dataset},{task},{metric_name}"] = total / numel
+                    log_dict[f"val/{dataset},{task},{metric_name}"] = (
+                        metric_from_totals(
+                            total, numel, root_mean_square=metric_name == "rmse"
+                        )
+                    )
 
         total_runtime = distutils.all_reduce(
             self.total_runtime, average=False, device=device
@@ -1091,7 +1078,9 @@ class MLIPEvalUnit(EvalUnit[AtomicData]):
         # we do not reduce across ranks here. DDP loss uses a _ddp_mean that
         # gives the an approximate loss -> loss_rank_i / average_num_samples_across_ranks
         log_dict["val/loss"] = self.total_loss_metrics.metric
-        log_dict["val/atoms_per_second"] = total_atoms / total_runtime
+        log_dict["val/atoms_per_second"] = (
+            total_atoms / total_runtime if total_runtime else float("nan")
+        )
         log_dict["val/epoch"] = self.eval_progress.num_epochs_completed
 
         if self.logger is not None:

@@ -434,3 +434,33 @@ def test_grouped_mole_chunk_preserves_routing_gradients():
         torch.testing.assert_close(a, b)
     sizes[0] += 1
     assert state.row_layout(3, len(x), x.device)[1] is not plan
+
+
+def test_mole_chunk_invalidates_cpu_counts_mutated_through_numpy():
+    sizes = torch.tensor([3, 0, 2, 2])
+    routing = torch.eye(4)
+    state = MOLEGlobals(routing, sizes, ac_start_idx=2)
+    layer = MOLE(4, 1, 1, state, bias=False)
+    with torch.no_grad():
+        layer.weights[:, 0, 0].copy_(torch.arange(1, 5))
+    x = torch.ones(4, 1)
+    assert layer(x).flatten().tolist() == [1, 3, 3, 4]
+    sizes.numpy()[:] = [2, 0, 4, 1]
+    assert layer(x).flatten().tolist() == [3, 3, 3, 3]
+
+
+@pytest.mark.parametrize("edge_count", [0, 1, 7, 32])
+def test_single_system_mole_counts_local_and_padding_edges_from_shape(edge_count):
+    # Meta tensors expose dimensions only. A CPU transfer or target lookup
+    # cannot provide their values, just as the fast path must not need them.
+    state = SimpleNamespace(num_experts=2, global_mole_tensors=SimpleNamespace())
+    with torch.inference_mode():
+        eSCNMDMoeBackbone.set_MOLE_sizes(
+            state,
+            1,
+            torch.empty(11, dtype=torch.long, device="meta"),
+            torch.empty((2, edge_count), dtype=torch.long, device="meta"),
+        )
+    result = state.global_mole_tensors.mole_sizes
+    torch.testing.assert_close(result, torch.tensor([edge_count], dtype=torch.int))
+    assert not result.is_inference()

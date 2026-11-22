@@ -19,12 +19,10 @@ from __future__ import annotations
 import argparse
 import copy
 import gc
-import hashlib
 import json
 import platform
 import subprocess
 import time
-from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
@@ -588,6 +586,7 @@ def run_case(args, atoms, task, device, merge_mole, stress=False, progress=None)
     Load a fresh predictor so each timing retains its chosen MoLE configuration.
     """
     from fairchem.core import FAIRChemCalculator, pretrained_mlip
+    from fairchem.core.regression_suite.execution.runner import checkpoint_digest
 
     def stage(name):
         if progress is not None:
@@ -600,6 +599,10 @@ def run_case(args, atoms, task, device, merge_mole, stress=False, progress=None)
     memory = {}
     try:
         stage("load_model")
+        requested = Path(args.model)
+        requested_hash = (
+            checkpoint_digest(str(requested)) if requested.is_file() else None
+        )
         if device.type == "xpu":
             memory["load_model"] = {
                 "before": _xpu_memory_snapshot(device, reset_peak=True)
@@ -706,10 +709,12 @@ def run_case(args, atoms, task, device, merge_mole, stress=False, progress=None)
         result["execution"] = _execution_report(predictor, settings, compiled_regions)
         checkpoint = getattr(predictor, "_inference_model_path", None)
         if isinstance(checkpoint, (str, Path)) and Path(checkpoint).is_file():
-            checkpoint = Path(checkpoint)
-            result["checkpoint_sha256"] = _checkpoint_digest(
-                checkpoint, checkpoint.stat().st_mtime_ns
-            )
+            result["checkpoint_sha256"] = checkpoint_digest(str(checkpoint))
+            if (
+                requested_hash is not None
+                and requested_hash != result["checkpoint_sha256"]
+            ):
+                raise ValueError("checkpoint changed during validation")
         completed = True
     finally:
         # Detach the copied structure's calculator even when evaluation fails.
@@ -736,15 +741,6 @@ def run_case(args, atoms, task, device, merge_mole, stress=False, progress=None)
                     }
     stage("complete")
     return values, result
-
-
-@lru_cache(maxsize=8)
-def _checkpoint_digest(path, mtime_ns):
-    with path.open("rb") as stream:
-        digest = hashlib.sha256()
-        for chunk in iter(lambda: stream.read(2**20), b""):
-            digest.update(chunk)
-        return digest.hexdigest()
 
 
 def _source_revision():
@@ -903,6 +899,7 @@ def main(argv=None):
                 "ase",
                 "e3nn",
                 "triton",
+                "triton-xpu",
                 "pytorch-triton-xpu",
                 "onednn",
                 "intel-sycl-rt",
@@ -1103,6 +1100,13 @@ def main(argv=None):
                         )
                         measured["cpu_comparison"] = parity
                         case["passed"] &= parity["passed"]
+            for mode in ("cpu", "xpu_unmerged", "xpu_merged", "cpu_fp64"):
+                digest = case.get(mode, {}).get("checkpoint_sha256")
+                if (
+                    digest is not None
+                    and report.setdefault("checkpoint_sha256", digest) != digest
+                ):
+                    raise ValueError(f"{name} {mode} used a different checkpoint")
             passed &= case["passed"]
         if not args.probe_only and not report["cases"]:
             raise ValueError("No structures evaluated")

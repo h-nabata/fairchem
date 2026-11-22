@@ -15,7 +15,11 @@ import torch.nn as nn
 
 from fairchem.core.common.registry import registry
 from fairchem.core.common.utils import conditional_grad
-from fairchem.core.models.base import BackboneInterface, HeadInterface
+from fairchem.core.models.base import (
+    BackboneInterface,
+    HeadInterface,
+    supports_graph_retention,
+)
 from fairchem.core.models.escaip.configs import EScAIPConfigs, init_configs
 from fairchem.core.models.escaip.modules.graph_attention_block import (
     EfficientGraphAttentionBlock,
@@ -400,8 +404,11 @@ class EScAIPGradientEnergyForceStressHead(EScAIPEnergyHead):  # type: ignore
         self.prefix = prefix
         self.wrap_property = wrap_property
 
+    @supports_graph_retention
     @conditional_grad(torch.enable_grad())
-    def forward(self, data, emb: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    def forward(
+        self, data, emb: dict[str, torch.Tensor], *, retain_graph: bool = False
+    ) -> dict[str, torch.Tensor]:
         if self.prefix:
             energy_key = f"{self.prefix}_energy"
             forces_key = f"{self.prefix}_forces"
@@ -438,6 +445,7 @@ class EScAIPGradientEnergyForceStressHead(EScAIPEnergyHead):  # type: ignore
                 [energy_output.sum()],
                 [data["pos_original"], emb["displacement"]],
                 create_graph=self.training,
+                retain_graph=retain_graph or self.training,
             )
 
             forces = torch.neg(grads[0])
@@ -455,7 +463,10 @@ class EScAIPGradientEnergyForceStressHead(EScAIPEnergyHead):  # type: ignore
             forces = (
                 -1
                 * torch.autograd.grad(
-                    energy_output.sum(), data["pos"], create_graph=self.training
+                    energy_output.sum(),
+                    data["pos"],
+                    create_graph=self.training,
+                    retain_graph=retain_graph or self.training,
                 )[0]
             )
             outputs[forces_key] = {"forces": forces} if self.wrap_property else forces

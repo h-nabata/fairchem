@@ -172,10 +172,10 @@ def _measure(
             for item in inputs:
                 predictor.predict(item, **options)
         torch.xpu.synchronize(device)
+        torch.xpu.reset_peak_memory_stats(device)
         if barrier is not None:
             barrier.wait(timeout=1800)
         start = time.monotonic()
-        torch.xpu.reset_peak_memory_stats(device)
         for _ in range(repeats):
             for item in inputs:
                 predictor.predict(item, **options)

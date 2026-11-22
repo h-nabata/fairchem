@@ -14,7 +14,7 @@ import math
 import time
 from collections import OrderedDict, defaultdict, deque
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from multiprocessing import cpu_count
 from numbers import Integral, Real
 from statistics import median
@@ -50,6 +50,7 @@ except ImportError:
 
     serve = _ServeStub()
 
+from fairchem.core.common._exception_frames import clear_exception_tracebacks
 from fairchem.core.components.serve_utils import (
     get_app_handle_with_retry,
     get_ray_connection_info,
@@ -88,6 +89,11 @@ __all__ = [
 if TYPE_CHECKING:
     from fairchem.core.datasets.atomic_data import AtomicData
     from fairchem.core.units.mlip_unit import MLIPPredictUnit
+
+
+def _batch_atom_count(batch: list[AtomicData]) -> int:
+    # Tensor shapes are available without synchronizing accelerator requests.
+    return sum(sample.num_nodes for sample in batch)
 
 
 def _to_cpu(obj: Any) -> Any:
@@ -336,7 +342,11 @@ class BatchPredictServerMixin:
                 predict_unit, "supports_requested_properties", False
             ):
                 raise ValueError("The predictor does not support requested_properties")
-            requested = default_requested if requested is None else requested
+            if len(items) == 1:
+                return self._run_compatible_batch(
+                    items, predict_unit, undo_element_references, requested
+                )
+            effective = default_requested if requested is None else requested
             # A property need not exist for every dataset. Mixing datasets can
             # produce a shortened collated tensor that cannot be assigned back
             # to the right request by its shape alone.
@@ -344,37 +354,41 @@ class BatchPredictServerMixin:
             # computes them for one structure at a time. A batch window may
             # still contain several such requests; isolate their forward calls.
             key = (
-                _compatibility_key(data),
+                requested,
                 index
-                if _requires_single_system(predict_unit, data, requested)
-                else None,
+                if _requires_single_system(predict_unit, data, effective)
+                else _compatibility_key(data),
             )
             groups[key].append(index)
-        if len(groups) > 1:
-            ordered = [None] * len(items)
-            for indices in groups.values():
-                outputs = self._run_batched_inference(
-                    [items[index] for index in indices],
-                    predict_unit,
-                    undo_element_references,
-                )
-                for index, output in zip(indices, outputs, strict=True):
-                    ordered[index] = output
-            return ordered
+        if len(groups) == 1:
+            return self._run_compatible_batch(
+                items, predict_unit, undo_element_references, requested
+            )
+        ordered = [None] * len(items)
+        for (requested, _), indices in groups.items():
+            outputs = self._run_compatible_batch(
+                [items[index] for index in indices],
+                predict_unit,
+                undo_element_references,
+                requested,
+            )
+            for index, output in zip(indices, outputs, strict=True):
+                ordered[index] = output
+        return ordered
+
+    def _run_compatible_batch(
+        self, items, predict_unit, undo_element_references, requested
+    ) -> list[dict]:
+        # Property selection is a per-call option, not per-atom metadata.
+        # The selection is shared by every retry when a batch is split on OOM.
+        predict_kwargs = (
+            {} if requested is None else {"requested_properties": requested}
+        )
         data_deque: deque[list[AtomicData]] = deque([items])
         results: list[dict] = []
         while data_deque:
             oom = False
             current = data_deque.popleft()
-            # Property selection is a per-call option, not per-atom metadata.
-            # Forward it explicitly so global predictor defaults cannot replace
-            # it and collation cannot duplicate or nest the requested names.
-            requested = _normalize_requested_properties(
-                current[0].get("_requested_properties", None)
-            )
-            predict_kwargs = (
-                {} if requested is None else {"requested_properties": requested}
-            )
             try:
                 batch = atomicdata_list_to_batch(
                     current, exclude_keys=["_requested_properties"]
@@ -407,11 +421,7 @@ class BatchPredictServerMixin:
                     "Caught out of memory error. Splitting batch and retrying."
                 )
                 oom = True
-                from fairchem.core.units.mlip_unit.predict import (
-                    _clear_exception_tracebacks,
-                )
-
-                _clear_exception_tracebacks(err)
+                clear_exception_tracebacks(err)
                 device = torch.device(
                     getattr(predict_unit, "device", current[0].pos.device)
                 )
@@ -642,9 +652,7 @@ class BatchPredictServer(BatchPredictServerMixin):
             "BatchPredictServer initialized with predict_unit from object store"
         )
 
-    @serve.batch(
-        batch_size_fn=lambda batch: sum(sample.natoms.sum() for sample in batch).item()
-    )
+    @serve.batch(batch_size_fn=_batch_atom_count)
     async def predict(
         self,
         data_list: list[AtomicData],
@@ -764,7 +772,7 @@ class MultiplexedBatchPredictServer(BatchPredictServerMixin):
         return True
 
     @serve.batch(
-        batch_size_fn=lambda batch: sum(sample.natoms.sum() for sample in batch).item(),
+        batch_size_fn=_batch_atom_count,
         max_concurrent_batches=1,
     )
     async def predict(
@@ -1051,8 +1059,7 @@ def _prepare_deployment_config(
             f"({default_basis}). Pass num_gpus or set "
             "ray_actor_options['num_gpus'] to override."
         )
-    deployment_config.ray_actor_options = actor_opts
-    return deployment_config
+    return replace(deployment_config, ray_actor_options=actor_opts)
 
 
 def _check_predict_unit_device(predict_unit: MLIPPredictUnit, num_gpus: float) -> None:
@@ -1219,6 +1226,7 @@ def _deploy_app(
     including replicas that autoscaling adds later.
     """
     with _deployment_lock(deployment_name):
+        batch_config = replace(batch_config)
         merged_options = {
             **options_kwargs,
             "user_config": {
@@ -1323,6 +1331,12 @@ def update_served_predict_unit(
             raise KeyError(
                 f"No deployment named {deployment_name!r} was created by this "
                 "process, so its checkpoint cannot be updated."
+            )
+
+        if not record.bind_args:
+            raise ValueError(
+                "Cannot replace a single predict unit in a multiplexed deployment. "
+                "Register a ModelSpec for the replacement model."
             )
 
         _check_predict_unit_device(

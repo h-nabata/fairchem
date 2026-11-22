@@ -64,11 +64,16 @@ def get_init_method(
         hostnames = subprocess.check_output(
             ["scontrol", "show", "hostnames", node_list]
         )
+        if not hostnames.split():
+            raise RuntimeError("Slurm returned no hosts for the distributed job")
+        port = os.environ.get("MASTER_PORT")
+        if port is None:
+            port = get_free_port() if world_size == 1 else DISTRIBUTED_PORT
         return get_tcp_init_method(
             world_size=world_size,
             hostname=hostnames.split()[0].decode("utf-8"),
             rank=rank,
-            port=get_free_port() if world_size == 1 else DISTRIBUTED_PORT,
+            port=int(port),
         )
     elif init_method == "file":
         return get_file_init_method(world_size=world_size, rank=rank, filename=filename)
@@ -82,56 +87,54 @@ def setup(config) -> None:
         node_list = os.environ.get("SLURM_STEP_NODELIST")
         if node_list is None:
             node_list = os.environ.get("SLURM_JOB_NODELIST")
-        if node_list is not None:
-            try:
-                nnodes = int(os_environ_get_or_throw("SLURM_NNODES"))
-                ntasks_per_node = os.environ.get("SLURM_NTASKS_PER_NODE")
-                if ntasks_per_node is not None:
-                    ntasks_per_node = int(ntasks_per_node)
-                else:
-                    ntasks = int(os_environ_get_or_throw("SLURM_NTASKS"))
-                    nnodes = int(os_environ_get_or_throw("SLURM_NNODES"))
-                    assert ntasks % nnodes == 0
-                    ntasks_per_node = int(ntasks / nnodes)
-                if ntasks_per_node == 1:
-                    assert config["world_size"] % nnodes == 0
-                    gpus_per_node = config["world_size"] // nnodes
-                    node_id = int(os_environ_get_or_throw("SLURM_NODEID"))
-                    rank = node_id * gpus_per_node
-                    local_rank = 0
-                else:
-                    assert ntasks_per_node == config["world_size"] // nnodes
-                    rank = int(os_environ_get_or_throw("SLURM_PROCID"))
-                    local_rank = int(os_environ_get_or_throw("SLURM_LOCALID"))
+        if not node_list:
+            raise RuntimeError(
+                "Slurm distributed setup requires SLURM_STEP_NODELIST or SLURM_JOB_NODELIST"
+            )
+        nnodes = int(os_environ_get_or_throw("SLURM_NNODES"))
+        ntasks_per_node = os.environ.get("SLURM_NTASKS_PER_NODE")
+        if ntasks_per_node is not None:
+            ntasks_per_node = int(ntasks_per_node)
+        else:
+            ntasks = int(os_environ_get_or_throw("SLURM_NTASKS"))
+            nnodes = int(os_environ_get_or_throw("SLURM_NNODES"))
+            assert ntasks % nnodes == 0
+            ntasks_per_node = int(ntasks / nnodes)
+        if ntasks_per_node == 1:
+            assert config["world_size"] % nnodes == 0
+            gpus_per_node = config["world_size"] // nnodes
+            node_id = int(os_environ_get_or_throw("SLURM_NODEID"))
+            rank = node_id * gpus_per_node
+            local_rank = 0
+        else:
+            assert ntasks_per_node == config["world_size"] // nnodes
+            rank = int(os_environ_get_or_throw("SLURM_PROCID"))
+            local_rank = int(os_environ_get_or_throw("SLURM_LOCALID"))
 
-                init_method = get_init_method(
-                    config["init_method"],
-                    world_size=config["world_size"],
-                    rank=rank,
-                    node_list=node_list,
-                    filename=os.path.join(
-                        config["shared_file_dir"],
-                        f".distributed-shared-file-{config['array_job_num']}",
-                    ),
-                )
-                logging.info(f"Torch distributed initialized with: {init_method}")
+        init_method = get_init_method(
+            config["init_method"],
+            world_size=config["world_size"],
+            rank=rank,
+            node_list=node_list,
+            filename=os.path.join(
+                config["shared_file_dir"],
+                f".distributed-shared-file-{config['array_job_num']}",
+            ),
+        )
+        logging.info(f"Initializing torch.distributed with: {init_method}")
 
-                # ensures GPU0 does not have extra context/higher peak memory
-                logging.info(
-                    f"local rank: {local_rank}, visible devices: {os.environ.get('CUDA_VISIBLE_DEVICES', 'None')}"
-                )
+        # ensures GPU0 does not have extra context/higher peak memory
+        logging.info(
+            f"local rank: {local_rank}, visible devices: {os.environ.get('CUDA_VISIBLE_DEVICES', 'None')}"
+        )
 
-                assign_device_for_local_rank(config["cpu"], local_rank)
+        assign_device_for_local_rank(config["cpu"], local_rank)
 
-                dist.init_process_group(
-                    backend=config["distributed_backend"],
-                    init_method=init_method,
-                    timeout=timeout,
-                )
-            except subprocess.CalledProcessError as e:  # scontrol failed
-                raise e
-            except FileNotFoundError:  # Slurm is not installed
-                pass
+        dist.init_process_group(
+            backend=config["distributed_backend"],
+            init_method=init_method,
+            timeout=timeout,
+        )
     else:  # local mode
         if config.get("init_method") == "file":
             local_rank = int(os.environ.get("LOCAL_RANK", 0))

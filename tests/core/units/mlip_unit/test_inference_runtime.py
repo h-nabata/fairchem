@@ -19,6 +19,7 @@ from ase import Atoms
 from torch.utils import _pytree
 
 from fairchem.core.datasets.atomic_data import AtomicData, atomicdata_list_to_batch
+from fairchem.core.modules.normalization.element_references import ElementReferences
 from fairchem.core.modules.normalization.normalizer import Normalizer
 from fairchem.core.units.mlip_unit.api.inference import InferenceSettings
 from fairchem.core.units.mlip_unit.inference_runtime import (
@@ -478,6 +479,14 @@ def test_single_atom_lookup_filters_requests_and_rejects_unavailable_outputs():
     result = predictor.predict(data, requested_properties=("energy",))
     assert set(result) == {"energy"}
     torch.testing.assert_close(result["energy"], torch.tensor([1.5]))
+    # The lookup contains absolute energies, while the checkpoint also has a
+    # fitted elemental reference. Per-call selection must honor both conventions.
+    tasks[0].element_references = ElementReferences(torch.tensor([0.0, 1.25]))
+    relative = predictor.predict(data, undo_element_references=False)
+    torch.testing.assert_close(relative["energy"], torch.tensor([0.25]))
+    torch.testing.assert_close(relative["forces"], torch.zeros(1, 3))
+    again = predictor.predict(data, requested_properties=("energy",))
+    torch.testing.assert_close(again["energy"], result["energy"])
     with pytest.raises(ValueError, match="lookup cannot provide"):
         predictor.predict(data, requested_properties=("embeddings",))
 
@@ -724,3 +733,77 @@ def test_ase_external_graph_uses_model_cutoff_and_degenerate_shell_policy():
     backbone.enforce_max_neighbors_strictly = True
     capped = FAIRChemCalculator(predictor, task_name="omol").a2g(atoms)
     assert capped.edge_index.shape[1] == 3
+
+
+@pytest.mark.parametrize("external", [False, True])
+@pytest.mark.parametrize("execution_mode", ["general", "umas_fast_portable"])
+def test_conservative_predictor_is_invariant_to_large_lattice_image(
+    tmp_path, external, execution_mode
+):
+    from tests.core.models.uma.uma_nitro.nitro_test_utils import (
+        batch,
+        random_checkpoint,
+    )
+
+    torch.manual_seed(42)
+    checkpoint = tmp_path / "model.pt"
+    torch.save(
+        random_checkpoint(
+            num_layers=1,
+            sphere_channels=8,
+            hidden_channels=16,
+            edge_channels=8,
+            num_distance_basis=8,
+            cutoff=1.4,
+        ),
+        checkpoint,
+    )
+    predictor = MLIPPredictUnit(
+        str(checkpoint),
+        device="cpu",
+        inference_settings=InferenceSettings(
+            execution_mode=execution_mode,
+            external_graph_gen=external,
+            hessian_chunk_size=2,
+            activation_checkpointing=execution_mode == "general",
+            merge_mole=execution_mode == "umas_fast_portable",
+        ),
+    )
+    props = ("energy", "forces", "stress", "hessian", "hessian_vector_product")
+
+    def predict(translated, requested=props):
+        # 100000000 = 1 + 33333333 * 3 is exactly representable in FP32.
+        atoms = Atoms(
+            "HC",
+            positions=[
+                [0.25, 0.125, 0.375],
+                [100000000 if translated else 1, 0.5, 0.25],
+            ],
+            cell=[3, 6, 6],
+            pbc=True,
+        )
+        data = batch((atoms, "omat"))
+        # ASE conversion wraps periodic input; external AtomicData and MD
+        # callers can supply the original, unwrapped Cartesian coordinates.
+        data.pos = torch.as_tensor(atoms.positions, dtype=data.pos.dtype).clone()
+        if external:
+            count = 33333333 if translated else 0
+            data.update_batch_edges(
+                torch.tensor([[0, 1], [1, 0]]),
+                torch.tensor([[count, 0, 0], [-count, 0, 0]]),
+                torch.tensor([2]),
+            )
+        data["hessian_vector"] = torch.tensor([[0.3, -0.1, 0.2], [0.8, 0.2, -0.4]])
+        torch.manual_seed(43)
+        return predictor.predict(data, requested_properties=requested)
+
+    reference = predict(False)
+    actual = predict(True)
+    assert reference["stress"].abs().max() > 1e-8
+    for prop in props:
+        torch.testing.assert_close(actual[prop], reference[prop], rtol=3e-5, atol=2e-8)
+    # Requesting stress alone must take the same branch, without a force graph
+    # built for Hessian or HVP.
+    torch.testing.assert_close(
+        predict(True, ("stress",))["stress"], reference["stress"], rtol=3e-5, atol=2e-8
+    )

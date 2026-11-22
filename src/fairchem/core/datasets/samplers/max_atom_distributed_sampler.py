@@ -14,10 +14,11 @@ from typing import TYPE_CHECKING, Iterator
 
 import numba as nb
 import numpy as np
-import torch
 from torch.utils.data import Sampler
 
 from fairchem.core.common import gp_utils
+from fairchem.core.datasets.base_dataset import natoms_for_sampling
+from fairchem.core.datasets.samplers.distributed_indices import distributed_indices
 
 if TYPE_CHECKING:
     from fairchem.core.datasets.base_dataset import BaseDataset
@@ -46,7 +47,7 @@ def get_batches(
 
     # Ensure the inputs are valid
     assert max_atoms > 0
-    assert len(natoms_list) > 0
+    assert 0 <= min_atoms <= max_atoms
     assert len(natoms_list) == len(indices)
 
     # Initialize variables to keep track of the batches and the total number of atoms in each batch
@@ -66,7 +67,7 @@ def get_batches(
             continue
 
         # If adding the sample to the current batch would not exceed the maximum number of atoms, add it
-        if run_sum + atoms <= max_atoms:
+        if atoms <= max_atoms - run_sum:
             cur_batch.append(idx)
             run_sum += atoms
         # Otherwise, start a new batch
@@ -78,7 +79,7 @@ def get_batches(
             run_sum = atoms
 
     # Add the last batch
-    if run_sum >= min_atoms:
+    if len(cur_batch) and run_sum >= min_atoms:
         batches.append(cur_batch)
         atom_counts.append(run_sum)
 
@@ -119,8 +120,10 @@ class MaxAtomDistributedBatchSampler(Sampler[list[int]]):
         self.min_atoms = min_atoms
         self.num_replicas = num_replicas
         self.rank = rank
-        assert self.num_replicas > 0
-        assert self.rank < self.num_replicas
+        if not 0 <= rank < num_replicas:
+            raise ValueError("rank must be in [0, num_replicas)")
+        if max_atoms <= 0 or not 0 <= min_atoms <= max_atoms:
+            raise ValueError("Expected max_atoms > 0 and 0 <= min_atoms <= max_atoms")
 
         if gp_utils.initialized():
             assert (
@@ -148,21 +151,20 @@ class MaxAtomDistributedBatchSampler(Sampler[list[int]]):
         else:
             self.num_samples = math.ceil(len(self.all_batches) / self.num_replicas)
         self.total_size = self.num_samples * self.num_replicas
-        assert (
-            len(self.all_batches) >= self.num_replicas
-        ), "there are less batches than ranks!"
 
-    def _prepare_batches(self) -> list[int]:
+    def _prepare_batches(self) -> list[list[int]]:
         # shuffle is not optional here since the metadata tend to be sorted by atom count and the resulting batches will be highly uneven
         rng = np.random.default_rng(self.seed)
         original_indices = rng.permutation(len(self.dataset))
-        # TODO: this is slow
         t0 = time.time()
         natoms_list = self.dataset.get_metadata("natoms", original_indices.tolist())
+        natoms_list = natoms_for_sampling(natoms_list, len(original_indices))
         t1 = time.time()
         indices, atoms_count, samples_filtered = get_batches(
-            np.array(natoms_list), original_indices, self.max_atoms, self.min_atoms
+            natoms_list, original_indices, self.max_atoms, self.min_atoms
         )
+        if not indices:
+            raise ValueError("No batch satisfies the configured atom count bounds")
         t2 = time.time()
         logging.info(
             f"Sampler batch generation times: get natoms: {t1 - t0}, total: {t2 - t0}"
@@ -179,39 +181,19 @@ class MaxAtomDistributedBatchSampler(Sampler[list[int]]):
         return self.num_samples
 
     def __iter__(self) -> Iterator[list[int]]:
-        # based on current rank, return an iterator over batches
-        if self.shuffle:
-            # deterministically shuffle based on epoch and seed
-            g = torch.Generator()
-            g.manual_seed(self.seed + self.epoch)
-            indices = torch.randperm(len(self.all_batches), generator=g).tolist()  # type: ignore[arg-type]
-        else:
-            indices = list(range(len(self.all_batches)))  # type: ignore[arg-type]
-
-        if not self.drop_last:
-            # add extra samples to make it evenly divisible
-            padding_size = self.total_size - len(indices)
-            if padding_size <= len(indices):
-                indices += indices[:padding_size]
-            else:
-                indices += (indices * math.ceil(padding_size / len(indices)))[
-                    :padding_size
-                ]
-        else:
-            # remove tail of data to make it evenly divisible.
-            indices = indices[: self.total_size]
-
-        assert len(indices) == self.total_size
-
-        indices = indices[self.rank : self.total_size : self.num_replicas]
-        assert len(indices) == self.num_samples
-        # slice of batch indices
-        batch_slice = [self.all_batches[i] for i in indices]
-        assert (
-            self.start_iter < len(batch_slice)
-        ), f"starting iteration {self.start_iter} must be less than size of the slice of batches! {len(batch_slice)}"
-        return iter(batch_slice[self.start_iter :])
+        indices = distributed_indices(
+            len(self.all_batches),
+            self.total_size,
+            self.rank,
+            self.num_replicas,
+            self.shuffle,
+            self.seed + self.epoch,
+            self.start_iter,
+        )
+        return (self.all_batches[i] for i in indices)
 
     def set_epoch_and_start_iteration(self, epoch: int, start_iter: int) -> None:
+        if not 0 <= start_iter <= self.num_samples:
+            raise ValueError(f"start_iter must be in [0, {self.num_samples}]")
         self.epoch = epoch
         self.start_iter = start_iter

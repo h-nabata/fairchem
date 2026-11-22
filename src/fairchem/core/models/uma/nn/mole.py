@@ -8,11 +8,12 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 import math
+from bisect import bisect_left, bisect_right
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import lru_cache
-from itertools import accumulate, pairwise
+from itertools import accumulate
 from typing import NamedTuple
 
 import torch
@@ -105,13 +106,20 @@ class MOLEGlobals:
             sizes is not cache.get("sizes")
             or version is None
             or version != cache.get("version")
+            or (
+                sizes.device.type == "cpu" and not torch.equal(cache["snapshot"], sizes)
+            )
         ):
             cache.clear()
-            counts = sizes.tolist()
+            # External CPU writers (e.g. NumPy) do not bump a tensor version.
+            snapshot = sizes.detach().clone() if sizes.device.type == "cpu" else None
+            counts = (snapshot if snapshot is not None else sizes).tolist()
+            if any(count < 0 for count in counts):
+                raise ValueError("MoLE row counts must be nonnegative")
             cache.update(
                 sizes=sizes,
                 version=version,
-                counts=counts,
+                snapshot=snapshot,
                 boundaries=[0, *accumulate(counts)],
             )
         device = torch.device(device)
@@ -122,7 +130,7 @@ class MOLEGlobals:
         )
         key = (start, rows, device, stream)
         if key not in cache:
-            cache[key] = _build_padded_plan(cache["counts"], start, rows, device)
+            cache[key] = _build_padded_plan(cache["boundaries"], start, rows, device)
         return cache["boundaries"], cache[key]
 
     def __getstate__(self):
@@ -154,10 +162,26 @@ class PaddedPlan(NamedTuple):
     index: torch.Tensor
 
 
+def _chunk_segments(boundaries, start, rows):
+    """(system, first row, end row) for the nonempty ranges in a local chunk."""
+    end = start + rows
+    first = max(0, bisect_right(boundaries, start) - 1)
+    last = min(len(boundaries) - 1, bisect_left(boundaries, end))
+    return [
+        (
+            system,
+            max(boundaries[system] - start, 0),
+            min(boundaries[system + 1], end) - start,
+        )
+        for system in range(first, last)
+        if rows and boundaries[system + 1] > boundaries[system]
+    ]
+
+
 @torch.inference_mode(False)
 @torch.no_grad()
 def _build_padded_plan(
-    sizes: list[int], start: int, num_rows: int, device: torch.device
+    boundaries: list[int], start: int, num_rows: int, device: torch.device
 ) -> PaddedPlan | None:
     """
     Build the padded layout for input rows [start, start + num_rows).
@@ -166,7 +190,7 @@ def _build_padded_plan(
     rows stay within twice its real rows.
 
     Args:
-        sizes: Rows per system for the whole batch.
+        boundaries: Cumulative row counts including the initial zero.
         start: Global index of the first input row (activation checkpointing).
         num_rows: Number of input rows.
         device: Device for the index tensors.
@@ -176,14 +200,10 @@ def _build_padded_plan(
         system has rows, or every system needs its own group) or the sizes do
         not cover the input.
     """
-    end = start + num_rows
-    segments = []  # (system, first input row, rows), in input order
-    offset = 0
-    for system, size in enumerate(sizes):
-        first, last = max(offset, start), min(offset + size, end)
-        if last > first:
-            segments.append((system, first - start, last - first))
-        offset += size
+    segments = [
+        (system, first, end - first)
+        for system, first, end in _chunk_segments(boundaries, start, num_rows)
+    ]
     if len(segments) < 2 or sum(seg[2] for seg in segments) != num_rows:
         return None
 
@@ -354,32 +374,11 @@ class MOLE(torch.nn.Module):
         ac_start_idx = state.ac_start_idx
         assert len(state.mole_sizes) > 0
         start_idxs, plan = state.row_layout(ac_start_idx, x.shape[0], x.device)
-        mole_intervals = pairwise(start_idxs)
-
-        # Because activation checkpointing can chunk the inputs, we need to only compute
-        # the mole_size intervals that overlap with the current chunks
-        # for example if mole_sizes = [10,10,15]
-        # start_idxs -> [0,10,20,35]
-        # mole_intervals -> [(0,10),(10,20),(20,35)]
-        # if the input segment is (5,15) then we compute the following 2 segments
-        # (5,10),(10,15)
-        input_segment = (ac_start_idx, ac_start_idx + x.shape[0])
+        end_idx = ac_start_idx + x.shape[0]
         assert (
-            0 <= input_segment[0] <= input_segment[1] <= start_idxs[-1]
-        ), f"Input segment {input_segment} is outside MoLE sizes {start_idxs[-1]}"
-
-        segments = []
-        for n, mole_segment in enumerate(mole_intervals):
-            interval_overlap = interval_intersection(input_segment, mole_segment)
-            # Intervals are half-open for tensor slicing. A touching boundary
-            # or a system with zero edges must not launch an empty GEMM.
-            if (
-                interval_overlap is not None
-                and interval_overlap[0] < interval_overlap[1]
-            ):
-                start = interval_overlap[0] - ac_start_idx
-                end = interval_overlap[1] - ac_start_idx
-                segments.append((n, start, end))
+            0 <= ac_start_idx <= end_idx <= start_idxs[-1]
+        ), f"Input segment {(ac_start_idx, end_idx)} is outside MoLE sizes {start_idxs[-1]}"
+        segments = _chunk_segments(start_idxs, ac_start_idx, x.shape[0])
 
         first_system = segments[0][0] if segments else 0
         last_system = segments[-1][0] + 1 if segments else 1

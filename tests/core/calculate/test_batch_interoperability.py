@@ -8,6 +8,7 @@ LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
 import copy
+import gc
 import pickle
 import weakref
 from concurrent.futures import ThreadPoolExecutor
@@ -34,6 +35,35 @@ from fairchem.core.modules.normalization.normalizer import Normalizer
 from fairchem.core.units.mlip_unit.mlip_unit import OutputSpec, Task
 from tests.core.calculate.test_batched_inference import HarmonicPredictor, _structure
 from tests.core.units.mlip_unit.test_xpu_preparation import _small_predictor
+
+
+def test_failed_worker_future_releases_forward_tensors_and_preserves_traceback():
+    references = []
+
+    class FailingPredictor:
+        device = "cpu"
+
+        def predict(self, data):
+            def fail():
+                temporary = data.pos.square()
+                references.extend([weakref.ref(temporary), weakref.ref(data.pos)])
+                raise ValueError("forward failed")
+
+            try:
+                fail()
+            except ValueError as error:
+                raise RuntimeError("prediction failed") from error
+
+    with IndependentDevicePool(lambda _: FailingPredictor(), ["cpu"]) as pool:
+        future = pool.submit([_structure()])
+        held_error = future.exception(timeout=10)
+        assert isinstance(held_error, RuntimeError)
+        assert "in fail" in held_error.__cause__.__notes__[0]
+        assert "in predict" in held_error.__notes__[0]
+        gc.collect()
+        assert len(references) == 2
+        assert all(reference() is None for reference in references)
+        assert pool._reserved_bytes == 0
 
 
 @pytest.mark.parametrize("slots", [None, 1, 2])
@@ -128,7 +158,7 @@ def test_per_structure_requests_do_not_become_nested_or_cross_jobs():
             return {name: output[name] for name in requested_properties}
 
     structures = [_structure(offset=i) for i in range(3)]
-    for data, props in zip(structures, [("energy",), ("forces",), ("energy",)]):
+    for data, props in zip(structures, [("energy",), ("forces",), ["energy"]]):
         data._requested_properties = props
     output = MicrobatchPredictor(Predictor()).predict_many(structures)
     assert [set(value) for value in output] == [{"energy"}, {"forces"}, {"energy"}]

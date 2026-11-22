@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 from abc import ABCMeta
 from functools import cached_property
+from os import PathLike
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -37,6 +38,20 @@ class UnsupportedDatasetError(ValueError):
     pass
 
 
+def natoms_for_sampling(values, size: int) -> np.ndarray:
+    """Give PyTorch and Numba a common signed, per-structure atom count."""
+    counts = np.asarray(values)
+    if counts.shape not in ((size,), (size, 1)):
+        raise ValueError("Expected one natoms count per sample")
+    if size and (
+        counts.dtype.kind not in "iu"
+        or counts.min() < 0
+        or int(counts.max()) > np.iinfo(np.int64).max
+    ):
+        raise ValueError("natoms must contain nonnegative integers that fit in int64")
+    return counts.reshape(-1).astype(np.int64, copy=False)
+
+
 class BaseDataset(Dataset[T_co], metaclass=ABCMeta):
     """Base Dataset class for all OCP datasets."""
 
@@ -50,10 +65,10 @@ class BaseDataset(Dataset[T_co], metaclass=ABCMeta):
         self.paths = []
 
         if "src" in self.config:
-            if isinstance(config["src"], str):
+            if isinstance(config["src"], (str, PathLike)):
                 self.paths = [Path(self.config["src"])]
             else:
-                self.paths = tuple(Path(path) for path in sorted(config["src"]))
+                self.paths = tuple(sorted(map(Path, config["src"])))
 
     def __len__(self) -> int:
         return self.num_samples
@@ -67,31 +82,31 @@ class BaseDataset(Dataset[T_co], metaclass=ABCMeta):
 
     @cached_property
     def _metadata(self) -> dict[str, ArrayLike]:
-        # logic to read metadata file here
-        metadata_npzs = []
-        if self.config.get("metadata_path", None) is not None:
-            metadata_npzs.append(
-                np.load(self.config["metadata_path"], allow_pickle=True)
-            )
-
+        if self.config.get("metadata_path") is not None:
+            files = [Path(self.config["metadata_path"])]
         else:
-            for path in self.paths:
-                if path.is_file():
-                    metadata_file = path.parent / "metadata.npz"
-                else:
-                    metadata_file = path / "metadata.npz"
-                if metadata_file.is_file():
-                    metadata_npzs.append(np.load(metadata_file, allow_pickle=True))
+            candidates = (
+                (path.parent if path.is_file() else path) / "metadata.npz"
+                for path in self.paths
+            )
+            files = list(dict.fromkeys(path for path in candidates if path.is_file()))
 
-        if len(metadata_npzs) == 0:
+        if not files:
             logging.warning(
                 f"Could not find dataset metadata.npz files in '{self.paths}'"
             )
             return {}
 
+        parts = {}
+        for path in files:
+            with np.load(path, allow_pickle=True) as archive:
+                if not parts:
+                    parts = {field: [] for field in archive.files}
+                for field, arrays in parts.items():
+                    arrays.append(archive[field])
         metadata = {
-            field: np.concatenate([metadata[field] for metadata in metadata_npzs])
-            for field in metadata_npzs[0]
+            key: arrays[0] if len(arrays) == 1 else np.concatenate(arrays)
+            for key, arrays in parts.items()
         }
 
         assert np.issubdtype(
@@ -106,8 +121,8 @@ class BaseDataset(Dataset[T_co], metaclass=ABCMeta):
     def get_metadata(self, attr, idx):
         if attr in self._metadata:
             metadata_attr = self._metadata[attr]
-            if isinstance(idx, list):
-                return [metadata_attr[_idx] for _idx in idx]
+            if isinstance(metadata_attr, (list, tuple)) and np.ndim(idx) == 1:
+                return [metadata_attr[i] for i in idx]
             return metadata_attr[idx]
         return None
 
@@ -132,8 +147,8 @@ class Subset(Subset_, BaseDataset):
         return self.dataset._metadata
 
     def get_metadata(self, attr, idx):
-        if isinstance(idx, list):
-            return self.dataset.get_metadata(attr, [[self.indices[i] for i in idx]])
+        if np.ndim(idx) == 1 and not isinstance(idx, slice):
+            return self.dataset.get_metadata(attr, [self.indices[i] for i in idx])
         return self.dataset.get_metadata(attr, self.indices[idx])
 
 

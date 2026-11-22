@@ -461,7 +461,10 @@ def test_deploy_app_pushes_batch_config_through_user_config(monkeypatch):
         "batch_wait_timeout_s": 0.5,
         "split_oom_batch": False,
     }
-    assert "app-under-test" in batch_server._DEPLOYED_APPS
+    config.max_batch_size = 123
+    assert (
+        batch_server._DEPLOYED_APPS["app-under-test"].batch_config.max_batch_size == 256
+    )
 
 
 def test_update_batch_config_redeploys_with_only_user_config_changed(monkeypatch):
@@ -493,10 +496,15 @@ def test_update_batch_config_redeploys_with_only_user_config_changed(monkeypatch
         route_prefix="/x",
     )
 
-    batch_server.update_batch_config(
+    applied = batch_server.update_batch_config(
         "app-under-test", BatchConfig(max_batch_size=4096, batch_wait_timeout_s=0.02)
     )
 
+    applied.max_batch_size = 123
+    assert (
+        batch_server._DEPLOYED_APPS["app-under-test"].batch_config.max_batch_size
+        == 4096
+    )
     assert len(deploys) == 2
     first, second = deploys
     assert {k: v for k, v in first.items() if k != "user_config"} == {
@@ -504,6 +512,32 @@ def test_update_batch_config_redeploys_with_only_user_config_changed(monkeypatch
     }
     assert second["user_config"]["max_batch_size"] == 4096
     assert second["user_config"]["batch_wait_timeout_s"] == 0.02
+
+
+def test_deployment_config_can_be_reused_for_another_device():
+    config = batch_server.DeploymentConfig(ray_actor_options={"num_cpus": 1})
+    first = batch_server._prepare_deployment_config(config, 0, "CPU")
+    second = batch_server._prepare_deployment_config(config, 1, "CUDA")
+    assert config.ray_actor_options == {"num_cpus": 1}
+    assert first.ray_actor_options == {"num_cpus": 1, "num_gpus": 0}
+    assert second.ray_actor_options == {"num_cpus": 1, "num_gpus": 1}
+
+
+def test_model_replacement_rejects_multiplexed_app_before_upload(monkeypatch):
+    record = batch_server._DeployedApp(
+        MultiplexedBatchPredictServer, {}, (), {}, "/models", BatchConfig()
+    )
+    monkeypatch.setattr(batch_server, "_DEPLOYED_APPS", {"models": record})
+    monkeypatch.setattr(ray, "put", lambda obj: pytest.fail("uploaded invalid model"))
+    with pytest.raises(ValueError, match="multiplexed"):
+        batch_server.update_served_predict_unit("models", SimpleNamespace(device="cpu"))
+    assert batch_server._DEPLOYED_APPS["models"] is record
+
+
+def test_ray_batch_atom_count_uses_host_shape_metadata():
+    assert batch_server._batch_atom_count([]) == 0
+    requests = [SimpleNamespace(num_nodes=n) for n in (2, 17, 3)]
+    assert batch_server._batch_atom_count(requests) == 22
 
 
 def test_prepare_deployment_config_honors_explicit_num_gpus():

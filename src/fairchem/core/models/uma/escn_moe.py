@@ -18,7 +18,11 @@ from matplotlib import pyplot as plt
 
 from fairchem.core.common.registry import registry
 from fairchem.core.common.utils import conditional_grad
-from fairchem.core.models.base import HeadInterface
+from fairchem.core.models.base import (
+    HeadInterface,
+    call_output_head,
+    supports_graph_retention,
+)
 from fairchem.core.models.uma.escn_md import eSCNMDBackbone, resolve_dataset_mapping
 from fairchem.core.models.uma.nn.mole import (
     MOLE,
@@ -233,6 +237,14 @@ class eSCNMDMoeBackbone(eSCNMDBackbone, MOLEInterface):
 
     def set_MOLE_sizes(self, nsystems, batch_full, edge_index):
         if self.num_experts == 0:
+            return
+        if nsystems == 1:
+            # Every local edge belongs to this system, including padding. The
+            # count is host shape metadata even for a graph-parallel partition.
+            with torch.inference_mode(False):
+                self.global_mole_tensors.mole_sizes = torch.full(
+                    (1,), edge_index.shape[1], dtype=torch.int, device="cpu"
+                )
             return
         with (
             torch.inference_mode(False),
@@ -637,12 +649,17 @@ class DatasetSpecificMoEWrapper(_MergedDatasetHead):
             return self.merge_MOLE_model(data)
         return self
 
+    @supports_graph_retention
     @conditional_grad(torch.enable_grad())
-    def forward(self, data, emb: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    def forward(
+        self, data, emb: dict[str, torch.Tensor], *, retain_graph: bool = False
+    ) -> dict[str, torch.Tensor]:
         # Fast path for merged model - skip MOLE routing overhead
         if self.merged_on_dataset is not None:
             self.on_predict_check(data)
-            head_output = self.head(data, emb)
+            head_output = call_output_head(
+                self.head, data, emb, retain_graph=retain_graph
+            )
             full_output = {}
             for key in head_output:
                 full_output[f"{self.merged_on_dataset}_{key}"] = (
@@ -686,7 +703,7 @@ class DatasetSpecificMoEWrapper(_MergedDatasetHead):
         )
 
         # run the internal head
-        head_output = self.head(data, emb)
+        head_output = call_output_head(self.head, data, emb, retain_graph=retain_graph)
 
         return _route_head_outputs(
             head_output, data, self.dataset_names, self.wrap_property
@@ -725,10 +742,13 @@ class DatasetSpecificSingleHeadWrapper(_MergedDatasetHead):
             return self.merge_MOLE_model(data)
         return self
 
+    @supports_graph_retention
     @conditional_grad(torch.enable_grad())
-    def forward(self, data, emb: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    def forward(
+        self, data, emb: dict[str, torch.Tensor], *, retain_graph: bool = False
+    ) -> dict[str, torch.Tensor]:
         self.on_predict_check(data)
-        head_output = self.head(data, emb)
+        head_output = call_output_head(self.head, data, emb, retain_graph=retain_graph)
 
         # if merged just return the merged outputs
         # put NaN in other dataset outputs just in case

@@ -60,6 +60,26 @@ def test_current_device_and_direct_cpu_merged_accuracy(tmp_path, monkeypatch):
         assert not case_report["cpu_vs_merged"]["passed"]
 
 
+def test_validation_rejects_equally_predicting_different_checkpoints(
+    tmp_path, monkeypatch
+):
+    mock_xpu(monkeypatch)
+
+    def case(args, atoms, task, device, merged, stress, progress):
+        return {"energy": 1.0, "forces": np.zeros((len(atoms), 3))}, {
+            "finite_difference": {"passed": True},
+            "checkpoint_sha256": device.type,
+        }
+
+    monkeypatch.setattr(validate_xpu, "run_case", case)
+    output = tmp_path / "validation.json"
+    assert validate_xpu.main(["--case", "molecule", "--output", str(output)]) == 1
+    report = json.loads(output.read_text())
+    assert report["cases"]["molecule"]["cpu_vs_xpu"]["passed"]
+    assert "different checkpoint" in report["error"]["message"]
+    assert not report["passed"]
+
+
 def test_energy_only_directional_checks_cover_other_components():
     atoms = molecule("H2O")
     atoms.calc = HarmonicCalculator()

@@ -25,6 +25,7 @@ from fairchem.core.calculate.device_buffers import (
     DeviceBatchStager,
     device_scope,
 )
+from fairchem.core.common._exception_frames import clear_exception_tracebacks
 from fairchem.core.common.distutils import parse_device
 from fairchem.core.datasets.atomic_data import (
     AtomicData,
@@ -88,12 +89,18 @@ def _compatibility_key(data: AtomicData) -> tuple:
     # dataset so output splitting cannot assign an omitted property to a system.
     return (
         tuple(getattr(data, "dataset", ())),
-        frozenset(data.keys()),
-        data.pos.device,
-        data.pos.dtype,
-        tuple(_field_signature(data, name, value) for name, value in data),
-        _normalize_requested_properties(data.get("_requested_properties", None)),
+        tuple(
+            _field_signature(data, name, value)
+            for name, value in data
+            if name != "_requested_properties"
+        ),
     )
+
+
+def _edge_cost(data: AtomicData, estimate: int | None) -> int:
+    # A caller can budget extra edges for an internally generated graph, but
+    # the stored graph already consumes at least this many edges.
+    return data.num_edges if estimate is None else max(data.num_edges, int(estimate))
 
 
 def plan_microbatches(
@@ -123,11 +130,7 @@ def plan_microbatches(
         atoms = data.pos.shape[0]
         if atoms < 1:
             raise ValueError("Empty structures are not supported by UMA batching")
-        edges = (
-            int(edge_counts[index])
-            if edge_counts is not None
-            else data.edge_index.shape[1]
-        )
+        edges = _edge_cost(data, None if edge_counts is None else edge_counts[index])
         if limits.max_edges is not None and edge_counts is None and edges == 0:
             raise ValueError(
                 "Supply edge_counts when max_edges is used with an internal graph"
@@ -152,7 +155,11 @@ def plan_microbatches(
     open_bins = {}
     for index in order:
         atoms, edges = costs[index]
-        signature = _compatibility_key(structures[index])
+        data = structures[index]
+        signature = (
+            _normalize_requested_properties(data.get("_requested_properties", None)),
+            _compatibility_key(data),
+        )
         if signature not in open_bins:
             open_bins[signature] = OrderedDict(), 0, 0
         compatible, max_free_atoms, max_free_edges = open_bins[signature]
@@ -661,7 +668,7 @@ class IndependentDevicePool:
                 1,
                 sum(
                     data.num_nodes
-                    + (data.num_edges if counts is None else int(counts[index]))
+                    + _edge_cost(data, None if counts is None else counts[index])
                     for index, data in enumerate(inputs)
                 ),
             )
@@ -703,6 +710,11 @@ class IndependentDevicePool:
             def run():
                 try:
                     return self._run(worker, inputs, plan, ready_events, profile, units)
+                except BaseException as error:
+                    # Futures retain exceptions. Release completed forward frames
+                    # before admitting another job against the memory budget.
+                    clear_exception_tracebacks(error, preserve_locations=True)
+                    raise
                 finally:
                     # Make the capacity available before publishing the result.
                     release()

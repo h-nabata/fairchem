@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
+from copy import copy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -162,6 +164,8 @@ class MDRunner(PreemptableMixin, CalculateRunner):
                 Both this value and velocity_seed are required to initialize.
             remove_center_of_mass_momentum: Remove net momentum after initialization.
         """
+        if trajectory_interval <= 0 or log_interval <= 0:
+            raise ValueError("trajectory_interval and log_interval must be positive")
         self._atoms = atoms
         self.thermostat = thermostat
         self.timestep_fs = timestep_fs
@@ -181,9 +185,11 @@ class MDRunner(PreemptableMixin, CalculateRunner):
         self._start_step = 0
         self._resuming = False
         self._trajectory_state: dict | None = None
+        self._log_state: dict | None = None
+        self._log_file: Path | None = None
         self._thermostat_state_to_restore: dict | None = None
         self._elapsed_wall_time: float = 0.0
-        self._wall_t0: float = time.monotonic()
+        self._wall_t0: float | None = None
 
         super().__init__(calculator=calculator, input_data=[atoms])
 
@@ -256,39 +262,46 @@ class MDRunner(PreemptableMixin, CalculateRunner):
                 "Resuming into existing output requires a restart-aware trajectory writer"
             )
 
-        # Attach trajectory collector with global step alignment
-        # We use interval=1 and check alignment manually to handle checkpoint resume correctly
+        # ASE schedules observers against the restored global nsteps.
         def collect_frame():
-            global_step = self._dyn.get_number_of_steps()
-            self._atoms.info["md_step"] = global_step
-            if self._resuming and global_step == self._start_step:
+            step = self._dyn.get_number_of_steps()
+            if self._resuming and step == self._start_step:
                 return
-            if global_step % self.trajectory_interval == 0:
-                frame = TrajectoryFrame.from_atoms(
-                    self._atoms,
-                    step=global_step,
-                    time=self._dyn.get_time() / ase.units.fs,
-                )
-                self._trajectory_writer.append(frame)
+            frame = TrajectoryFrame.from_atoms(
+                self._atoms, step=step, time=self._dyn.get_time() / ase.units.fs
+            )
+            self._trajectory_writer.append(frame)
 
-        self._dyn.attach(collect_frame, interval=1)
-
+        self._dyn.attach(collect_frame, interval=self.trajectory_interval)
         self._wall_t0 = time.monotonic()
 
+        # Discard rows from an uncommitted tail before appending a continuation.
+        append_log = self._resuming and log_file.exists()
+        if (
+            append_log
+            and self._log_state is not None
+            and self._log_state["output"] == str(log_file.resolve())
+        ):
+            offset = self._log_state["size"]
+            with log_file.open("r+b") as file:
+                if not 0 <= offset <= os.fstat(file.fileno()).st_size:
+                    raise ValueError("Thermodynamic log is shorter than its checkpoint")
+                file.truncate(offset)
         logger = MDLogger(
             dyn=self._dyn,
             atoms=self._atoms,
             logfile=str(log_file),
-            header=True,
-            mode="a" if self._start_step > 0 else "w",
+            header=not append_log or log_file.stat().st_size == 0,
+            mode="a" if append_log else "w",
         )
+        logger.logfile.flush()
+        self._log_file = log_file
 
-        def log_with_alignment():
-            global_step = self._dyn.get_number_of_steps()
-            if global_step % self.log_interval == 0:
+        def log_step():
+            if not self._resuming or self._dyn.nsteps != self._start_step:
                 logger()
 
-        self._dyn.attach(log_with_alignment, interval=1)
+        self._dyn.attach(log_step, interval=self.log_interval)
 
         # Attach STOPFAIR checker if heartbeat_interval is configured
         if self.heartbeat_interval is not None and self.heartbeat_interval > 0:
@@ -337,6 +350,7 @@ class MDRunner(PreemptableMixin, CalculateRunner):
             raise
         finally:
             self._elapsed_wall_time += time.monotonic() - self._wall_t0
+            self._wall_t0 = None
             logger.close()
         if not stopped_by_stopfair:
             self._trajectory_writer.close()
@@ -429,11 +443,13 @@ class MDRunner(PreemptableMixin, CalculateRunner):
         if self._dyn is None or self._atoms is None:
             raise RuntimeError("Cannot checkpoint before MD dynamics are initialized")
 
-        self._atoms.info["md_step"] = self._dyn.get_number_of_steps()
-        _save_atoms(self._atoms, checkpoint_dir / "atoms.json")
+        # Snapshot bookkeeping must not change calculator inputs on the live atoms.
+        checkpoint_atoms = copy(self._atoms)
+        checkpoint_atoms.info = {**self._atoms.info, "md_step": self._dyn.nsteps}
+        _save_atoms(checkpoint_atoms, checkpoint_dir / "atoms.json")
         ase.io.write(
             str(checkpoint_dir / "checkpoint.extxyz"),
-            self._atoms,
+            checkpoint_atoms,
             format="extxyz",
             # Keep the legacy format's representable per-atom data and fixed
             # masks. Higher-rank and unsupported arrays live in atoms.json.
@@ -468,6 +484,15 @@ class MDRunner(PreemptableMixin, CalculateRunner):
             elif hasattr(self._trajectory_writer, "flush"):
                 self._trajectory_writer.flush()
 
+        log_state = None
+        if self._log_file is not None:
+            with self._log_file.open("rb") as file:
+                os.fsync(file.fileno())
+                log_state = {
+                    "output": str(self._log_file.resolve()),
+                    "size": os.fstat(file.fileno()).st_size,
+                }
+
         md_state = {
             "version": 1,
             "timestep_fs": self.timestep_fs,
@@ -485,11 +510,13 @@ class MDRunner(PreemptableMixin, CalculateRunner):
                 if hasattr(self.thermostat, key)
             },
             "trajectory": trajectory_state,
+            "thermo_log": log_state,
             "current_step": self._dyn.get_number_of_steps(),
             "total_steps": self._dyn.get_number_of_steps(),
             "target_steps": self.steps,
             "elapsed_wall_time": (
-                self._elapsed_wall_time + time.monotonic() - self._wall_t0
+                self._elapsed_wall_time
+                + (time.monotonic() - self._wall_t0 if self._wall_t0 is not None else 0)
             ),
         }
         state_path = checkpoint_dir / "md_state.json"
@@ -563,11 +590,16 @@ class MDRunner(PreemptableMixin, CalculateRunner):
         else:
             raise ValueError(f"Unsupported MD checkpoint version {version}")
         self._trajectory_state = md_state.get("trajectory")
+        self._log_state = md_state.get("thermo_log")
         self._resuming = True
         self._start_step = md_state["current_step"]
         self._elapsed_wall_time = md_state.get("elapsed_wall_time", 0.0)
 
-        if self._start_step >= self.steps:
+        # A final periodic checkpoint can precede publication of the trajectory.
+        # Reopen its immutable parts and finish publication without advancing MD.
+        if self._start_step > self.steps or (
+            self._start_step == self.steps and not self._trajectory_state
+        ):
             logging.warning(
                 f"Checkpoint step ({self._start_step}) is already at or beyond "
                 f"configured total steps ({self.steps}). Stopping immediately."

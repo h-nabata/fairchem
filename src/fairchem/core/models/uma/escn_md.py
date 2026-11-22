@@ -30,12 +30,13 @@ from fairchem.core.common.registry import registry
 from fairchem.core.common.utils import conditional_grad
 from fairchem.core.graph.compute import (
     canonicalize_external_edges,
+    edge_strain_for_stress,
     external_edge_geometry,
     filter_edges_by_node_partition,
     generate_graph,
     spatially_order_graph,
 )
-from fairchem.core.models.base import HeadInterface
+from fairchem.core.models.base import HeadInterface, supports_graph_retention
 from fairchem.core.models.uma.common.quaternion.quaternion_wigner_utils import (
     create_wigner_data_module,
 )
@@ -821,6 +822,20 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
                 "edge_distance_vec": vectors,
             }
 
+        if (
+            "stress" in data_dict.get("_resolved_requested_properties", ())
+            and not self.regress_config.direct_stress
+        ):
+            strain = edge_strain_for_stress(
+                graph_dict,
+                data_dict["pos"],
+                data_dict["cell"],
+                data_dict["batch"],
+                cell_offsets=None if self.otf_graph else data_dict["cell_offsets"],
+            )
+            if strain is not None:
+                graph_dict["edge_strain"] = strain
+
         if getattr(self, "graph_edge_order", "original") == "spatial":
             if gp_utils.initialized():
                 raise ValueError("Spatial edge ordering requires a single-device graph")
@@ -1081,6 +1096,8 @@ class eSCNMDBackbone(nn.Module, MOLEInterface):
             "node_embedding": x_message,
             "batch": data_dict["batch"],
         }
+        if "edge_strain" in graph_dict:
+            out["edge_strain"] = graph_dict["edge_strain"]
         return out
 
     @property
@@ -1286,9 +1303,14 @@ class MLP_EFS_Head(nn.Module, HeadInterface):
         self.regress_config = backbone.regress_config
         self.requested_properties = getattr(backbone, "requested_properties", None)
 
+    @supports_graph_retention
     @conditional_grad(torch.enable_grad())
     def forward(
-        self, data: AtomicData, emb: dict[str, torch.Tensor]
+        self,
+        data: AtomicData,
+        emb: dict[str, torch.Tensor],
+        *,
+        retain_graph: bool = False,
     ) -> dict[str, torch.Tensor]:
         requested = resolve_requested_properties(
             self.regress_config,
@@ -1347,12 +1369,19 @@ class MLP_EFS_Head(nn.Module, HeadInterface):
                 data["cell"],
                 batch=data["batch_full"],  # use batch_full to work with GP reduction
                 training=create_graph,
+                retain_graph=retain_graph,
+                edge_strain=emb.get("edge_strain"),
             )
             emit("stress", stress)
         elif (
             "forces" in requested or curvature
         ) and not self.regress_config.direct_forces:
-            forces = compute_forces(energy_part, data["pos"], training=create_graph)
+            forces = compute_forces(
+                energy_part,
+                data["pos"],
+                training=create_graph,
+                retain_graph=retain_graph,
+            )
         else:
             forces = None
 
@@ -1369,7 +1398,7 @@ class MLP_EFS_Head(nn.Module, HeadInterface):
                 data["pos"],
                 vector.reshape_as(data["pos"]),
                 training=self.training,
-                retain_graph=self.training or "hessian" in requested,
+                retain_graph=retain_graph or self.training or "hessian" in requested,
             )
             emit("hessian_vector_product", hvp)
         if "hessian" in requested:
@@ -1379,6 +1408,7 @@ class MLP_EFS_Head(nn.Module, HeadInterface):
                 vmap=self.regress_config.hessian_vmap,
                 training=self.training,
                 chunk_size=self.regress_config.hessian_chunk_size,
+                retain_graph=retain_graph,
             )
             emit("hessian", hessian)
 

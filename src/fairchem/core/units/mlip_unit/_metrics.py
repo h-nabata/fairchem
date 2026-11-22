@@ -14,6 +14,12 @@ from typing import TYPE_CHECKING, Callable
 import numpy as np
 import torch
 
+from fairchem.core.modules.evaluator import (
+    mean_euclidean_error as _legacy_mean_euclidean_error,
+)
+from fairchem.core.modules.evaluator import metric_from_totals as _metric_from_totals
+from fairchem.core.modules.evaluator import rmse as _rmse
+
 if TYPE_CHECKING:
     from collections.abc import Hashable
 
@@ -25,11 +31,23 @@ class Metrics:
     metric: float = 0.0
     total: float = 0.0
     numel: int = 0
+    root_mean_square: bool = False
 
     def __iadd__(self, other):
+        if (
+            self.numel
+            and other.numel
+            and self.root_mean_square != other.root_mean_square
+        ):
+            raise ValueError("Cannot combine means and squared-error totals")
+        if other.numel:
+            self.root_mean_square = other.root_mean_square
         self.total += other.total
         self.numel += other.numel
-        self.metric = self.total / self.numel
+        if self.numel:
+            self.metric = _metric_from_totals(
+                self.total, self.numel, self.root_mean_square
+            )
         return self
 
 
@@ -82,13 +100,12 @@ def mse(
     return (target[key] - prediction[key]) ** 2
 
 
-@metrics_dict
-def rmse(
-    prediction: dict[str, torch.Tensor],
-    target: dict[str, torch.Tensor],
-    key: Hashable = None,
-) -> torch.Tensor:
-    return torch.sqrt(((target[key] - prediction[key]) ** 2).sum(dim=-1))
+def rmse(prediction, target, key=NONE_SLICE) -> Metrics:
+    return Metrics(**_rmse(prediction, target, key))
+
+
+def mean_euclidean_error(prediction, target, key=NONE_SLICE) -> Metrics:
+    return Metrics(**_legacy_mean_euclidean_error(prediction, target, key))
 
 
 @metrics_dict

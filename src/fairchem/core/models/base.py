@@ -32,6 +32,19 @@ if TYPE_CHECKING:
     from fairchem.core.units.mlip_unit.mlip_unit import Task
 
 
+def supports_graph_retention(forward):
+    """Mark a head forward that accepts the optional retain_graph keyword."""
+    forward.supports_graph_retention = True
+    return forward
+
+
+def call_output_head(head, data, embeddings, *, retain_graph=False):
+    """Let conservative heads keep the backbone tape for subsequent heads."""
+    if retain_graph and getattr(head.forward, "supports_graph_retention", False):
+        return head(data, embeddings, retain_graph=True)
+    return head(data, embeddings)
+
+
 def _get_dataset_to_tasks_map(tasks: Sequence[Task]) -> dict[str, list[Task]]:
     """Create a mapping from dataset names to their associated tasks."""
     dset_to_tasks_map = defaultdict(list)
@@ -153,6 +166,33 @@ class BackboneInterface(metaclass=ABCMeta):
 
 class HydraInterfaceMixin:
     """Mixin class providing shared task management functionality for Hydra models."""
+
+    def _forward_heads(self, data, pass_through=False):
+        position = data.get("pos")
+        if self.device is None or (
+            isinstance(position, torch.Tensor) and self.device != position.device.type
+        ):
+            devices = {
+                x.device.type for x in data.values() if isinstance(x, torch.Tensor)
+            }
+            assert (
+                len(devices) == 1
+            ), f"all inputs must be on the same device, found {devices}"
+            self.device = devices.pop()
+
+        embeddings = self.backbone(data)
+        out = {}
+        last = len(self.output_heads) - 1
+        for index, (name, head) in enumerate(self.output_heads.items()):
+            with torch.autocast(device_type=self.device, enabled=head.use_amp):
+                values = call_output_head(
+                    head, data, embeddings, retain_graph=index < last
+                )
+            if pass_through:
+                out.update(values)
+            else:
+                out[name] = values
+        return out
 
     @property
     def tasks(self) -> dict[str, Task]:
@@ -418,29 +458,7 @@ class HydraModel(nn.Module, HydraInterfaceMixin):
             )
 
     def forward(self, data: AtomicData):
-        # lazily get device from input to use with amp, at least one input must be a tensor to figure out it's device
-        if not self.device:
-            device_from_tensors = {
-                x.device.type for x in data.values() if isinstance(x, torch.Tensor)
-            }
-            assert (
-                len(device_from_tensors) == 1
-            ), f"all inputs must be on the same device, found the following devices {device_from_tensors}"
-            self.device = device_from_tensors.pop()
-
-        emb = self.backbone(data)
-        # Predict all output properties for all structures in the batch for now.
-        out = {}
-        for k in self.output_heads:
-            with torch.autocast(
-                device_type=self.device, enabled=self.output_heads[k].use_amp
-            ):
-                if self.pass_through_head_outputs:
-                    out.update(self.output_heads[k](data, emb))
-                else:
-                    out[k] = self.output_heads[k](data, emb)
-
-        return out
+        return self._forward_heads(data, self.pass_through_head_outputs)
 
     def prepare_for_inference(
         self, data: AtomicData, settings: InferenceSettings
@@ -496,25 +514,7 @@ class HydraModelV2(nn.Module, HydraInterfaceMixin):
                 param.requires_grad = False
 
     def forward(self, data):
-        # lazily get device from input to use with amp, at least one input must be a tensor to figure out it's device
-        if not self.device:
-            device_from_tensors = {
-                x.device.type for x in data.values() if isinstance(x, torch.Tensor)
-            }
-            assert (
-                len(device_from_tensors) == 1
-            ), f"all inputs must be on the same device, found the following devices {device_from_tensors}"
-            self.device = device_from_tensors.pop()
-
-        emb = self.backbone(data)
-        # Predict all output properties for all structures in the batch for now.
-        out = {}
-        for k in self.output_heads:
-            with torch.autocast(
-                device_type=self.device, enabled=self.output_heads[k].use_amp
-            ):
-                out[k] = self.output_heads[k](data, emb)
-        return out
+        return self._forward_heads(data)
 
     def prepare_for_inference(
         self, data: AtomicData, settings: InferenceSettings

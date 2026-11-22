@@ -451,3 +451,50 @@ def test_undefined_molecular_stress_never_cached(request_aware):
     assert "stress" not in atoms.calc.results
     with pytest.raises(ValueError, match="finite nonzero volume"):
         atoms.get_stress()
+
+
+def test_molecular_md_predicts_once_per_geometry(tmp_path):
+    import pyarrow.parquet as pq
+
+    from fairchem.core.components.calculate import MDRunner, VelocityVerletThermostat
+
+    predictor = BufferPredictor()
+    atoms = _atoms()
+    atoms.set_cell([0, 0, 0])
+    atoms.info["sid"] = ["water"]
+    runner = MDRunner(
+        FAIRChemCalculator(predictor, "omol"),
+        VelocityVerletThermostat(),
+        atoms,
+        steps=3,
+        log_interval=1,
+        checkpoint_interval=2,
+    )
+    runner._job_config = SimpleNamespace(
+        metadata=SimpleNamespace(
+            results_dir=tmp_path, preemption_checkpoint_dir=tmp_path / "cp"
+        )
+    )
+    runner.calculate()
+    rows = pq.read_table(tmp_path / "trajectory.parquet").to_pylist()
+    assert [row["step"] for row in rows] == [0, 1, 2, 3]
+    assert all(
+        row["energy"] is not None
+        and row["forces"] is not None
+        and row["pressure"] is None
+        and row["sid"] == "water"
+        for row in rows
+    )
+    assert predictor.calls == 4
+
+
+def test_bfloat16_predictions_can_be_read_by_ase():
+    predictor = BufferPredictor()
+    forces = torch.tensor(
+        [[1.125, 0.375, -0.5], [2.0, 0.25, -1.0], [4.0, 0.0, 0.125]],
+        dtype=torch.bfloat16,
+    )
+    predictor.override["forces"] = forces
+    atoms = _atoms()
+    atoms.calc = FAIRChemCalculator(predictor, "omol")
+    np.testing.assert_array_equal(atoms.get_forces(), forces.float().numpy())

@@ -47,7 +47,7 @@ from fairchem.core.regression_suite.evaluation.performance import (
     compare_performance,
     load_performance_sidecar,
 )
-from fairchem.core.regression_suite.spec.hashing import canonical_json
+from fairchem.core.regression_suite.spec.hashing import canonical_json, file_sha256
 from fairchem.core.regression_suite.spec.profiles import (
     profile_config,
     unsupported_suites_for_profile,
@@ -372,49 +372,86 @@ def _observable_report(
     }
 
 
+def _run_sidecar(path: ArtifactPath, expected: Mapping[str, Any]) -> dict[str, Any]:
+    sidecar = load_performance_sidecar(path)
+    validate_identity(sidecar["identity"], expected, label="performance sidecar")
+    if sidecar["environment"] != expected["execution_environment"]:
+        raise RegressionSchemaError(
+            "performance sidecar environment differs from its run"
+        )
+    return sidecar
+
+
 def _performance_comparison(
     baseline_dir: ArtifactPath,
     candidate_dir: ArtifactPath,
     profile: str,
     baseline: Mapping[str, Any],
     role: str,
+    candidate_identity: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     candidate_path = (
         fragment_path(candidate_dir, "inference", profile, role).parent
         / "performance.json"
     )
-    if not candidate_path.is_file():
+    if candidate_identity is None or not candidate_path.is_file():
         return {
             "status": "NOT AVAILABLE",
-            "reason": "candidate performance sidecar not found",
+            "reason": "candidate performance sidecar or inference records not found",
         }
     baseline_suite = baseline["suites"]["inference"]
     baselines = {}
     for baseline_profile, tier in PROFILE_TIERS:
-        paths = [
-            (
-                baseline_dir / baseline_suite[collection][baseline_profile]["fragment"]
-            ).parent.parent
-            / "performance.json"
-            for collection in ("profiles", "verifications")
-        ]
-        if not all(path.is_file() for path in paths):
-            return {
-                "status": "NOT AVAILABLE",
-                "reason": (
-                    "main performance sidecars are incomplete; run a new "
-                    "baseline campaign"
-                ),
-            }
-        baselines[tier] = [load_performance_sidecar(path) for path in paths]
-    return compare_performance(load_performance_sidecar(candidate_path), baselines)
+        runs = []
+        for collection, baseline_role in (
+            ("profiles", "calibration"),
+            ("verifications", "verification"),
+        ):
+            entry = baseline_suite[collection][baseline_profile]
+            path = (baseline_dir / entry["fragment"]).parent.parent / "performance.json"
+            if not path.is_file():
+                return {
+                    "status": "NOT AVAILABLE",
+                    "reason": "main performance sidecars are incomplete; run a new baseline campaign",
+                }
+            runs.append(
+                _run_sidecar(
+                    path,
+                    {
+                        "suite": "inference",
+                        "profile": baseline_profile,
+                        "role": baseline_role,
+                        "run_id": entry["run_id"],
+                        "execution_environment": entry["execution_environment"],
+                    },
+                )
+            )
+        baselines[tier] = runs
+    # The summary adds the reference identity after the worker writes its files.
+    expected = {
+        key: value
+        for key, value in candidate_identity.items()
+        if key not in ("reference_hash", "reference_run_id")
+    }
+    return compare_performance(_run_sidecar(candidate_path, expected), baselines)
 
 
-def _energy_deviations(path: ArtifactPath) -> dict[str, np.ndarray]:
+def _pinned_run(root: ArtifactPath, entry: Mapping[str, Any]) -> ArtifactPath:
+    manifest = root / entry["fragment"]
+    if file_sha256(manifest) != entry["fragment_sha256"]:
+        raise RegressionSchemaError(
+            f"{entry['fragment']} differs from the pinned baseline"
+        )
+    return manifest.parent
+
+
+def _energy_deviations(
+    path: ArtifactPath, *, reference_hash: str | None = None
+) -> dict[str, np.ndarray]:
     """
     Return one run's NVE energy-deviation series by case.
     """
-    _manifest, records = load_reference(path)
+    _manifest, records = load_reference(path, expected_hash=reference_hash)
     return {
         record.case_id: record.values
         for record in records
@@ -452,6 +489,7 @@ FEW_CLUSTERS = 4
 
 def _short_series(
     baseline_root: ArtifactPath,
+    baseline_suite: Mapping[str, Any],
     suite: Suite,
     candidate_records: ArtifactPath | None,
     names: set[str],
@@ -462,13 +500,15 @@ def _short_series(
     candidate, as the observable compares them.
     """
     runs = {
-        "FP32": fragment_path(baseline_root, suite.name, "fp32-eager", "calibration"),
-        "TF32": fragment_path(baseline_root, suite.name, "tf32-eager", "calibration"),
+        tier: _pinned_run(baseline_root, baseline_suite["profiles"][profile])
+        for profile, tier in PROFILE_TIERS
+        if tier in ("FP32", "TF32")
     }
     if candidate_records is not None:
         runs["candidate"] = candidate_records
     _manifest, references = load_reference(
-        fragment_path(baseline_root, suite.name, "fp64-eager", "reference")
+        (baseline_root / baseline_suite["reference"]["manifest"]).parent,
+        expected_hash=baseline_suite["reference"]["reference_hash"],
     )
     reference = {
         record.key: record
@@ -501,7 +541,9 @@ def _significant(values: np.ndarray) -> list[float]:
 
 
 def _nve_gate_curves(
-    baseline_root: ArtifactPath, candidate_records: ArtifactPath | None
+    baseline_root: ArtifactPath,
+    baseline_suite: Mapping[str, Any],
+    candidate_records: ArtifactPath | None,
 ) -> dict[str, Any]:
     """
     Return each NVE system's gate curves for the FP64, FP32, and TF32
@@ -524,11 +566,12 @@ def _nve_gate_curves(
     )
 
     reference = _energy_deviations(
-        fragment_path(baseline_root, "nve-md", "fp64-eager", "reference")
+        (baseline_root / baseline_suite["reference"]["manifest"]).parent,
+        reference_hash=baseline_suite["reference"]["reference_hash"],
     )
     runs = {
         tier: _energy_deviations(
-            fragment_path(baseline_root, "nve-md", profile, "calibration")
+            _pinned_run(baseline_root, baseline_suite["profiles"][profile])
         )
         for profile, tier in PROFILE_TIERS
     }
@@ -638,6 +681,10 @@ def build_candidate_report(
         records_path = fragment_path(candidate_root, suite, profile, role)
         summary = qualification = None
         if records_path.is_dir():
+            if role == "verification":
+                records_path = _pinned_run(
+                    candidate_root, baseline_suite["verifications"][profile]
+                )
             summary = summarize_run(
                 records_path,
                 (baseline_root / baseline_suite["reference"]["manifest"]).parent,
@@ -693,6 +740,7 @@ def build_candidate_report(
         if few and suite != "nve-md":
             series = _short_series(
                 baseline_root,
+                baseline_suite,
                 definition,
                 records_path if records_path.is_dir() else None,
                 few,
@@ -701,7 +749,9 @@ def build_candidate_report(
                 observable["series"] = series.get(observable["name"])
         gate_curves = (
             _nve_gate_curves(
-                baseline_root, records_path if records_path.is_dir() else None
+                baseline_root,
+                baseline_suite,
+                records_path if records_path.is_dir() else None,
             )
             if suite == "nve-md"
             else None
@@ -790,7 +840,12 @@ def build_candidate_report(
     }
     if "inference" in selected_suites:
         report["performance"] = _performance_comparison(
-            baseline_root, candidate_root, profile, baseline, role
+            baseline_root,
+            candidate_root,
+            profile,
+            baseline,
+            role,
+            dict(candidate_runs).get("inference"),
         )
     return report
 

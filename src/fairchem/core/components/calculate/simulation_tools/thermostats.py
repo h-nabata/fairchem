@@ -217,7 +217,13 @@ class LangevinThermostat(Thermostat):
                     if mobile.all()
                     else FixSubsetCom(indices=np.flatnonzero(mobile))
                 )
-                atoms.set_constraint([*atoms.constraints, fix_com])
+                # ASE FixSubsetCom adjusts *all* trial positions by the COM
+                # correction. Apply FixAtoms afterwards to keep pins exact.
+                atoms.set_constraint(
+                    [*atoms.constraints, fix_com]
+                    if mobile.all()
+                    else [fix_com, *atoms.constraints]
+                )
             elif not mobile.all():
                 constraints = []
                 for constraint in atoms.constraints:
@@ -231,7 +237,10 @@ class LangevinThermostat(Thermostat):
                     elif isinstance(constraint, FixCom):
                         selected = FixSubsetCom(indices=np.flatnonzero(mobile))
                     constraints.append(selected)
-                atoms.set_constraint(constraints)
+                atoms.set_constraint(
+                    [c for c in constraints if isinstance(c, FixCom)]
+                    + [c for c in constraints if not isinstance(c, FixCom)]
+                )
             if atoms.get_number_of_degrees_of_freedom() <= 0:
                 raise ValueError(
                     "No unconstrained degrees of freedom remain for Langevin dynamics"

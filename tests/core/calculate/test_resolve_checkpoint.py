@@ -55,9 +55,8 @@ def test_resolve_checkpoint_registered_name_fetches_refs(tmp_path, monkeypatch):
     assert resolved.path == str(tmp_path / "uma-s-1p1.pt")
     assert resolved.atom_refs == {"H": -0.5}
     assert resolved.form_elem_refs == {"H": -1.0}
-    # The checkpoint always downloads to CACHE_DIR; only refs honor cache_dir.
-    assert downloads[0] == ("uma-s-1p1.pt", pretrained_mlip.CACHE_DIR)
-    assert all(cache_dir == "/refs/cache" for _, cache_dir in downloads[1:])
+    assert downloads[0] == ("uma-s-1p1.pt", "/refs/cache")
+    assert all(cache_dir == "/refs/cache" for _, cache_dir in downloads)
 
 
 def test_resolve_checkpoint_registry_wins_over_file(tmp_path, monkeypatch):
