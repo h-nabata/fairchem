@@ -30,7 +30,8 @@ def test_current_device_and_direct_cpu_merged_accuracy(tmp_path, monkeypatch):
     def case(args, atoms, task, device, merged, stress, progress):
         error = 0.0 if device.type == "cpu" else 0.000075 * (1 + merged)
         return {"energy": len(atoms) * error, "forces": np.zeros((len(atoms), 3))}, {
-            "finite_difference": {"passed": True}
+            "finite_difference": {"passed": True},
+            "execution": {"passed": True},
         }
 
     monkeypatch.setattr(validate_xpu, "run_case", case)
@@ -53,10 +54,8 @@ def test_current_device_and_direct_cpu_merged_accuracy(tmp_path, monkeypatch):
         report = json.loads(output.read_text())
         assert report["device"] == expected
         case_report = report["cases"]["molecule"]
-        assert (
-            case_report["cpu_vs_xpu"]["passed"]
-            and case_report["unmerged_vs_merged"]["passed"]
-        )
+        assert case_report["cpu_vs_xpu"]["passed"]
+        assert case_report["unmerged_vs_merged"]["passed"]
         assert not case_report["cpu_vs_merged"]["passed"]
 
 
@@ -68,6 +67,7 @@ def test_validation_rejects_equally_predicting_different_checkpoints(
     def case(args, atoms, task, device, merged, stress, progress):
         return {"energy": 1.0, "forces": np.zeros((len(atoms), 3))}, {
             "finite_difference": {"passed": True},
+            "execution": {"passed": True},
             "checkpoint_sha256": device.type,
         }
 
@@ -97,7 +97,8 @@ def test_energy_only_directional_checks_cover_other_components():
     result = validate_xpu.finite_difference_check(
         atoms, wrong, 1e-4, 1e-5, directions=3, scales=(1.0, 2.0)
     )
-    assert len(result["checks"]) == 6 and not result["passed"]
+    assert len(result["checks"]) == 6
+    assert not result["passed"]
     assert all(properties == ["energy"] for properties in requests)
 
 
@@ -128,7 +129,9 @@ def test_single_process_cpu_qps_without_distributed(monkeypatch):
     predictor = SimpleNamespace(device="cpu", predict=calls.append)
     monkeypatch.setattr(torch.distributed, "barrier", lambda: pytest.fail("no group"))
     qps, per_day = get_qps("system", predictor, warmups=1, timeiters=2, repeats=3)
-    assert len(calls) == 7 and qps > 0 and per_day > 0
+    assert len(calls) == 7
+    assert qps > 0
+    assert per_day > 0
 
 
 def test_bounded_md_summary_and_stream(tmp_path):
@@ -146,7 +149,8 @@ def test_bounded_md_summary_and_stream(tmp_path):
     )
     rows = [json.loads(row) for row in path.read_text().splitlines()]
     assert [row["step"] for row in rows] == list(range(22))
-    assert len(result["samples"]) <= 4 and result["quantile_sample_size"] == 4
+    assert len(result["samples"]) <= 4
+    assert result["quantile_sample_size"] == 4
     slope = np.polyfit(
         [r["time_ps"] for r in rows], [r["energy_eV_per_atom"] for r in rows], 1
     )[0]
@@ -213,7 +217,8 @@ def test_actual_model_hvp_and_geometry_variation(monkeypatch):
     assert result["hvp_finite_difference"]["passed"]
     for mode in ("subskin", "rebuild"):
         row = result["geometry_workloads"][mode]
-        assert row["physical_edges"] > 0 and row["p95_ms"] > 0
+        assert row["physical_edges"] > 0
+        assert row["p95_ms"] > 0
 
 
 def test_counted_predictor_tracks_shared_call_after_replica_serialization():

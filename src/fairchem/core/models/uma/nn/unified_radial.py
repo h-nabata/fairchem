@@ -278,6 +278,17 @@ class UnifiedRadialMLP(nn.Module):
         state["_element_cache_event"] = None
         return state
 
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        # Upstream whole-module checkpoints used one epsilon for both norms
+        # in every layer and did not store the derived element tables.
+        if not hasattr(self, "ln1_eps"):
+            self.ln1_eps = self.ln2_eps = (self.ln_eps,) * self.num_layers
+            self.hidden2_features = self.fc2_weight.shape[1]
+        self.register_buffer("_source_table", None, persistent=False)
+        self.register_buffer("_target_table", None, persistent=False)
+        self._clear_element_cache()
+
     def _clear_element_cache(self) -> None:
         self._source_table = None
         self._target_table = None

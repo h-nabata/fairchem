@@ -56,13 +56,15 @@ jobs:
             tests/core/datasets/test_sampler_metadata_audit.py \
             tests/core/calculate/test_resolve_checkpoint.py \
             tests/core/calculate/test_xpu_pretrained.py \
+            tests/core/calculate/test_ase_interop_jobs.py::test_cached_result_revalidates_charge_and_spin_types \
+            tests/core/components/test_batch_server_interop.py::test_checkpoint_update_preserves_cached_client_interface \
+            tests/core/components/test_md_runner.py \
             tests/core/graph/test_geometry.py \
-            tests/core/graph/test_periodic_topology_regressions.py::test_local_edge_strain_preserves_virial_for_mixed_translated_systems \
-            tests/core/graph/test_periodic_topology_regressions.py::test_edge_strain_keeps_small_graph_and_supports_empty_large_partition \
-            tests/core/graph/test_periodic_topology_regressions.py::test_external_stress_batch_matches_independent_virials_and_training_gradients \
-            tests/core/graph/test_periodic_topology_regressions.py::test_external_stress_reuses_image_decision_and_updates_it_each_forward \
+            tests/core/graph/test_periodic_topology_regressions.py \
             tests/core/units/mlip_unit/test_inference_runtime.py::test_conservative_predictor_is_invariant_to_large_lattice_image \
             tests/core/models/uma/test_precision_contracts.py \
+            tests/core/models/uma/nn/test_series_a_radial.py \
+            tests/core/scripts/test_validate_xpu.py::test_fp64_reference_derivative_failure_fails_validation \
             tests/core/models/uma/test_moe_routing_memory.py::test_single_system_mole_counts_local_and_padding_edges_from_shape \
             tests/core/regression_suite/test_measurement_integrity.py \
             tests/core/units/mlip_unit/test_hessian_predict.py::test_periodic_hessian_vs_numerical_cpu \
@@ -101,6 +103,9 @@ jobs:
           python -m pytest -q --junitxml=results/kernels.xml \
             'tests/core/graph/test_periodic_topology_regressions.py::test_external_stress_batch_matches_independent_virials_and_training_gradients[xpu-fp32]' \
             'tests/core/graph/test_periodic_topology_regressions.py::test_external_stress_batch_matches_independent_virials_and_training_gradients[xpu-fp64]' \
+            'tests/core/graph/test_periodic_topology_regressions.py::test_short_periodic_bond_with_large_common_origin[xpu-external]' \
+            'tests/core/graph/test_periodic_topology_regressions.py::test_short_periodic_bond_with_large_common_origin[xpu-otf]' \
+            'tests/core/graph/test_periodic_topology_regressions.py::test_short_periodic_bond_with_large_common_origin[xpu-cached]' \
             tests/core/models/uma/test_xpu_kernel_device_scope.py::test_native_xpu1_kernels_with_xpu0_current \
             tests/core/models/uma/test_xpu_radial_kernels.py::test_actual_xpu_forward_force_and_hvp \
             tests/core/models/uma/test_portable_fused_backend.py::test_xpu_csr_cache_cross_stream_reuse \
@@ -108,7 +113,7 @@ jobs:
           python - <<'PY'
           import xml.etree.ElementTree as ET
           cases = ET.parse("results/kernels.xml").findall(".//testcase")
-          assert len(cases) >= 7 and all(c.find("skipped") is None for c in cases)
+          assert len(cases) >= 10 and all(c.find("skipped") is None for c in cases)
           PY
       - name: Compare FP32, FP64, graph replay and compiled blocks with CPU
         run: |

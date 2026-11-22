@@ -652,6 +652,7 @@ def test_main_rejects_wrong_stress_even_when_cpu_and_xpu_agree(
         values = {"energy": 0.0, "forces": np.zeros((4, 3)), "stress": np.zeros(6)}
         return values, {
             "finite_difference": {"passed": True},
+            "execution": {"passed": True},
             "stress_finite_difference": {"passed": backend != failing_backend},
         }
 
@@ -697,6 +698,58 @@ def test_main_retains_failure_stage_and_completed_cpu_report(tmp_path, monkeypat
     }
     assert report["cases"]["molecule"]["cpu"]["finite_difference"]["passed"]
     assert report["error"]["message"] == "synthetic kernel failure"
+
+
+@pytest.mark.parametrize(
+    "failed_check",
+    ["finite_difference", "stress_finite_difference", "hvp_finite_difference"],
+)
+def test_fp64_reference_derivative_failure_fails_validation(
+    tmp_path, monkeypatch, failed_check
+):
+    from fairchem.core.scripts import validate_xpu
+
+    mock_xpu(monkeypatch)
+    tolerances = {}
+
+    def run(args, atoms, task, device, merged, stress, progress):
+        validate_xpu._resolve_tolerances(args)
+        tolerances[args.dtype] = args.hvp_tolerance
+        prediction = {
+            "energy": 1.0,
+            "forces": np.zeros((len(atoms), 3)),
+            "stress": np.zeros(6),
+        }
+        checks = {
+            key: {"passed": args.dtype != "float64" or key != failed_check}
+            for key in (
+                "finite_difference",
+                "stress_finite_difference",
+                "hvp_finite_difference",
+                "execution",
+            )
+        }
+        return prediction, checks
+
+    monkeypatch.setattr(validate_xpu, "run_case", run)
+    output = tmp_path / "validation.json"
+    options = [
+        "--case",
+        "periodic",
+        "--stress",
+        "--hvp",
+        "--compare-merged",
+        "--fp64-reference",
+    ]
+    assert main([*options, "--output", str(output)]) == 1
+    report = json.loads(output.read_text())
+    case = report["cases"]["periodic"]
+    assert all(row["passed"] for row in case["vs_cpu_fp64"].values())
+    assert not case["cpu_fp64"][failed_check]["passed"]
+    assert not case["passed"]
+    assert not report["passed"]
+    assert "error" not in report
+    assert tolerances == {"float32": 0.05, "float64": 1e-4}
 
 
 def test_no_xpu_fails_before_loading_model_and_writes_json(tmp_path, monkeypatch):

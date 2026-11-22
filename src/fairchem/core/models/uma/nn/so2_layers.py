@@ -196,7 +196,12 @@ class SO2_m_Conv_Block(torch.nn.Module):
             self._w_block_event = _record_cache_event(self._w_block)
             return block
         key = _tensor_cache_key(self.fc.weight)
-        if self._w_block is None or key is None or key != self._w_block_key:
+        # Upstream whole-module checkpoints can contain an unversioned block.
+        if (
+            self._w_block is None
+            or key is None
+            or key != getattr(self, "_w_block_key", None)
+        ):
             self._build_w_block()
         _wait_cache_event(self._w_block_event, self._w_block)
         return self._w_block

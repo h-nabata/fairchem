@@ -52,6 +52,7 @@ from fairchem.core.components.calculate import (
 from fairchem.core.components.calculate.simulation_tools.initialization import (
     initialize_momenta,
 )
+from fairchem.core.components.dynamics import ase_md_runner
 from fairchem.core.datasets.common_structures import get_slab_adsorbate
 
 
@@ -674,6 +675,8 @@ def test_same_directory_restarts_match_constrained_nve(tmp_path):
     atoms.set_momenta([[0.012, 0.031, 0], [-0.012, -0.026, 0]])
     atoms.set_constraint(FixBondLengths([[0, 1]]))
     atoms.new_array("labels_int32", np.array([1, 2], dtype=np.int32))
+    atoms.new_array("local_tensor", np.arange(18).reshape(2, 3, 3))
+    atoms.new_array("flags", np.array([0, 255], dtype=np.uint8))
     reference_dir = tmp_path / "reference"
     reference_dir.mkdir()
 
@@ -694,6 +697,10 @@ def test_same_directory_restarts_match_constrained_nve(tmp_path):
             runner.load_state(str(checkpoint))
             assert isinstance(runner._atoms.constraints[0], FixBondLengths)
             assert runner._atoms.arrays["labels_int32"].dtype == np.int32
+            for key in ("local_tensor", "flags"):
+                npt.assert_array_equal(
+                    runner._atoms.arrays[key], atoms.arrays[key], strict=True
+                )
         return runner, runner.calculate()
 
     reference, _ = run(reference_dir, 9)
@@ -1005,3 +1012,21 @@ def test_trajectory_buffer_owns_native_arrays_and_nullable_vectors(tmp_path):
     assert first["forces"] is None
     assert second["forces"] == [[1.0, 1.0, 1.0]]
     assert empty["positions"] == []
+
+
+@pytest.mark.parametrize("device", [None, "xpu:1"])
+def test_langevin_uma_runner_device_and_friction(cu_atoms, monkeypatch, device):
+    from unittest.mock import Mock
+
+    load = Mock(return_value=object())
+    monkeypatch.setattr(ase_md_runner.pretrained_mlip, "get_predict_unit", load)
+    monkeypatch.setattr(ase_md_runner, "FAIRChemCalculator", lambda *a, **kw: EMT())
+    dynamics = Mock(wraps=ase_md_runner.Langevin)
+    monkeypatch.setattr(ase_md_runner, "Langevin", dynamics)
+    runner = ase_md_runner.ASELangevinUMARunner(
+        [cu_atoms], device=device, friction_ps_inv=3, steps_total=1, warmup_steps=1
+    )
+    assert len(runner.run()) == 1
+    assert load.call_args.kwargs["device"] == device
+    assert load.call_args.kwargs["workers"] == 1
+    assert dynamics.call_args.kwargs["friction"] == pytest.approx(3 / (1000 * units.fs))

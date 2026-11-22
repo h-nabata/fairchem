@@ -253,14 +253,17 @@ class InferenceBatcher:
         update rather than being served a mix of old and new weights.
 
         Client metadata must remain compatible. For a different property
-        schema, inference configuration, or reference energies, create a new
-        deployment and calculators. Recreate existing ASE calculators after
-        any checkpoint update to discard their cached energies and forces.
+        schema, client graph configuration, inference settings, or reference
+        energies, create a new deployment and calculators. Recreate existing ASE
+        calculators after any checkpoint update to discard cached results.
 
         Args:
             new_predict_unit: A new MLIPPredictUnit instance with the updated checkpoint
         """
-        from fairchem.core.calculate.ase_calculator import _metadata_equal
+        from fairchem.core.calculate.ase_calculator import (
+            _metadata_equal,
+            _predictor_graph_options,
+        )
 
         def client_metadata(predictor):
             return {
@@ -269,6 +272,7 @@ class InferenceBatcher:
                     for dataset, tasks in predictor.dataset_to_tasks.items()
                 },
                 "settings": asdict(predictor.inference_settings),
+                "client_graph": _predictor_graph_options(predictor),
                 "atom_refs": predictor.atom_refs,
                 "form_elem_refs": predictor.form_elem_refs,
             }
@@ -281,7 +285,8 @@ class InferenceBatcher:
             ):
                 raise ValueError(
                     "Checkpoint update changes cached client metadata (tasks, inference "
-                    "settings, or references). Create a new InferenceBatcher and calculators."
+                    "settings, graph construction, or references). Create a new "
+                    "InferenceBatcher and calculators."
                 )
             update_served_predict_unit(self.deployment_name, new_predict_unit)
             self.predict_unit = new_predict_unit

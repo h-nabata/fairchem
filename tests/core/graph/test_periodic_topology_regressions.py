@@ -275,12 +275,20 @@ def test_exact_external_images_batch_with_ordinary_offsets():
 
 @pytest.mark.parametrize("offset_dtype", [torch.float32, torch.long])
 @pytest.mark.parametrize("compiled", [False, True])
-@pytest.mark.parametrize("period,image", [(3.0, -33333334), (33333334.0, -3)])
+@pytest.mark.parametrize(
+    "period,image,endpoint,distance",
+    [
+        (3.0, -33333334, 1e8, -2.25),
+        (33333334.0, -3, 1e8, -2.25),
+        (1.0, -(2**53), 2**53, -0.25),
+    ],
+)
 def test_external_wide_shift_preserves_local_energy_derivatives(
-    offset_dtype, compiled, period, image
+    offset_dtype, compiled, period, image, endpoint, distance
 ):
-    # The image ID itself fits in FP32, but its product by 3 does not.
-    pos = torch.tensor([[1e8, 0, 0], [0.25, 0, 0]], requires_grad=True)
+    # Even when the image ID fits FP32, its Cartesian shift may not. With a
+    # distant enough endpoint, even an FP64 subtraction first can lose 0.25 Å.
+    pos = torch.tensor([[endpoint, 0.0, 0.0], [0.25, 0, 0]], requires_grad=True)
     cell = torch.diag(torch.tensor([period, 6, 6])).unsqueeze(0).requires_grad_()
     edges = torch.tensor([[0], [1]])
     cells = torch.tensor([[image, 0, 0]], dtype=offset_dtype)
@@ -288,12 +296,14 @@ def test_external_wide_shift_preserves_local_energy_derivatives(
     if compiled:
         evaluate = torch.compile(evaluate, backend="eager", fullgraph=True)
     vec, _ = evaluate(pos, edges, cell, cells, torch.tensor([1]))
-    torch.testing.assert_close(vec, pos.new_tensor([[-2.25, 0, 0]]))
+    torch.testing.assert_close(vec, pos.new_tensor([[distance, 0, 0]]))
     forces, stress = torch.autograd.grad(
         vec.square().sum(), (pos, cell), create_graph=True
     )
-    torch.testing.assert_close(forces[:, 0], pos.new_tensor([-4.5, 4.5]))
-    torch.testing.assert_close(stress[0, 0, 0], pos.new_tensor(-4.5 * image))
+    torch.testing.assert_close(
+        forces[:, 0], pos.new_tensor([2 * distance, -2 * distance])
+    )
+    torch.testing.assert_close(stress[0, 0, 0], pos.new_tensor(2 * distance * image))
     torch.testing.assert_close(
         torch.autograd.grad(forces[0, 0], pos)[0][:, 0], pos.new_tensor([2, -2])
     )
@@ -447,6 +457,65 @@ def test_local_edge_strain_preserves_virial_for_mixed_translated_systems(mode):
         )
     if cache is not None:
         assert cache.hits == 1
+
+
+@pytest.mark.parametrize("mode", ["external", "otf", "cached"])
+@pytest.mark.parametrize("device", ["cpu", "xpu"])
+def test_short_periodic_bond_with_large_common_origin(mode, device):
+    if device == "xpu" and not torch.xpu.is_available():
+        pytest.skip("Requires a real Intel XPU")
+    edges = torch.tensor([[0, 1], [1, 0]], device=device)
+    shifts = torch.tensor([[1, 0, 0], [-1, 0, 0]], device=device)
+    data = SimpleNamespace(
+        natoms=torch.tensor([2], device=device),
+        batch=torch.zeros(2, dtype=torch.long, device=device),
+        cell=torch.diag(torch.tensor([256.5, 5.0, 5.0], device=device))[
+            None
+        ].requires_grad_(),
+        pbc=torch.tensor([[True, False, False]], device=device),
+    )
+    cache = VerletNeighborCache(0.3) if mode == "cached" else None
+    # FP32 can represent both endpoints and the 256.5 Å cell exactly. Applying
+    # that shift to an unwrapped endpoint first would erase the 0.5 Å residual.
+    for origin in (0, 2**25):
+        data.pos = torch.tensor(
+            [[origin, 0.0, 0.0], [origin + 256, 0.0, 0.0]],
+            device=device,
+            requires_grad=True,
+        )
+        if mode == "external":
+            vectors, _ = external_edge_geometry(
+                data.pos, edges, data.cell, shifts, data.natoms
+            )
+            graph = {"edge_index": edges, "edge_distance_vec": vectors}
+        else:
+            graph = generate_graph(
+                data, 1.0, 8, False, 2, data.pbc, neighbor_cache=cache
+            )
+            if cache is not None:
+                graph = generate_graph(
+                    data, 1.0, 8, False, 2, data.pbc, neighbor_cache=cache
+                )
+        strain = edge_strain_for_stress(
+            graph, data.pos, data.cell, data.batch, selective=True
+        )
+        vectors = graph["edge_distance_vec"]
+        torch.testing.assert_close(
+            vectors[:, 0].sort().values, data.pos.new_tensor([-0.5, 0.5])
+        )
+        forces, stress = compute_forces_and_stress(
+            vectors.square().sum() / 2,
+            data.pos,
+            data.cell,
+            data.batch,
+            edge_strain=strain,
+        )
+        torch.testing.assert_close(forces[:, 0], data.pos.new_tensor([-1, 1]))
+        torch.testing.assert_close(stress[0, 0], stress.new_tensor(0.5 / (256.5 * 25)))
+        (hrow,) = torch.autograd.grad(-forces[0, 0], data.pos)
+        torch.testing.assert_close(hrow[:, 0], data.pos.new_tensor([2, -2]))
+    if cache is not None:
+        assert cache.hits == 2
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64], ids=["fp32", "fp64"])
@@ -636,3 +705,59 @@ def test_external_stress_reuses_image_decision_and_updates_it_each_forward(monke
             atol=0,
         )
     assert wide_inputs == [False, False, True, False]
+
+
+def test_compiled_external_stress_survives_periodic_image_change():
+    backbone = SimpleNamespace(
+        otf_graph=False, regress_config=SimpleNamespace(direct_stress=False)
+    )
+    batch = torch.tensor([0, 0, 1, 1])
+    edges = torch.tensor([[1, 0, 3, 2], [0, 1, 2, 3]])
+    counts = torch.tensor([2, 2])
+
+    def build(pos, cell, images):
+        return eSCNMDBackbone._generate_graph(
+            backbone,
+            {
+                "pos": pos,
+                "cell": cell,
+                "batch": batch,
+                "edge_index": edges,
+                "cell_offsets": images,
+                "nedges": counts,
+                "_resolved_requested_properties": {"stress"},
+            },
+        )
+
+    def derivatives(graph, pos, cell):
+        energy = graph["edge_distance"].pow(4).sum() / 2
+        return compute_forces_and_stress(
+            energy,
+            pos,
+            cell,
+            batch,
+            training=False,
+            edge_strain=graph.get("edge_strain"),
+        )
+
+    # AOT Autograd wraps captured tensors in a shared backward function. A
+    # tracing-only eager backend would miss a lost radial virial gradient.
+    compiled = torch.compile(build, backend="aot_eager")
+    for x, shift in ((1.0, 0), (1e8, -33333333)):
+        pos = torch.tensor(
+            [
+                [2.75, 0.125, 0.25],
+                [0.5, 0.5, 0.75],
+                [0.25, 0.125, 0.25],
+                [x, 0.5, 0.75],
+            ],
+            requires_grad=True,
+        )
+        cell = torch.diag(pos.new_tensor([3, 4, 6])).repeat(2, 1, 1).requires_grad_()
+        images = torch.zeros(4, 3, dtype=torch.long)
+        images[:, 0] = images.new_tensor([1, -1, shift, -shift])
+
+        expected = derivatives(build(pos, cell, images), pos, cell)
+        actual = derivatives(compiled(pos, cell, images), pos, cell)
+        for result, reference in zip(actual, expected, strict=True):
+            torch.testing.assert_close(result, reference)

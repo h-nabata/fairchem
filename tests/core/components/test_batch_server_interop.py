@@ -499,13 +499,14 @@ def test_batcher_setup_failure_releases_executor_without_mutating_caller(monkeyp
     executor.shutdown.assert_called_once_with(wait=False)
 
 
-@pytest.mark.parametrize("change", ["tasks", "dtype", "references", None])
+@pytest.mark.parametrize("change", ["tasks", "dtype", "references", "cutoff", None])
 def test_checkpoint_update_preserves_cached_client_interface(monkeypatch, change):
     def predictor():
         return SimpleNamespace(
             dataset_to_tasks={
                 "omol": [SimpleNamespace(property="energy", level="system")]
             },
+            graph_settings={"otf_graph": False, "cutoff": 4.0},
             inference_settings=InferenceSettings(),
             atom_refs={"omol": torch.tensor([1.0, 2.0])},
             form_elem_refs={"omol": {"H": 1.0}},
@@ -524,6 +525,8 @@ def test_checkpoint_update_preserves_cached_client_interface(monkeypatch, change
         new.inference_settings.base_precision_dtype = "float64"
     elif change == "references":
         new.form_elem_refs["omol"]["H"] = 2.0
+    elif change == "cutoff":
+        new.graph_settings["cutoff"] = 6.0
     if change is None:
         batcher.update_checkpoint(new)
         update.assert_called_once_with("test", new)

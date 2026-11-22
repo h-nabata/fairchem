@@ -883,6 +883,14 @@ def main(argv=None):
     Return nonzero on absent XPU, exceptions, nonfinite outputs or failed checks.
     """
     args = build_parser().parse_args(argv)
+    # Resolve defaults independently for each precision, preserving explicit
+    # tolerances and finite-difference step sizes supplied on the command line.
+    fp64_args = None
+    if args.fp64_reference and args.dtype == "float32":
+        fp64_args = copy.copy(args)
+        fp64_args.dtype = "float64"
+        fp64_args.geometry_workloads = ()
+        _resolve_tolerances(fp64_args)
     _resolve_tolerances(args)
     report = {
         "passed": False,
@@ -1027,18 +1035,7 @@ def main(argv=None):
             case["cpu_vs_xpu"] = compare_predictions(
                 reference, candidate, len(atoms), tolerances
             )
-            case["passed"] = all(
-                (
-                    case["cpu_vs_xpu"]["passed"],
-                    case["cpu"]["finite_difference"]["passed"],
-                    case["xpu_unmerged"]["finite_difference"]["passed"],
-                )
-            )
-            if stress:
-                case["passed"] &= (
-                    case["cpu"]["stress_finite_difference"]["passed"]
-                    and case["xpu_unmerged"]["stress_finite_difference"]["passed"]
-                )
+            case["passed"] = case["cpu_vs_xpu"]["passed"]
             if args.compare_merged:
                 merged, case["xpu_merged"] = run_case(
                     args, atoms, task, device, True, stress, progress
@@ -1053,22 +1050,8 @@ def main(argv=None):
                 case["passed"] &= (
                     case["cpu_vs_merged"]["passed"]
                     and case["unmerged_vs_merged"]["passed"]
-                    and case["xpu_merged"]["finite_difference"]["passed"]
                 )
-                if stress:
-                    case["passed"] &= case["xpu_merged"]["stress_finite_difference"][
-                        "passed"
-                    ]
-            for key in ("cpu", "xpu_unmerged", "xpu_merged"):
-                for check in ("execution", "hvp_finite_difference"):
-                    if check in case.get(key, {}):
-                        case["passed"] &= case[key][check]["passed"]
-            if args.fp64_reference and args.dtype == "float32":
-                fp64_args = copy.copy(args)
-                fp64_args.dtype = "float64"
-                fp64_args.fd_step = fp64_args.fd_tolerance = None
-                fp64_args.stress_fd_step = fp64_args.stress_fd_tolerance = None
-                fp64_args.geometry_workloads = ()
+            if fp64_args is not None:
                 reference64, case["cpu_fp64"] = run_case(
                     fp64_args, atoms, task, torch.device("cpu"), False, stress, progress
                 )
@@ -1100,8 +1083,16 @@ def main(argv=None):
                         )
                         measured["cpu_comparison"] = parity
                         case["passed"] &= parity["passed"]
+            checks = ["finite_difference", "execution"]
+            if stress:
+                checks.append("stress_finite_difference")
+            if args.hvp:
+                checks.append("hvp_finite_difference")
             for mode in ("cpu", "xpu_unmerged", "xpu_merged", "cpu_fp64"):
-                digest = case.get(mode, {}).get("checkpoint_sha256")
+                if mode not in case:
+                    continue
+                case["passed"] &= all(case[mode][check]["passed"] for check in checks)
+                digest = case[mode].get("checkpoint_sha256")
                 if (
                     digest is not None
                     and report.setdefault("checkpoint_sha256", digest) != digest

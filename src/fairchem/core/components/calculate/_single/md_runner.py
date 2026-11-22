@@ -68,6 +68,18 @@ _TRIATOMIC_ARRAYS = (
 )
 
 
+def _write_extxyz(atoms: Atoms, path: Path, write_results: bool) -> None:
+    # ExtXYZ supports one- or two-dimensional arrays of a limited set of
+    # scalar types. The checkpoint JSON retains the complete atom state.
+    view = copy(atoms)
+    view.arrays = {
+        key: array
+        for key, array in atoms.arrays.items()
+        if key != "move_mask" and array.ndim <= 2 and array.dtype.kind in "fiOSUb"
+    }
+    ase.io.write(path, view, format="extxyz", write_results=write_results)
+
+
 def _save_atoms(atoms: Atoms, path: Path) -> None:
     state = atoms.todict()
     constraints = []
@@ -235,7 +247,7 @@ class MDRunner(PreemptableMixin, CalculateRunner):
         # Save the initial atoms before MD begins.
         init_atoms_file = results_dir / "init_atoms.extxyz"
         if not init_atoms_file.exists():
-            ase.io.write(str(init_atoms_file), self._atoms, format="extxyz")
+            _write_extxyz(self._atoms, init_atoms_file, write_results=True)
 
         trajectory_file = results_dir / "trajectory.parquet"
         log_file = results_dir / "thermo.log"
@@ -447,29 +459,8 @@ class MDRunner(PreemptableMixin, CalculateRunner):
         checkpoint_atoms = copy(self._atoms)
         checkpoint_atoms.info = {**self._atoms.info, "md_step": self._dyn.nsteps}
         _save_atoms(checkpoint_atoms, checkpoint_dir / "atoms.json")
-        ase.io.write(
-            str(checkpoint_dir / "checkpoint.extxyz"),
-            checkpoint_atoms,
-            format="extxyz",
-            # Keep the legacy format's representable per-atom data and fixed
-            # masks. Higher-rank and unsupported arrays live in atoms.json.
-            columns=["symbols", "positions", "move_mask"]
-            + [
-                key
-                for key, array in self._atoms.arrays.items()
-                if key
-                not in {
-                    "numbers",
-                    "symbols",
-                    "positions",
-                    "move_mask",
-                    "species",
-                    "pos",
-                }
-                and array.ndim <= 2
-                and array.dtype.kind in "dfiOSUb"
-            ],
-            write_results=False,
+        _write_extxyz(
+            checkpoint_atoms, checkpoint_dir / "checkpoint.extxyz", write_results=False
         )
 
         thermostat_state = self.thermostat.save_state(self._dyn)

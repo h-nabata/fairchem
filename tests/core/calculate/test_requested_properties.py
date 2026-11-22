@@ -49,6 +49,7 @@ class RecordingPredictor:
 def test_ase_requests_only_needed_derivatives_and_retains_valid_results():
     predictor = RecordingPredictor()
     atoms = molecule("H2O")
+    atoms.set_cell([8.0] * 3)
     atoms.calc = FAIRChemCalculator(predictor, task_name="omol")
     energy = atoms.get_potential_energy()
     assert predictor.requests == [("energy",)]
@@ -72,6 +73,7 @@ def test_ase_legacy_predictor_signature_remains_supported():
     predict = predictor.predict
     predictor.predict = lambda data: predict(data)
     atoms = molecule("H2O")
+    atoms.set_cell([8.0] * 3)
     atoms.calc = FAIRChemCalculator(predictor, task_name="omol")
     atoms.get_forces()
     atoms.get_stress()
