@@ -421,7 +421,8 @@ def test_invalid_graph_replacement_is_atomic():
     data.update_batch_edges(edges, offsets, torch.tensor([2]))
     with pytest.raises(ValueError):
         data.update_batch_edges(edges + 1, offsets, torch.tensor([2]))
-    assert data.edge_index is edges and data.cell_offsets is offsets
+    assert data.edge_index is edges
+    assert data.cell_offsets is offsets
     assert data.nedges.tolist() == [2]
 
 
@@ -451,3 +452,37 @@ def test_ase_isotope_bits_and_implicit_masses_survive_model_dtype_changes():
         for restored, original in zip(data.to_ase(), (natural, heavy), strict=True):
             assert restored.has("masses") == original.has("masses")
             np.testing.assert_array_equal(restored.get_masses(), original.get_masses())
+
+
+def test_singleton_batch_roundtrip_preserves_scalar_and_object_fields():
+    source = _data()
+    source.extra = torch.tensor(1.5)
+    source.info = {"labels": ["old"]}
+    source.label = "one"
+    for _ in range(2):
+        batch = atomicdata_list_to_batch([source])
+        result = batch.get_example(0)
+        assert result.extra.shape == ()
+        assert result.label == "one"
+        assert result.info == {"labels": ["old"]}
+        result.info["labels"].append("new")
+        assert batch.info == [{"labels": ["old"]}]
+        result.info["labels"].pop()
+        source = result
+
+
+def test_failed_field_conversion_keeps_original_tensors():
+    data = _data()
+    original = {key: value for key, value in data if torch.is_tensor(value)}
+    calls = 0
+
+    def fail(tensor):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("conversion failed")
+        return tensor.clone()
+
+    with pytest.raises(RuntimeError, match="conversion failed"):
+        data.apply(fail)
+    assert all(data[key] is value for key, value in original.items())

@@ -7,6 +7,7 @@ LICENSE file in the root directory of this source tree.
 
 from __future__ import annotations
 
+import math
 from functools import wraps
 from typing import TYPE_CHECKING, Callable, ClassVar
 
@@ -114,16 +115,26 @@ class Evaluator:
                 "numel": 0,
             }
 
+        previous = metrics[key]
         if isinstance(stat, dict):
-            # If dictionary, we expect it to have `metric`, `total`, `numel`.
-            metrics[key]["total"] += stat["total"]
-            metrics[key]["numel"] += stat["numel"]
-            metrics[key]["metric"] = metrics[key]["total"] / metrics[key]["numel"]
+            root = stat.get("root_mean_square", False)
+            if previous["numel"] and root != previous.get("root_mean_square", False):
+                raise ValueError(
+                    "Incompatible metric totals; start a new accumulator for RMSE"
+                )
+            if root:
+                previous["root_mean_square"] = True
+            previous["total"] += stat["total"]
+            previous["numel"] += stat["numel"]
+            previous["metric"] = metric_from_totals(
+                previous["total"], previous["numel"], root
+            )
         elif isinstance(stat, (float, int)):
-            # If float or int, just add to the total and increment numel by 1.
-            metrics[key]["total"] += stat
-            metrics[key]["numel"] += 1
-            metrics[key]["metric"] = metrics[key]["total"] / metrics[key]["numel"]
+            if previous.get("root_mean_square", False):
+                raise ValueError("RMSE updates require squared-error totals and counts")
+            previous["total"] += stat
+            previous["numel"] += 1
+            previous["metric"] = previous["total"] / previous["numel"]
         elif torch.is_tensor(stat):
             raise NotImplementedError
 
@@ -369,14 +380,41 @@ def min_diff(
     return np.matmul(fractional, cell)
 
 
+def metric_from_totals(total, numel, root_mean_square=False):
+    """Finalize pooled component statistics after all observations are counted."""
+    if not numel:
+        return float("nan")
+    mean = total / numel
+    return math.sqrt(mean) if root_mean_square else mean
+
+
 def rmse(
     prediction: dict[str, torch.Tensor],
     target: dict[str, torch.Tensor],
-    key: Hashable = None,
+    key: Hashable = NONE_SLICE,
 ) -> dict[str, float | int]:
-    error = torch.sqrt(((target[key] - prediction[key]) ** 2).sum(dim=-1))
+    """Root of the mean squared component error, including across batches."""
+    pred, label = prediction[key], target[key]
+    # Avoid overflow in the input dtype when accumulating BF16/FP16 residuals.
+    dtype = torch.promote_types(
+        torch.promote_types(pred.dtype, label.dtype), torch.float32
+    )
+    residual = pred.to(dtype) - label.to(dtype)
+    total = residual.square().sum().item()
+    count = residual.numel()
     return {
-        "metric": torch.mean(error).item(),
-        "total": torch.sum(error).item(),
-        "numel": error.numel(),
+        "metric": metric_from_totals(total, count, True),
+        "total": total,
+        "numel": count,
+        "root_mean_square": True,
     }
+
+
+@metrics_dict
+def mean_euclidean_error(
+    prediction: dict[str, torch.Tensor],
+    target: dict[str, torch.Tensor],
+    key: Hashable = NONE_SLICE,
+) -> torch.Tensor:
+    """Mean final-axis Euclidean norm (historically reported as rmse)."""
+    return torch.sqrt(((target[key] - prediction[key]) ** 2).sum(dim=-1))

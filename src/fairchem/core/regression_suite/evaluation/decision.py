@@ -30,6 +30,10 @@ def _channel_ratios(
     statistics: Sequence[str],
 ) -> dict[str, float]:
     statistics_key, value_key = CHANNEL_FIELDS[channel]
+    if not statistics or any(
+        not math.isfinite(limits[name]) or limits[name] <= 0 for name in statistics
+    ):
+        raise RegressionSchemaError("decision limits must be finite and positive")
     if smoke:
         # A few smoke clusters are each held to the loosest statistic's limit.
         values = (
@@ -41,11 +45,13 @@ def _channel_ratios(
             default=math.inf,
         )
         return {"maximum_cluster_mean": observed / limits[statistics[-1]]}
-    return {
-        statistic: float(candidate[statistics_key][statistic])
-        / float(limits[statistic])
-        for statistic in statistics
-    }
+    ratios = {}
+    for statistic in statistics:
+        observed = float(candidate[statistics_key][statistic])
+        ratios[statistic] = (
+            observed / limits[statistic] if math.isfinite(observed) else math.inf
+        )
+    return ratios
 
 
 def _observable_result(
@@ -151,6 +157,8 @@ def qualify_suite(
         for name, result in observable_results.items()
         if not result["report_only"]
     }
+    if not decisions:
+        raise RegressionSchemaError("qualification requires a decision observable")
     tier_pass = {
         tier: all(result["tier_pass"][tier] for result in decisions.values())
         for tier in PRECISION_TIERS

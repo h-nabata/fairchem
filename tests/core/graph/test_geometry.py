@@ -17,6 +17,7 @@ from fairchem.core.datasets.collaters.simple_collater import data_list_collater
 from fairchem.core.graph.geometry import (
     compute_minkowski_op,
     minimum_image_displacement,
+    wrap_positions,
     wrap_positions_torch,
 )
 
@@ -242,3 +243,30 @@ def test_collated_batch_matches_general_find_mic():
         batch.batch,
         minkowski_op=batch.minkowski_op.double(),
     )
+
+
+@pytest.mark.parametrize("rotated", [False, True])
+def test_large_fp32_periodic_displacements_match_wide_input(rotated):
+    # Rotate the wire onto y to also exercise a non-diagonal basis.
+    basis = torch.diag(torch.tensor([3.0, 6.0, 7.0]))
+    pos = torch.tensor([[1e8, 0.25, 1.0], [0.25, 1.0, 2.0]])
+    if rotated:
+        basis = basis.roll(1, dims=-1)
+        pos = pos.roll(1, dims=-1)
+    pos.requires_grad_()
+    basis.requires_grad_()
+    flags = torch.tensor([[True, False, False]])
+    for op in (
+        lambda x, c: wrap_positions(x, c, flags[0]),
+        lambda x, c: wrap_positions_torch(
+            x, c.expand(len(x), -1, -1), flags.expand(len(x), -1)
+        ),
+        lambda x, c: minimum_image_displacement(x, c, flags),
+    ):
+        got = op(pos, basis)
+        ref = op(pos.double(), basis.double())
+        torch.testing.assert_close(got, ref.float())
+        got_grads = torch.autograd.grad(got.square().sum(), (pos, basis))
+        ref_grads = torch.autograd.grad(ref.square().sum(), (pos, basis))
+        for actual, expected in zip(got_grads, ref_grads, strict=True):
+            torch.testing.assert_close(actual, expected)

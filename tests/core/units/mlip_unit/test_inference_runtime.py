@@ -19,6 +19,7 @@ from ase import Atoms
 from torch.utils import _pytree
 
 from fairchem.core.datasets.atomic_data import AtomicData, atomicdata_list_to_batch
+from fairchem.core.modules.normalization.element_references import ElementReferences
 from fairchem.core.modules.normalization.normalizer import Normalizer
 from fairchem.core.units.mlip_unit.api.inference import InferenceSettings
 from fairchem.core.units.mlip_unit.inference_runtime import (
@@ -478,6 +479,14 @@ def test_single_atom_lookup_filters_requests_and_rejects_unavailable_outputs():
     result = predictor.predict(data, requested_properties=("energy",))
     assert set(result) == {"energy"}
     torch.testing.assert_close(result["energy"], torch.tensor([1.5]))
+    # The lookup contains absolute energies, while the checkpoint also has a
+    # fitted elemental reference. Per-call selection must honor both conventions.
+    tasks[0].element_references = ElementReferences(torch.tensor([0.0, 1.25]))
+    relative = predictor.predict(data, undo_element_references=False)
+    torch.testing.assert_close(relative["energy"], torch.tensor([0.25]))
+    torch.testing.assert_close(relative["forces"], torch.zeros(1, 3))
+    again = predictor.predict(data, requested_properties=("energy",))
+    torch.testing.assert_close(again["energy"], result["energy"])
     with pytest.raises(ValueError, match="lookup cannot provide"):
         predictor.predict(data, requested_properties=("embeddings",))
 

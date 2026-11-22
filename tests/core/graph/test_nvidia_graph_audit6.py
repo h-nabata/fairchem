@@ -294,3 +294,31 @@ def test_cuda_capping_accepts_host_structure_counts():
     )
     assert _tuples(torch.stack((source, target)), offsets) == _tuples(*expected[:2])
     assert data.natoms.device.type == "cpu"
+
+
+@pytest.mark.parametrize("real_backend", [False, True])
+def test_large_images_in_mixed_molecular_crystal_batch(real_backend, request):
+    if real_backend:
+        if not nvidia.nvalchemiops_installed():
+            pytest.skip("nvalchemiops is not installed")
+    else:
+        request.getfixturevalue("native_double")
+    data = _data(
+        [[0.25, 0, 0], [1e8, 0, 0], [-1, 0, 0], [-0.5, 0, 0]], dtype=torch.float32
+    )
+    data.cell = torch.stack(
+        [torch.diag(data.pos.new_tensor([3, 6, 6])), data.pos.new_zeros((3, 3))]
+    )
+    data.pbc = torch.tensor([[True, False, False], [False, False, False]])
+    data.natoms = torch.tensor([2, 2])
+    data.batch = torch.tensor([0, 0, 1, 1])
+    target, source, shifts, d2 = _search(data, cutoff=1.1, return_distances_sq=True)
+    assert _tuples(torch.stack([source, target]), shifts) == [
+        (0, 1, 33333333, 0, 0),
+        (1, 0, -33333333, 0, 0),
+        (2, 3, 0, 0, 0),
+        (3, 2, 0, 0, 0),
+    ]
+    torch.testing.assert_close(
+        d2.sort().values, data.pos.new_tensor([0.25, 0.25, 0.5625, 0.5625])
+    )

@@ -7,6 +7,8 @@ LICENSE file in the root directory of this source tree.
 
 from __future__ import annotations
 
+import copy
+
 import torch
 
 from fairchem.core.datasets.atomic_data import AtomicData, atomicdata_list_to_batch
@@ -56,21 +58,14 @@ class MTCollater:
         return datasets_task_map
 
     def _add_missing_attr(self, data_list, dataset_task_map):
-        """
-        add missing data object attributes as inf
-        """
-        # find all tasks in a given batch
-        # and collect all necessary info
-        datasets_in_batch_to_task_configs = {}
-        tasks_to_report_on = []
-
-        # Dataset adapters may assign a scalar name after AtomicData
-        # construction. Canonicalize each owned sample at the collation boundary.
-        data_list = [data.clone() for data in data_list]
-        for data in data_list:
-            labels = [data.dataset] if isinstance(data.dataset, str) else data.dataset
+        """Fill missing task labels on temporary owners before collation."""
+        prepared = []
+        for source in data_list:
+            labels = (
+                [source.dataset] if isinstance(source.dataset, str) else source.dataset
+            )
             if (
-                data.num_graphs != 1
+                source.num_graphs != 1
                 or not isinstance(labels, (list, tuple))
                 or len(labels) != 1
                 or not isinstance(labels[0], str)
@@ -79,59 +74,25 @@ class MTCollater:
                     "Each training sample must have one system and one dataset name"
                 )
             name = labels[0]
+            provided = dataset_task_map[name]
+            # Collation copies tensors and metadata. Only the attribute table
+            # needs separate ownership while adding fields to this sample.
+            data = copy.copy(source)
+            data.__keys__ = source.__keys__.copy()
             data.dataset = [name]
-            if name not in datasets_in_batch_to_task_configs:
-                datasets_in_batch_to_task_configs[name] = dataset_task_map[name]
-                for task, task_config in datasets_in_batch_to_task_configs[
-                    name
-                ].items():
-                    # if this is the first time we have seen this kind of dataset
-                    # record its out spec
-                    if "out_spec" not in datasets_in_batch_to_task_configs[name][task]:
-                        if task_config["level"] == "system":
-                            dim = list(getattr(data, task).shape)
-                        elif task_config["level"] == "atom":
-                            dim = list(getattr(data, task).shape[1:])
-                        else:
-                            raise ValueError(
-                                f"task level must be either system or atom, found {task_config['level']}"
-                            )
-                        datasets_in_batch_to_task_configs[name][task]["out_spec"] = {
-                            "dim": dim,
-                            "dtype": str(getattr(data, task).dtype),
-                        }
-
-                    # make sure all data in this batch has a valid output for this task
-                    tasks_to_report_on.append(task)
-
-        # tasks info
-        set_all_tasks = True  # DDP breaks if we try and be clever here :(
-        if set_all_tasks:
-            task_config = self.task_config
-            tasks_to_report_on = list(self.task_config)
-        else:
-            task_config = {
-                task: val
-                for _, td in datasets_in_batch_to_task_configs.items()
-                for task, val in td.items()
-            }
-
-        # find missing tasks in the batch
-        missing_tasks = {}
-        for dataset, task_dict in datasets_in_batch_to_task_configs.items():
-            missing_tasks[dataset] = list(
-                set(tasks_to_report_on).difference(set(task_dict.keys()))
-            )
-
-        # set missing attributes to inf for all data objects in the batch
-        # according to level, output dim, and dtype
-        for data in data_list:
-            for task in missing_tasks[data.dataset[0]]:
-                dim = task_config[task]["out_spec"]["dim"]
-                dtype = getattr(torch, task_config[task]["out_spec"]["dtype"])
-                if task_config[task]["level"] == "atom":
+            for task, config in self.task_config.items():
+                if config["level"] not in ("atom", "system"):
+                    raise ValueError(f"Unknown task level {config['level']!r}")
+                if task in provided:
+                    if task not in data:
+                        raise ValueError(f"Dataset {name!r} is missing task {task!r}")
+                    continue
+                dim = config["out_spec"]["dim"]
+                if config["level"] == "atom":
                     dim = [data.num_nodes, *dim]
+                dtype = getattr(torch, config["out_spec"]["dtype"])
                 data[task] = torch.full(
                     dim, torch.inf, dtype=dtype, device=data.pos.device
                 )
-        return data_list
+            prepared.append(data)
+        return prepared

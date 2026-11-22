@@ -150,7 +150,7 @@ class DistillationSample:
 class _ShardedSamples(Sequence):
     """Private, job-owned shards. Reads return independent CPU samples."""
 
-    def __init__(self, samples, directory, shard_size):
+    def __init__(self, samples, directory, shard_size, *, properties=None):
         self._directory = tempfile.TemporaryDirectory(
             dir=directory, prefix="fairchem-labels-"
         )
@@ -158,6 +158,7 @@ class _ShardedSamples(Sequence):
         self._cached = (None, None)
         self._shard_size = shard_size
         self._count = 0
+        self._common_targets = None if properties is None else frozenset(properties)
         shard = []
         try:
             for sample in samples:
@@ -193,6 +194,10 @@ class _ShardedSamples(Sequence):
     def __getitem__(self, index):
         if isinstance(index, slice):
             return tuple(self[i] for i in range(*index.indices(len(self))))
+        return copy.deepcopy(self._sample_at(index))
+
+    def _sample_at(self, index):
+        # Internal readers may borrow the cache while copying to their device.
         index = operator.index(index)
         if index < 0:
             index += len(self)
@@ -203,7 +208,7 @@ class _ShardedSamples(Sequence):
         if cached_number != shard:
             entries = self._read(shard)
             self._cached = (shard, entries)
-        return copy.deepcopy(entries[offset])
+        return entries[offset]
 
 
 @dataclass(frozen=True)
@@ -302,7 +307,9 @@ def collect_teacher_labels(
     owned = (
         tuple(samples())
         if shard_directory is None
-        else _ShardedSamples(samples(), shard_directory, int(shard_size))
+        else _ShardedSamples(
+            samples(), shard_directory, int(shard_size), properties=properties
+        )
     )
     return DistillationDataset._from_owned_samples(
         owned,
@@ -514,9 +521,18 @@ def distill_student(
         dataset = DistillationDataset._from_owned_samples(
             dataset.samples, copy.deepcopy(dataset.provenance)
         )
+        sample_at = dataset.samples._sample_at
+        common_targets = getattr(dataset.samples, "_common_targets", None)
     else:
         dataset = DistillationDataset(dataset.samples, dataset.provenance)
-    if any(set(weights.active) - sample.targets.keys() for sample in dataset.samples):
+        sample_at = dataset.samples.__getitem__
+        common_targets = None
+    required = set(weights.active)
+    if (
+        not required.issubset(common_targets)
+        if common_targets is not None
+        else any(not required.issubset(sample.targets) for sample in dataset.samples)
+    ):
         raise ValueError("Every sample must contain all positively weighted properties")
     # A warm UMA stores the previous forward's routing graph in shared MoLE
     # globals. These transient coefficients are recomputed before each forward;
@@ -568,13 +584,13 @@ def distill_student(
         optimizer = torch.optim.Adam(parameters, lr=learning_rate)
         optimizer.zero_grad(set_to_none=True)
         for _ in range(int(steps)):
-            sample = dataset.samples[
+            sample = sample_at(
                 int(
                     torch.randint(
                         len(dataset.samples), (), generator=generator, device="cpu"
                     )
                 )
-            ]
+            )
             data = _clone_tensor_tree(
                 sample.data,
                 tensor_transform=lambda tensor: tensor.to(

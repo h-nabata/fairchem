@@ -266,3 +266,92 @@ def test_exact_external_images_batch_with_ordinary_offsets():
         mixed.pos, mixed.edge_index, mixed.cell, mixed.cell_offsets, mixed.nedges
     )
     torch.testing.assert_close(vectors.norm(dim=-1), torch.full((4,), 0.75))
+
+
+@pytest.mark.parametrize("offset_dtype", [torch.float32, torch.long])
+@pytest.mark.parametrize("compiled", [False, True])
+@pytest.mark.parametrize("period,image", [(3.0, -33333334), (33333334.0, -3)])
+def test_external_wide_shift_preserves_local_energy_derivatives(
+    offset_dtype, compiled, period, image
+):
+    # The image ID itself fits in FP32, but its product by 3 does not.
+    pos = torch.tensor([[1e8, 0, 0], [0.25, 0, 0]], requires_grad=True)
+    cell = torch.diag(torch.tensor([period, 6, 6])).unsqueeze(0).requires_grad_()
+    edges = torch.tensor([[0], [1]])
+    cells = torch.tensor([[image, 0, 0]], dtype=offset_dtype)
+    evaluate = external_edge_geometry
+    if compiled:
+        evaluate = torch.compile(evaluate, backend="eager", fullgraph=True)
+    vec, _ = evaluate(pos, edges, cell, cells, torch.tensor([1]))
+    torch.testing.assert_close(vec, pos.new_tensor([[-2.25, 0, 0]]))
+    forces, stress = torch.autograd.grad(
+        vec.square().sum(), (pos, cell), create_graph=True
+    )
+    torch.testing.assert_close(forces[:, 0], pos.new_tensor([-4.5, 4.5]))
+    torch.testing.assert_close(stress[0, 0, 0], pos.new_tensor(-4.5 * image))
+    torch.testing.assert_close(
+        torch.autograd.grad(forces[0, 0], pos)[0][:, 0], pos.new_tensor([2, -2])
+    )
+
+
+@pytest.mark.parametrize("pbc", [[True, False, False], [True, False, True]])
+def test_skew_vacuum_does_not_inflate_search_or_change_edges(pbc):
+    flags = torch.tensor([pbc])
+    pos = torch.tensor([[0.2, 0.4, 0.1], [3.6, 0.4, 0.1]])
+    cell = torch.diag(torch.tensor([4.0, 4.0, 6.0])).unsqueeze(0)
+    data = SimpleNamespace(
+        pos=pos,
+        batch=torch.zeros(2, dtype=torch.long),
+        natoms=torch.tensor([2]),
+        cell=cell,
+        pbc=flags,
+    )
+    reference = generate_graph(data, 1.1, 8, False, 2, flags)
+    data.cell = cell.clone()
+    data.cell[0, 1] = pos.new_tensor([4, 0.001, 0])
+    _, _, reciprocal = radius_graph_pbc.periodic_search_frame(data, flags)
+    torch.testing.assert_close(
+        reciprocal[0, flags[0]].norm(dim=-1),
+        cell[0, flags[0]].norm(dim=-1).reciprocal(),
+    )
+    for version, cache in ((1, None), (2, None), (2, VerletNeighborCache(0.3))):
+        for _ in range(2):
+            graph = generate_graph(
+                data, 1.1, 8, False, version, flags, neighbor_cache=cache
+            )
+            for field in (
+                "edge_index",
+                "cell_offsets",
+                "edge_distance",
+                "edge_distance_vec",
+            ):
+                torch.testing.assert_close(graph[field], reference[field])
+
+
+@pytest.mark.parametrize(
+    "period,first,second,cutoff,dist",
+    [
+        (1e7, 0.0, -0.25, 0.5, 0.25),
+        (33333334.0, 0.25, 1e8, 2.2, None),
+        (33333334.0, 0.25, 1e8, 2.3, 2.25),
+    ],
+)
+@pytest.mark.parametrize("version", [1, 2, 3])
+def test_centered_local_frame_preserves_both_cutoff_directions(
+    period, first, second, cutoff, dist, version
+):
+    if version == 3 and not radius_graph_pbc_nvidia.nvalchemiops_installed():
+        pytest.skip("nvalchemiops is not installed")
+    pos = torch.tensor([[first, 0.0, 0.0], [second, 0.0, 0.0]])
+    data = SimpleNamespace(
+        pos=pos,
+        cell=torch.diag(pos.new_tensor([period, 6.0, 6.0])).unsqueeze(0),
+        batch=torch.zeros(2, dtype=torch.long),
+        natoms=torch.tensor([2]),
+        pbc=torch.tensor([[True, False, False]]),
+    )
+    graph = generate_graph(data, cutoff, 8, False, version, data.pbc)
+    expected = [] if dist is None else [dist, dist]
+    torch.testing.assert_close(
+        graph["edge_distance"], pos.new_tensor(expected), atol=1e-12, rtol=1e-6
+    )

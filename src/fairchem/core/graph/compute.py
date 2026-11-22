@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from fairchem.core.graph.geometry import needs_wide_image_math, wide_image_device
 from fairchem.core.graph.portable_search import morton_keys
 from fairchem.core.graph.radius_graph_pbc import (
     periodic_search_frame,
@@ -226,25 +227,53 @@ def filter_edges_by_node_partition(
 
 
 def external_edge_geometry(pos, edges, cell, cells, counts):
-    """Preserve the local displacement even when an external image offset is large."""
-    if (
-        cells.dtype == torch.long
-        and pos.dtype == torch.float32
-        and (torch.compiler.is_compiling() or bool((cells.abs() >= 2**23).any()))
-    ):
-        # An int64 image outside FP32's exact integer range cannot first be
-        # multiplied into an FP32 Cartesian shift. Cancel before narrowing.
-        device = (
-            pos.device if pos.device.type in {"cpu", "cuda"} else torch.device("cpu")
+    """Cancel large image translations before rounding to the model dtype."""
+    if pos.dtype != cell.dtype:
+        dtype = torch.promote_types(pos.dtype, cell.dtype)
+        vectors, shifts = external_edge_geometry(
+            pos.to(dtype), edges, cell.to(dtype), cells, counts
         )
-        wide_pos = pos.to(device=device, dtype=torch.float64)
-        row, col = edges.to(device)
-        shifts = edge_cell_offsets(
-            cell.to(device=device, dtype=torch.float64),
-            cells.to(device),
-            counts.to(device),
-        )
-        return (wide_pos[row] - wide_pos[col] + shifts).to(pos), shifts.to(cell)
+        return vectors, shifts.to(cell)
+    if pos.dtype == torch.float32 and cells.numel():
+        # Even an exactly representable floating image ID can produce a
+        # rounded Cartesian shift when multiplied by a nonbinary cell vector.
+        large = needs_wide_image_math(cells, cell)
+        if torch.compiler.is_compiling():
+            # torch.cond does not propagate higher-order derivatives on the
+            # supported PyTorch versions. Choose the forward value without AD;
+            # both formulas have the same linear coordinate/cell Jacobian.
+            with torch.no_grad():
+                selected, offsets = torch.cond(
+                    large,
+                    _wide_external_geometry,
+                    _native_external_geometry,
+                    (pos, edges, cell, cells, counts),
+                )
+            if torch.is_grad_enabled() and (
+                pos.requires_grad or cell.requires_grad or cells.requires_grad
+            ):
+                native, shifts = _native_external_geometry(
+                    pos, edges, cell, cells, counts
+                )
+                selected = selected + (native - native.detach())
+                offsets = offsets + (shifts - shifts.detach())
+            return selected, offsets
+        if bool(large):
+            return _wide_external_geometry(pos, edges, cell, cells, counts)
+    return _native_external_geometry(pos, edges, cell, cells, counts)
+
+
+def _wide_external_geometry(pos, edges, cell, cells, counts):
+    device = wide_image_device(pos.device)
+    wide_pos = pos.to(device=device, dtype=torch.float64)
+    row, col = edges.to(device)
+    shifts = edge_cell_offsets(
+        cell.to(device=device, dtype=torch.float64), cells.to(device), counts.to(device)
+    )
+    return (wide_pos[row] - wide_pos[col] + shifts).to(pos), shifts.to(cell)
+
+
+def _native_external_geometry(pos, edges, cell, cells, counts):
     shifts = edge_cell_offsets(cell, cells, counts)
     source, target = pos[edges[0]], pos[edges[1]]
     # Keep the original operation order except when the endpoint difference

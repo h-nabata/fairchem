@@ -67,7 +67,11 @@ def _owned_prediction_array(value, name):
     Copy prediction storage across the Tensor/NumPy calculator boundary.
     """
     if hasattr(value, "detach"):
-        value = value.detach().cpu().numpy()
+        value = value.detach().cpu()
+        if value.dtype == torch.bfloat16:
+            # NumPy has no native bfloat16. Float32 represents every value exactly.
+            value = value.float()
+        value = value.numpy()
     array = np.array(value, copy=True)
     if array.dtype.kind not in "biuf" or not np.isfinite(array).all():
         raise ValueError(f"Prediction {name!r} must contain finite real numbers")
@@ -365,7 +369,7 @@ class FAIRChemCalculator(Calculator):
         Notes:
             - `charge` must be an integer representing the total charge on the system and can range from -100 to 100.
             - `spin` must be an integer representing the spin multiplicity and can range from 0 to 100.
-            - If `task_name="omol"`, and `charge` or `spin` are not set in `atoms.info`, they will default to `0`.
+            - For `task_name="omol"`, missing charge and spin default to 0 and 1, respectively.
             - `charge` and `spin` are currently only used for the `omol` head.
             - The `free_energy` is simply a copy of the `energy` and is not the actual electronic free energy.
               It is only set for ASE routines/optimizers that are hard-coded to use this rather than the `energy` key.

@@ -29,18 +29,35 @@ if TYPE_CHECKING:
     from fairchem.core.regression_suite.suites.base import Suite
 
 
+def _mean_error(values: np.ndarray) -> float:
+    with np.errstate(over="ignore"):
+        mean = float(np.mean(values))
+    if not np.isfinite(mean):
+        if not np.isfinite(values).all():
+            raise RegressionSchemaError(
+                "comparison differences exceed the finite float64 range"
+            )
+        # All errors are non-negative. Scale before summing when their total
+        # overflows even though their mean is representable.
+        scale = float(np.max(values))
+        mean = float(np.mean(values / scale)) * scale
+    return mean
+
+
 def summary_statistics(values: Sequence[float]) -> dict[str, float]:
     """
     Compute the canonical statistics stored for one observable summary.
     """
     array = np.asarray(values, dtype=np.float64)
     absolute = np.abs(array)
+    lower, upper = np.quantile(array, (0.25, 0.75))
+    median, p95, p99 = np.quantile(absolute, (0.5, 0.95, 0.99))
     return {
-        "mean_absolute": float(np.mean(absolute)),
-        "median_absolute": float(np.median(absolute)),
-        "iqr": float(np.quantile(array, 0.75) - np.quantile(array, 0.25)),
-        "p95": float(np.quantile(absolute, 0.95)),
-        "p99": float(np.quantile(absolute, 0.99)),
+        "mean_absolute": _mean_error(absolute),
+        "median_absolute": float(median),
+        "iqr": float(upper - lower),
+        "p95": float(p95),
+        "p99": float(p99),
     }
 
 
@@ -58,12 +75,20 @@ def _primary_difference(
         raise RegressionSchemaError(
             "log-ratio comparisons require strictly positive values"
         )
-    return np.abs(np.log(candidate / reference)), absolute
+    # A quotient can overflow or lose precision in the subnormal range even
+    # though both logarithms and their difference are representable.
+    with np.errstate(over="ignore", under="ignore", divide="ignore"):
+        ratio = candidate / reference
+        log_ratio = np.asarray(np.log(ratio))
+    extreme = ~np.isfinite(ratio) | (ratio < np.finfo(np.float64).tiny)
+    if np.any(extreme):
+        log_ratio[extreme] = np.log(candidate[extreme]) - np.log(reference[extreme])
+    return np.abs(log_ratio), absolute
 
 
 def _observable_summary(
     spec: ObservableSpec,
-    clusters: Mapping[str, tuple[np.ndarray, np.ndarray]],
+    clusters: Mapping[str, tuple[int, float, float]],
     *,
     case_count: int,
 ) -> dict[str, Any]:
@@ -74,10 +99,10 @@ def _observable_summary(
     decision_clusters = [
         {
             "cluster_id": cluster_id,
-            "primary_mean": float(np.mean(primary)),
-            "absolute_mean": float(np.mean(absolute)),
+            "primary_mean": primary,
+            "absolute_mean": absolute,
         }
-        for cluster_id, (primary, absolute) in clusters.items()
+        for cluster_id, (_, primary, absolute) in sorted(clusters.items())
     ]
     return {
         "units": spec.units,
@@ -87,7 +112,7 @@ def _observable_summary(
         "population": {
             "cases": case_count,
             "clusters": len(decision_clusters),
-            "values": sum(primary.size for primary, _ in clusters.values()),
+            "values": sum(count for count, _, _ in clusters.values()),
         },
         "decision_clusters": decision_clusters,
         **{
@@ -130,38 +155,51 @@ def compare_records(
             "comparison case count differs from the paired population"
         )
 
-    # Each cluster collects its primary and absolute differences in key order.
-    clusters: dict[str, dict[str, tuple[list, list]]] = defaultdict(
-        lambda: defaultdict(lambda: ([], []))
-    )
+    # Keep only element counts and means after processing each record.
+    clusters: dict[str, dict[str, tuple[int, float, float]]] = defaultdict(dict)
     cases: dict[str, set[tuple[str, str]]] = defaultdict(set)
     for key in sorted(reference):
         reference_record = reference[key]
         candidate_record = candidate[key]
         observable = reference_record.observable
+        if observable not in observable_specs:
+            raise RegressionSchemaError(f"unknown comparison observable: {observable}")
+        spec = observable_specs[observable]
+        if candidate_record.cluster_id != reference_record.cluster_id:
+            raise RegressionSchemaError(f"comparison cluster differs for {key}")
+        for field in ("units", "comparison", "floor", "report_only"):
+            expected = getattr(spec, field)
+            if any(
+                getattr(record, field) != expected
+                for record in (reference_record, candidate_record)
+            ):
+                raise RegressionSchemaError(f"comparison {field} differs for {key}")
         if candidate_record.values.shape != reference_record.values.shape:
             raise RegressionSchemaError(f"comparison shape differs for {key}")
         primary, absolute = _primary_difference(
             reference_record.values,
             candidate_record.values,
-            observable_specs[observable],
+            spec,
         )
-        primary_parts, absolute_parts = clusters[observable][
-            reference_record.cluster_id
-        ]
-        primary_parts.append(primary.reshape(-1))
-        absolute_parts.append(absolute.reshape(-1))
+        primary_mean = _mean_error(primary)
+        absolute_mean = primary_mean if absolute is primary else _mean_error(absolute)
+        cluster = reference_record.cluster_id
+        count, previous_primary, previous_absolute = clusters[observable].get(
+            cluster, (0, 0.0, 0.0)
+        )
+        total = count + primary.size
+        weight = primary.size / total
+        clusters[observable][cluster] = (
+            total,
+            (count / total) * previous_primary + weight * primary_mean,
+            (count / total) * previous_absolute + weight * absolute_mean,
+        )
         cases[observable].add((reference_record.case_id, reference_record.transform_id))
 
     summaries = {
         observable: _observable_summary(
             observable_specs[observable],
-            {
-                cluster_id: (np.concatenate(primary), np.concatenate(absolute))
-                for cluster_id, (primary, absolute) in sorted(
-                    observable_clusters.items()
-                )
-            },
+            observable_clusters,
             case_count=len(cases[observable]),
         )
         for observable, observable_clusters in sorted(clusters.items())
@@ -257,7 +295,7 @@ def summarize_run(
         summary["observables"][observable] = _observable_summary(
             suite.observables[observable],
             {
-                cluster_id: (np.array([value.value]), np.array([value.value]))
+                cluster_id: (1, value.value, value.value)
                 for cluster_id, value in sorted(values.items())
             },
             case_count=sum(value.case_count for value in values.values()),

@@ -384,21 +384,27 @@ def segmented_sum(values, target, num_nodes):
     """
     Sum existing dtype values by target without a global-prefix subtraction.
     """
+    topology = _segment_topology(target, num_nodes, values.device)
+    return _reduce_segments(values, target, num_nodes, topology)
+
+
+def _segment_topology(target, num_nodes, device):
+    if torch.compiler.is_compiling() or device.type == "xpu" or _CAPTURE_SAFE.get():
+        return None
+    return get_csr_topology(target, num_nodes)
+
+
+def _reduce_segments(values, target, num_nodes, topology):
     if target.ndim != 1 or values.ndim < 1 or values.shape[0] != target.numel():
         raise ValueError(
             "Segment values and target indices must have the same leading length"
         )
-    if (
-        torch.compiler.is_compiling()
-        or values.device.type == "xpu"
-        or _CAPTURE_SAFE.get()
-    ):
+    if topology is None:
         # segment_reduce kernel coverage varies across XPU releases. The XPU
         # fused consumer below owns CSR rows; this reference retains index_add.
         return values.new_zeros((num_nodes,) + values.shape[1:]).index_add(
             0, target, values
         )
-    topology = get_csr_topology(target, num_nodes)
     if not values.shape[0]:
         return values.new_zeros((num_nodes,) + values.shape[1:]) + values.sum() * 0
     return _SegmentSum.apply(
@@ -417,11 +423,14 @@ def consumer_reference(g0, g1, g2, wigner, target, num_nodes, channels, residual
     """
     wigner = compact_wigner(wigner)
     coefficients = _unpack_coefficients(g0, g1, g2, channels)
+    topology = _segment_topology(target, num_nodes, g0.device)
     result = []
     for start, width, offset in _BLOCKS:
         features = torch.stack(coefficients[start : start + width], dim=1)
         matrix = wigner[:, offset : offset + width * width].reshape(-1, width, width)
-        reduced = segmented_sum(torch.bmm(matrix, features), target, num_nodes)
+        reduced = _reduce_segments(
+            torch.bmm(matrix, features), target, num_nodes, topology
+        )
         if residual is not None:
             reduced = reduced + residual[:, start : start + width]
         result.append(reduced)

@@ -1,14 +1,19 @@
 """Exercise nonzero global ranks, including one-way empty peer messages."""
 
+from __future__ import annotations
+
 from datetime import timedelta
 
+import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from fairchem.core.common import distutils
+from fairchem.core.common import distutils, gp_utils
+from fairchem.core.common.data_parallel import BalancedBatchSampler
 from fairchem.core.common.parallelism.graph_parallel_a2a import _safe_all_to_all
+from fairchem.core.datasets.base_dataset import BaseDataset
 from fairchem.core.modules.loss import DDPMTLoss, MSELoss
 
 
@@ -48,6 +53,25 @@ def _subgroup_worker(rank, rendezvous):
                     torch.tensor([True]),
                     torch.tensor([1]),
                 )
+        gp_utils.setup_graph_parallel_groups(2, "gloo")
+        try:
+            dataset = BaseDataset({})
+            dataset.num_samples = 1
+            dataset._metadata = {"natoms": np.array([3])}
+            sampler = BalancedBatchSampler(
+                dataset,
+                batch_size=1,
+                rank=gp_utils.get_dp_rank(),
+                num_replicas=gp_utils.get_dp_world_size(),
+                device="cpu",
+                seed=0,
+                shuffle=False,
+            )
+            # Each DP replica legitimately receives sample 0; each GP partner
+            # must agree with its own replica even with the padding duplicate.
+            assert [x.tolist() for x in sampler] == [[0]]
+        finally:
+            gp_utils.cleanup_gp()
         dist.barrier()
     finally:
         dist.destroy_process_group()

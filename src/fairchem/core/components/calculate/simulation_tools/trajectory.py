@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from itertools import pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -64,40 +64,17 @@ class TrajectoryFrame:
         """
         Convert to dictionary for Parquet serialization.
         """
-        d = {
-            "step": self.step,
-            "natoms": len(self.positions),
-            "atomic_numbers": self.atomic_numbers.tolist(),
-            "positions": self.positions.tolist(),
-            "cell": self.cell.tolist(),
-            "pbc": self.pbc.tolist(),
-            "sid": self.sid,
-        }
-        if self.time is not None:
-            d["time"] = self.time
-        if self.velocities is not None:
-            d["velocities"] = self.velocities.tolist()
-        if self.energy is not None:
-            d["energy"] = self.energy
-        if self.forces is not None:
-            d["forces"] = self.forces.tolist()
-        if self.stress is not None:
-            d["stress"] = self.stress.tolist()
-        if self.temperature is not None:
-            d["temperature"] = self.temperature
-        if self.kinetic_energy is not None:
-            d["kinetic_energy"] = self.kinetic_energy
-        if self.pressure is not None:
-            d["pressure"] = self.pressure
-        if self.tags is not None:
-            d["tags"] = self.tags.tolist()
-        if self.fixed is not None:
-            d["fixed"] = self.fixed.tolist()
-        if self.charge is not None:
-            d["charge"] = self.charge
-        if self.spin is not None:
-            d["spin"] = self.spin
-        return d
+        return self._snapshot(as_lists=True)
+
+    def _snapshot(self, *, as_lists: bool) -> dict:
+        row = {"natoms": len(self.positions)}
+        for field in fields(self):
+            value = getattr(self, field.name)
+            if isinstance(value, np.ndarray):
+                value = value.tolist() if as_lists else value.copy()
+            if value is not None or field.name == "sid":
+                row[field.name] = value
+        return row
 
     @classmethod
     def from_atoms(
@@ -128,7 +105,13 @@ class TrajectoryFrame:
                 )
                 raise
 
-        stress = property_value("stress", atoms.get_stress)
+        # A molecule or partial cell can have energy and forces without a
+        # physical 3-D volume in which to define stress.
+        stress = (
+            None
+            if atoms.cell.rank < 3 or atoms.cell.volume == 0
+            else property_value("stress", atoms.get_stress)
+        )
         energy = property_value("energy", atoms.get_potential_energy)
         forces = property_value("forces", atoms.get_forces)
         velocities = atoms.get_velocities()
@@ -147,7 +130,7 @@ class TrajectoryFrame:
 
         # Tags: only store if any are nonzero (all zeros is ASE default)
         raw_tags = atoms.get_tags()
-        tags = raw_tags.copy() if np.any(raw_tags) else None
+        tags = raw_tags if np.any(raw_tags) else None
 
         # Fixed atoms: build bool mask from FixAtoms constraints
         fixed = None
@@ -162,13 +145,18 @@ class TrajectoryFrame:
         charge = atoms.info.get("charge", None)
         spin = atoms.info.get("spin", None)
 
+        sid = atoms.info.get("sid")
+        if isinstance(sid, (list, tuple)) and len(sid) == 1:
+            # AtomicData.to_ase_single retains the singleton batch dimension.
+            sid = sid[0]
+
         return cls(
             step=step,
             time=time,
-            atomic_numbers=atoms.get_atomic_numbers().copy(),
-            positions=atoms.get_positions().copy(),
-            cell=atoms.get_cell()[:].copy(),
-            pbc=np.array(atoms.get_pbc()),
+            atomic_numbers=atoms.get_atomic_numbers(),
+            positions=atoms.get_positions(),
+            cell=atoms.get_cell().array,
+            pbc=atoms.get_pbc(),
             velocities=velocities,
             energy=energy,
             forces=forces,
@@ -176,7 +164,7 @@ class TrajectoryFrame:
             temperature=temperature,
             kinetic_energy=kinetic_energy,
             pressure=pressure,
-            sid=atoms.info.get("sid"),
+            sid=sid,
             tags=tags,
             fixed=fixed,
             charge=charge,
@@ -220,7 +208,32 @@ def _trajectory_table(rows):
         if isinstance(sid, (int, np.integer)):
             row["sid_integer"] = int(sid)
             row["sid"] = str(sid)
-    return pa.Table.from_pylist(rows, schema=_TRAJECTORY_SCHEMA)
+    columns = []
+    for field in _TRAJECTORY_SCHEMA:
+        values = [row.get(field.name) for row in rows]
+        if field.type != _VECTORS:
+            columns.append(pa.array(values, type=field.type))
+            continue
+        # Pack each (N, 3) column in native buffers. Nested tolist() would
+        # create a Python object for every coordinate of every buffered frame.
+        present = [np.asarray(value) for value in values if value is not None]
+        if not present:
+            columns.append(pa.nulls(len(rows), type=_VECTORS))
+            continue
+        coordinates = np.concatenate([value.reshape(-1, 3) for value in present])
+        vectors = pa.ListArray.from_arrays(
+            np.arange(0, coordinates.size + 1, 3),
+            pa.array(coordinates.ravel(), type=pa.float64()),
+        )
+        lengths = [0 if value is None else len(value) for value in values]
+        columns.append(
+            pa.ListArray.from_arrays(
+                np.cumsum([0, *lengths]),
+                vectors,
+                mask=pa.array([value is None for value in values]),
+            )
+        )
+    return pa.Table.from_arrays(columns, schema=_TRAJECTORY_SCHEMA)
 
 
 class ParquetTrajectoryWriter:
@@ -295,7 +308,7 @@ class ParquetTrajectoryWriter:
     def append(self, frame: TrajectoryFrame) -> None:
         if self._closed:
             raise ValueError("Cannot append to a closed trajectory")
-        self.buffer.append(frame.to_dict())
+        self.buffer.append(frame._snapshot(as_lists=False))
         if len(self.buffer) >= self.flush_interval:
             self.flush()
 

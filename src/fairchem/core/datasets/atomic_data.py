@@ -31,7 +31,12 @@ from monty.dev import requires
 
 from fairchem.core.common.utils import StrEnum
 from fairchem.core.graph.compute import canonicalize_external_edges
-from fairchem.core.graph.radius_graph_pbc import get_max_neighbors_mask
+from fairchem.core.graph.radius_graph_pbc import (
+    complete_periodic_cell,
+    get_max_neighbors_mask,
+    periodic_search_frame,
+    public_image_offsets,
+)
 
 try:
     from pymatgen.io.ase import AseAtomsAdaptor
@@ -195,21 +200,44 @@ def get_neighbors_pymatgen(
 ):
     """Performs nearest neighbor search and returns edge index, distances,
     and cell offsets"""
-    struct = AseAtomsAdaptor.get_structure(atoms)
-
-    # Pymatgen searches in double precision. Obtain a superset and apply the
-    # same squared-distance predicate and shell cap as graph v2 in model dtype.
+    # Pymatgen searches in double precision. Cap neighbors in the same
+    # locally wrapped, model-rounded geometry as the native search, then
+    # convert each retained shift back to the caller's coordinate frame.
     pos = torch.as_tensor(atoms.get_positions(), dtype=target_dtype)
     cell = torch.as_tensor(np.asarray(atoms.cell), dtype=target_dtype)
+    flags = torch.as_tensor(atoms.pbc).reshape(1, 3)
+    search_cell = complete_periodic_cell(cell.unsqueeze(0), flags)[0]
+    images = None
+    scale = float(cutoff)
+    if atoms.pbc.any():
+        data = types.SimpleNamespace(
+            pos=pos, cell=cell.unsqueeze(0), natoms=torch.tensor([len(atoms)])
+        )
+        pos, images, _ = periodic_search_frame(data, flags)
+        if len(pos):
+            # Bound rounding slack by the local coordinate span. Vacuum size
+            # and the absolute number of periodic translations are irrelevant.
+            scale += min(
+                float((pos.amax(0) - pos.amin(0)).amax()),
+                float(cell[flags[0]].abs().sum(0).max()),
+            )
+    # A Structure needs a full basis even for a cell-less molecule. Only
+    # periodic rows take part in physical image displacements.
+    search_atoms = ase.Atoms(
+        numbers=atoms.numbers,
+        positions=pos.numpy(),
+        cell=ase.cell.Cell(search_cell.numpy()).complete(),
+        pbc=atoms.pbc,
+    )
+    struct = AseAtomsAdaptor.get_structure(search_atoms)
     eps = torch.finfo(target_dtype).eps
-    scale = cutoff + (float(pos.abs().max()) if atoms.pbc.any() and len(pos) else 0)
     _c_index, _n_index, _offsets, _ = struct.get_neighbor_list(
         r=cutoff + 16 * eps * (1 + scale), numerical_tol=1e-8, exclude_self=False
     )
     order = np.argsort(_c_index, kind="stable")
     _c_index, _n_index, _offsets = _c_index[order], _n_index[order], _offsets[order]
     shifts = torch.as_tensor(_offsets, dtype=target_dtype) @ cell
-    squared = (pos[_c_index] - (pos[_n_index] + shifts)).square().sum(-1)
+    squared = ((pos[_c_index] - pos[_n_index]) - shifts).square().sum(-1)
     selected = torch.where((squared > 0) & (squared <= cutoff * cutoff))[0]
     centers = torch.as_tensor(_c_index)[selected].long()
     squared = squared[selected]
@@ -245,6 +273,10 @@ def get_neighbors_pymatgen(
         _n_index[indices],
         _offsets[indices],
     )
+    if images is not None:
+        _offsets = (
+            _offsets.astype(np.int64) + (images[_c_index] - images[_n_index]).numpy()
+        )
     return _c_index, _n_index, n_distance, _offsets
 
 
@@ -259,7 +291,11 @@ def reshape_features(
     takes in np.arrays and returns torch tensors"""
     edge_index = torch.LongTensor(np.vstack((n_index, c_index)))
     edge_distances = torch.tensor(n_distance, dtype=target_dtype, device="cpu")
-    cell_offsets = torch.tensor(offsets, dtype=target_dtype, device="cpu")
+    raw_offsets = torch.as_tensor(offsets, device="cpu")
+    images = raw_offsets.to(torch.long)
+    if not torch.equal(images.to(raw_offsets.dtype), raw_offsets):
+        raise ValueError("Cell offsets must be integer periodic images")
+    cell_offsets = public_image_offsets(images, target_dtype)
 
     # Neighbor search and model geometry exclude exact zero-distance edges.
     nonzero = torch.where(edge_distances > 0)[0]
@@ -923,12 +959,13 @@ class AtomicData:
         # Conversion mutates this owner in place. Metadata back-references must
         # keep pointing here instead of creating a second AtomicData instance.
         memo = {id(self): self}
-        # The memo is indexed by Python ids. Keep original field roots alive
-        # until all conversions finish, so replacing e.g. sid cannot recycle
-        # its id for a later dataclass's temporary deepcopy state list.
-        items = [(key, self[key]) for key in self.__keys__]
-        for key, item in items:
-            self[key] = self.__apply__(item, func, memo)
+        # Keep every original root alive until the shared memo is complete.
+        # A failed conversion must not leave fields split across devices/dtypes.
+        converted = {
+            key: self.__apply__(self[key], func, memo) for key in self.__keys__
+        }
+        for key, item in converted.items():
+            self[key] = item
 
         return self
 
@@ -999,9 +1036,9 @@ class AtomicData:
         idx = self.num_graphs + idx if idx < 0 else idx
         if not 0 <= idx < self.num_graphs:
             raise IndexError("AtomicData example index out of range")
-        if self.num_graphs == 1:
-            return self.clone()
         if self.__slices__ is None:
+            if self.num_graphs == 1:
+                return self.clone()
             raise ValueError("Unbatching requires stored batch slice metadata")
 
         data_dict = {}

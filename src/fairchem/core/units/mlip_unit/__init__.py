@@ -23,6 +23,19 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
+def resolve_inference_device(device: str | None) -> str:
+    if device is None:
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch, "xpu") and torch.xpu.is_available():
+            device = "xpu"
+        else:
+            device = "cpu"
+        logging.warning(f"device was not explicitly set, using {device=}.")
+
+    return device
+
+
 def load_predict_unit(
     path: str | Path,
     inference_settings: InferenceSettings | str = "default",
@@ -60,14 +73,7 @@ def load_predict_unit(
         A MLIPPredictUnit instance ready for inference
     """
 
-    if device is None:
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif hasattr(torch, "xpu") and torch.xpu.is_available():
-            device = "xpu"
-        else:
-            device = "cpu"
-        logging.warning(f"device was not explicitly set, using {device=}.")
+    device = resolve_inference_device(device)
 
     if parse_device(device).type == "xpu":
         if workers != 1 or gp_config is not None:

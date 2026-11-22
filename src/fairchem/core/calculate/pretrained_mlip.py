@@ -10,8 +10,10 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 from dataclasses import dataclass
 from importlib import resources
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 import torch
@@ -21,7 +23,11 @@ from omegaconf import OmegaConf
 from fairchem.core import calculate
 from fairchem.core._config import CACHE_DIR
 from fairchem.core.common.distutils import parse_device, resolve_xpu_device
-from fairchem.core.units.mlip_unit import MLIPPredictUnit, load_predict_unit
+from fairchem.core.units.mlip_unit import (
+    MLIPPredictUnit,
+    load_predict_unit,
+    resolve_inference_device,
+)
 from fairchem.core.units.mlip_unit.api.inference import guess_inference_settings
 from fairchem.core.units.mlip_unit.inference_runtime import (
     _preflight_fp64,
@@ -124,13 +130,26 @@ def resolve_checkpoint(
         checkpoint_path = pretrained_checkpoint_path_from_name(
             name_or_path, cache_dir=cache_dir
         )
+        # The Hub places every downloaded file under snapshots/<resolved commit>.
+        # Reuse that immutable revision for companion files, including offline hits.
+        revision = next(
+            (
+                p.name
+                for p in Path(checkpoint_path).parents
+                if p.parent.name == "snapshots"
+                and re.fullmatch(r"[a-f0-9]{40}", p.name)
+            ),
+            _MODEL_CKPTS.checkpoints[name_or_path].revision,
+        )
         if _MODEL_CKPTS.checkpoints[name_or_path].atom_refs is not None:
-            atom_refs = get_reference_energies(name_or_path, "atom_refs", cache_dir)
+            atom_refs = get_reference_energies(
+                name_or_path, "atom_refs", cache_dir, revision
+            )
         else:
             atom_refs = None
         if _MODEL_CKPTS.checkpoints[name_or_path].form_elem_refs is not None:
             form_elem_refs = get_reference_energies(
-                name_or_path, "form_elem_refs", cache_dir
+                name_or_path, "form_elem_refs", cache_dir, revision
             )["refs"]
         else:
             form_elem_refs = None
@@ -187,10 +206,11 @@ def get_predict_unit(
         UnknownCheckpointError: If model_name is neither a registered model name nor
             an existing file. Subclasses KeyError and ValueError.
     """
-    # Fail before authentication/download if an explicit Intel device cannot
+    # Fail before authentication/download if the selected Intel device cannot
     # serve the request. The predictor performs the same check on local loads.
     evidence = None
-    if device is not None and parse_device(device).type == "xpu":
+    device = resolve_inference_device(device)
+    if parse_device(device).type == "xpu":
         if workers != 1 or gp_config is not None:
             raise ValueError(
                 "XPU inference supports workers=1 without graph parallelism."
@@ -231,6 +251,7 @@ def get_reference_energies(
     model_name: str,
     reference_type: Literal["atom_refs", "form_elem_refs"] = "atom_refs",
     cache_dir: str = CACHE_DIR,
+    revision: str | None = None,
 ) -> dict:
     """
     Retrieves the isolated atomic energies for use with single atom systems into the CACHE_DIR
@@ -251,7 +272,7 @@ def get_reference_energies(
         filename=file_data["filename"],
         repo_id=model_checkpoint.repo_id,
         subfolder=file_data["subfolder"],
-        revision=model_checkpoint.revision,
+        revision=revision if revision is not None else model_checkpoint.revision,
         cache_dir=cache_dir,
     )
     return OmegaConf.load(refs_path)

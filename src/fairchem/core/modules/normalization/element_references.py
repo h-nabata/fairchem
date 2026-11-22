@@ -36,15 +36,24 @@ class ElementReferences(nn.Module):
 
     @staticmethod
     def compute_references(batch, tensor, elem_refs, operation):
-        assert tensor.shape[0] == len(batch.natoms)
+        if (
+            tensor.ndim == 0
+            or tensor.shape[0] != len(batch.natoms)
+            or tensor.numel() != len(batch.natoms)
+        ):
+            raise ValueError("Element references require one scalar per structure")
         with torch.autocast(elem_refs.device.type, enabled=False):
-            refs = torch.zeros(
-                tensor.shape, dtype=elem_refs.dtype, device=tensor.device
-            ).scatter_reduce(
-                0,
-                batch.batch_full,
-                elem_refs[batch.atomic_numbers_full],
-                reduce="sum",
+            refs = (
+                torch.zeros(
+                    tensor.shape[0], dtype=elem_refs.dtype, device=tensor.device
+                )
+                .scatter_reduce(
+                    0,
+                    batch.batch_full,
+                    elem_refs[batch.atomic_numbers_full],
+                    reduce="sum",
+                )
+                .reshape_as(tensor)
             )
             if operation == "subtract":
                 return tensor - refs

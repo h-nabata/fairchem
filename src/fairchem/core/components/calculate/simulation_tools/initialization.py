@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import numpy as np
-from ase.constraints import FixAtoms, FixCom
+from ase.constraints import FixAtoms, FixCom, FixSubsetCom
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
 
 if TYPE_CHECKING:
@@ -32,6 +32,9 @@ def initialize_momenta(
         seed: NumPy random seed recorded with the run.
         remove_center_of_mass_momentum: Remove net linear momentum when true.
     """
+
+    if not np.isfinite(temperature_K) or temperature_K < 0:
+        raise ValueError("Initialization temperature must be finite and nonnegative")
 
     if remove_center_of_mass_momentum:
         unsupported_constraints = [
@@ -66,17 +69,38 @@ def initialize_momenta(
         initial_kinetic_energy = np.sum(
             momenta[mobile] ** 2 / (2 * masses[mobile, np.newaxis])
         )
-        center_of_mass_velocity = momenta[mobile].sum(axis=0) / masses[mobile].sum()
-        momenta[mobile] -= masses[mobile, np.newaxis] * center_of_mass_velocity
+        subsets = [c for c in atoms.constraints if isinstance(c, FixSubsetCom)]
+        if subsets:
+            # Project onto all requested zero-momentum constraints together.
+            # Sequential corrections can reintroduce drift in overlapping sets.
+            groups = np.zeros((1 + len(subsets), len(atoms)))
+            groups[0] = mobile
+            for row, constraint in zip(groups[1:], subsets, strict=True):
+                row[constraint.get_indices()] = 1
+            groups[:, ~mobile] = 0
+            weighted = groups * masses
+            correction, _, rank, _ = np.linalg.lstsq(
+                weighted @ groups.T, groups @ momenta, rcond=None
+            )
+            if rank == mobile.sum():
+                momenta.fill(0)
+            else:
+                momenta -= weighted.T @ correction
+        else:
+            center_of_mass_velocity = momenta[mobile].sum(axis=0) / masses[mobile].sum()
+            momenta[mobile] -= masses[mobile, np.newaxis] * center_of_mass_velocity
         corrected_kinetic_energy = np.sum(
             momenta[mobile] ** 2 / (2 * masses[mobile, np.newaxis])
         )
-        if corrected_kinetic_energy <= 0:
+        if corrected_kinetic_energy <= 0 and initial_kinetic_energy > 0:
             raise ValueError(
                 "Center-of-mass momentum removal produced zero kinetic energy. "
                 "Set remove_center_of_mass_momentum=False for this system."
             )
-        momenta[mobile] *= np.sqrt(initial_kinetic_energy / corrected_kinetic_energy)
+        if initial_kinetic_energy > 0:
+            momenta[mobile] *= np.sqrt(
+                initial_kinetic_energy / corrected_kinetic_energy
+            )
         atoms.set_momenta(momenta, apply_constraint=False)
     atoms.info["velocity_seed"] = seed
     atoms.info["initial_temperature_K"] = temperature_K

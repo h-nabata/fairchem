@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
+from fairchem.core.graph.geometry import needs_wide_image_math, wide_image_device
 from fairchem.core.graph.portable_search import (
     _borrow_integer_cartesian_table,
     alternative_candidates,
@@ -193,37 +194,50 @@ def get_max_neighbors_mask(
 
 
 def complete_periodic_cell(cell, flags):
-    """Complete only undefined nonperiodic axes for lattice searches."""
+    """Choose orthogonal vacuum directions for searches in a periodic subspace.
+
+    Only translations along flagged axes can contribute neighbors. Including
+    a nearly parallel vacuum vector in the reciprocal basis can otherwise
+    inflate the number of trial images arbitrarily.
+    """
     flags = flags.expand(len(cell), -1)
-    volume = (cell[:, 0] * torch.cross(cell[:, 1], cell[:, 2], dim=-1)).sum(-1)
-    incomplete = flags.any(-1) & (volume == 0)
-    if not bool(incomplete.any()):
+    partial = flags.any(-1) & ~flags.all(-1)
+    if not bool(partial.any()):
+        return cell
+    # Keep existing orthogonal vacuum rows (and their lengths). No completion
+    # is necessary for the usual nonzero diagonal slab or wire cell.
+    if bool((cell == torch.diag_embed(cell.diagonal(dim1=-2, dim2=-1))).all()) and bool(
+        (cell.diagonal(dim1=-2, dim2=-1) != 0).all()
+    ):
         return cell
     completed = cell.clone()
-    for system in torch.where(incomplete)[0].tolist():
-        axes = torch.where(flags[system])[0].tolist()
-        missing = torch.where(~flags[system])[0].tolist()
-        basis = cell[system, axes]
-        if not missing or bool((basis.norm(dim=-1) == 0).any()):
-            raise ValueError(
-                "Periodic lattice vectors must span a nonsingular subspace"
-            )
+    for pattern in flags[partial].unique(dim=0).tolist():
+        axes = [i for i, periodic in enumerate(pattern) if periodic]
+        missing = [i for i, periodic in enumerate(pattern) if not periodic]
+        systems = (flags == flags.new_tensor(pattern)).all(-1).nonzero().flatten()
+        basis = cell[systems][:, axes]
         if len(axes) == 2:
-            normal = torch.cross(basis[0], basis[1], dim=0)
-            length = normal.norm()
-            if not bool(length > 0):
+            normal = torch.cross(basis[:, 0], basis[:, 1], dim=-1)
+            length = normal.norm(dim=-1, keepdim=True)
+            if bool((length == 0).any()):
                 raise ValueError(
                     "Periodic lattice vectors must span a nonsingular subspace"
                 )
-            completed[system, missing[0]] = normal / length
+            completed[systems, missing[0]] = normal / length
         else:
-            direction = basis[0] / basis[0].norm()
+            direction = basis[:, 0]
+            length = direction.norm(dim=-1, keepdim=True)
+            if bool((length == 0).any()):
+                raise ValueError(
+                    "Periodic lattice vectors must span a nonsingular subspace"
+                )
+            direction = direction / length
             pivot = torch.zeros_like(direction)
-            pivot[direction.abs().argmin()] = 1
-            normal = torch.cross(direction, pivot, dim=0)
-            normal = normal / normal.norm()
-            completed[system, missing[0]] = normal
-            completed[system, missing[1]] = torch.cross(direction, normal, dim=0)
+            pivot.scatter_(1, direction.abs().argmin(dim=-1, keepdim=True), 1)
+            normal = torch.cross(direction, pivot, dim=-1)
+            normal = normal / normal.norm(dim=-1, keepdim=True)
+            completed[systems, missing[0]] = normal
+            completed[systems, missing[1]] = torch.cross(direction, normal, dim=-1)
     return completed
 
 
@@ -233,11 +247,12 @@ def public_image_offsets(images, dtype):
     return converted if torch.equal(converted.long(), images) else images
 
 
-def periodic_search_frame(data, flags):
+def periodic_search_frame(data, flags, *, search_cell=None):
     """Return differentiable local positions, integer image IDs and reciprocal vectors."""
     cell = data.cell
     with torch.no_grad():
-        search_cell = complete_periodic_cell(cell, flags)
+        if search_cell is None:
+            search_cell = complete_periodic_cell(cell, flags)
         cross = torch.cross(search_cell.roll(-1, 1), search_cell.roll(-2, 1), dim=-1)
         volume = (search_cell[:, 0] * cross[:, 0]).sum(-1)
         periodic = flags.any(1)
@@ -252,21 +267,23 @@ def periodic_search_frame(data, flags):
                 data.natoms, output_size=len(data.pos)
             )
         pos = data.pos.to(torch.promote_types(data.pos.dtype, cell.dtype))
+        # Center the search frame on the origin. Wrapping a tiny negative
+        # coordinate to one whole cell can round the displacement away in FP32.
         if len(cell) == 1:
             frac = pos @ reciprocal[0].T.to(pos)
-            fractional_images = torch.where(flags, frac.floor(), 0)
+            fractional_images = torch.where(flags, frac.round(), 0)
         else:
             frac = (reciprocal[batch].to(pos) @ pos.unsqueeze(-1)).squeeze(-1)
             fractional_images = torch.where(
-                flags.expand(len(cell), -1)[batch], frac.floor(), 0
+                flags.expand(len(cell), -1)[batch], frac.round(), 0
             )
-    if pos.dtype == torch.float32 and bool((fractional_images.abs() >= 16384).any()):
+    if pos.dtype == torch.float32 and bool(
+        needs_wide_image_math(fractional_images, cell)
+    ):
         # FP32 cannot reliably subtract large integer multiples of a nonbinary
         # lattice vector. Reduce only such unwrapped inputs in double. Xe devices
         # without FP64 can still run the model in FP32 after a CPU reduction.
-        device = (
-            pos.device if pos.device.type in {"cpu", "cuda"} else torch.device("cpu")
-        )
+        device = wide_image_device(pos.device)
         wide = SimpleNamespace(
             pos=data.pos.to(device=device, dtype=torch.float64),
             cell=cell.to(device=device, dtype=torch.float64),
@@ -309,7 +326,8 @@ def radius_graph_pbc(
         )
 
     device = data.pos.device
-    validate_graph_geometry(data)
+    if _frame is None:
+        validate_graph_geometry(data)
     batch_size = len(data.natoms)
     if not len(data.pos):
         return (
@@ -866,7 +884,8 @@ def radius_graph_pbc_v2(
     pbc = sys_pbc.any(dim=0).tolist()
 
     device = data.pos.device
-    validate_graph_geometry(data)
+    if _frame is None:
+        validate_graph_geometry(data)
     batch_size = len(data.natoms)
     node_partition = None
     if hasattr(data, "node_partition"):

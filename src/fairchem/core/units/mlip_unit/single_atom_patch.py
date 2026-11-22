@@ -23,6 +23,7 @@ def single_atom_prediction_from_lookup(
     tasks: dict[str, Task],
     device: torch.device,
     dtype: torch.dtype = torch.float32,
+    undo_element_references: bool = True,
 ) -> dict[str, torch.Tensor] | None:
     """
     Handle prediction for single-atom systems without PBC.
@@ -39,6 +40,7 @@ def single_atom_prediction_from_lookup(
         atom_refs: Dictionary mapping dataset names to their atom reference dictionaries
         tasks: Dictionary mapping task names to Task objects
         device: Device to place output tensors on
+        undo_element_references: Return absolute energy or subtract the task's elemental baseline.
 
     Returns:
         Dictionary mapping task names to prediction tensors if the batch contains
@@ -111,9 +113,13 @@ def single_atom_prediction_from_lookup(
         if dataset_name not in task.datasets:
             continue
         if task.property == "energy":
-            pred_output[task_name] = torch.tensor(
-                [float(energy)], dtype=dtype, device=device
-            )
+            value = float(energy)
+            if not undo_element_references and task.element_references is not None:
+                # The lookup already contains absolute energies. Subtract the
+                # single atom's baseline before rounding to the output dtype.
+                refs = task.element_references.element_references
+                value -= refs[atomic_number].item()
+            pred_output[task_name] = torch.tensor([value], dtype=dtype, device=device)
         elif task.property == "forces":
             pred_output[task_name] = torch.zeros((1, 3), dtype=dtype, device=device)
         elif task.property == "stress":

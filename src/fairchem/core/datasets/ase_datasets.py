@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 import ase
 import numpy as np
+from ase.db.sqlite import SQLite3Database
 from ase.io.formats import string2index
 from ase.io.trajectory import TrajectoryReader
 from tqdm import tqdm
@@ -177,6 +178,18 @@ class AseAtomsDataset(BaseDataset, ABC):
         return len(self.get_atoms(idx))
 
 
+def _structure_files(directory: Path, config):
+    metadata_path = config.get("metadata_path")
+    sidecar = Path(metadata_path).resolve() if metadata_path is not None else None
+    return (
+        path
+        for path in directory.glob(config.get("pattern", "*"))
+        if path.name != "metadata.npz"
+        and path.is_file()
+        and (sidecar is None or path.resolve() != sidecar)
+    )
+
+
 @registry.register_dataset("ase_read")
 class AseReadDataset(AseAtomsDataset):
     """
@@ -243,7 +256,7 @@ class AseReadDataset(AseAtomsDataset):
             self.relaxed_ase_read_args = copy.deepcopy(self.ase_read_args)
             self.relaxed_ase_read_args["index"] = "-1"
 
-        return list(self.path.glob(f"{config.get('pattern', '*')}"))
+        return list(_structure_files(self.path, config))
 
     def get_atoms(self, idx: int) -> ase.Atoms:
         try:
@@ -377,7 +390,7 @@ class AseReadMultiStructureDataset(AseAtomsDataset):
         self.path = Path(config["src"])
         if self.path.is_file():
             raise ValueError(f"The specified src is not a directory: {self.path}")
-        filenames = self.path.glob(config.get("pattern", "*"))
+        filenames = _structure_files(self.path, config)
         if config.get("use_tqdm", True):
             filenames = tqdm(filenames)
         for filename in filenames:
@@ -471,8 +484,8 @@ class AseDBDataset(AseAtomsDataset):
         transform (callable, optional): deprecated?
     """
 
-    def _load_dataset_get_ids(self, config: dict) -> list[int]:
-        if isinstance(config["src"], list):
+    def _load_dataset_get_ids(self, config: dict) -> range:
+        if not isinstance(config["src"], (str, os.PathLike)):
             filepaths = []
             for path in sorted(config["src"]):
                 if os.path.isdir(path):
@@ -486,7 +499,7 @@ class AseDBDataset(AseAtomsDataset):
         elif os.path.isdir(config["src"]):
             filepaths = sorted(glob(f"{config['src']}/*"))
         else:
-            filepaths = sorted(glob(config["src"]))
+            filepaths = sorted(glob(os.fspath(config["src"])))
 
         self.dbs = []
 
@@ -517,13 +530,16 @@ class AseDBDataset(AseAtomsDataset):
             if hasattr(db, "ids") and self.select_args == {}:
                 self.db_ids.append(db.ids)
             else:
-                # this is the slow alternative
-                self.db_ids.append([row.id for row in db.select(**self.select_args)])
+                args = self.select_args
+                if isinstance(db, SQLite3Database) and args.get("filter") is None:
+                    # SQL handles the selection. The caller only needs row IDs.
+                    args = {**args, "columns": ["id"], "include_data": False}
+                self.db_ids.append([row.id for row in db.select(**args)])
 
         idlens = [len(ids) for ids in self.db_ids]
         self._idlen_cumulative = np.cumsum(idlens).tolist()
 
-        return list(range(sum(idlens)))
+        return range(sum(idlens))
 
     def get_atoms(self, idx: int) -> ase.Atoms:
         """Get atoms object corresponding to datapoint idx. Useful to read other properties not in data object.
@@ -538,13 +554,13 @@ class AseDBDataset(AseAtomsDataset):
             atoms: ASE atoms corresponding to datapoint idx
         """
         # Figure out which db this should be indexed from.
+        idx = self.ids[integer_index(idx)]
         db_idx = bisect.bisect(self._idlen_cumulative, idx)
 
         # Extract index of element within that db
         el_idx = idx
         if db_idx != 0:
             el_idx = idx - self._idlen_cumulative[db_idx - 1]
-        assert el_idx >= 0
 
         atoms_row = self.dbs[db_idx]._get_row(self.db_ids[db_idx][el_idx])
         atoms = atoms_row.toatoms()
@@ -569,13 +585,16 @@ class AseDBDataset(AseAtomsDataset):
         connect_args = dict(connect_args or {})
 
         # If we're using an aselmdb, let's set readonly=True to be safe!
-        if "aselmdb" in address:
+        if connect_args.get("type", "extract_from_name") == "aselmdb" or (
+            connect_args.get("type", "extract_from_name") == "extract_from_name"
+            and Path(address).suffix == ".aselmdb"
+        ):
             connect_args["readonly"] = True
             connect_args["use_lock_file"] = False
 
         return ase.db.connect(address, **connect_args)
 
     def __del__(self):
-        for db in self.dbs:
+        for db in getattr(self, "dbs", ()):
             if hasattr(db, "close"):
                 db.close()

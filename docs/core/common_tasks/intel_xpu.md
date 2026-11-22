@@ -5,6 +5,8 @@ backend. It includes strict FP32 and an opt-in FP64 preset. It has **not yet bee
 validated on an Intel Arc Pro B70**: CPU regression tests and simulated device
 dispatch cannot establish real XPU kernel correctness or performance.
 
+See the [November 2026 follow-up audit](intel_xpu_reaudit_20261122.md) for CPU regression results and isolated before/after measurements.
+
 ## Environment
 
 Intel lists Arc Pro B70 with Ubuntu 24.04/26.04 in its

@@ -303,10 +303,10 @@ def test_sharded_training_keeps_file_samples_independent_and_matches_resident(tm
 def test_process_training_with_shards_preserves_parent_rng(tmp_path):
     # Import through its qualified module name so a fresh interpreter can
     # reconstruct this example exactly as it would a user's packaged student.
+    from fairchem.core.common._model_state import MODEL_STATE_LOCK
     from tests.core.calculate.test_series_b_distillation import (
         HarmonicStudent as Student,
     )
-    from fairchem.core.common._model_state import MODEL_STATE_LOCK
 
     dataset = collect_teacher_labels(
         Teacher(Student(2.0)),
@@ -322,3 +322,32 @@ def test_process_training_with_shards_preserves_parent_rng(tmp_path):
     reference = distill_student(Student(), dataset, steps=2)
     assert isolated.loss_history == reference.loss_history
     torch.testing.assert_close(torch.get_rng_state(), rng)
+
+
+def test_short_sharded_training_only_reads_the_sampled_shard(tmp_path, monkeypatch):
+    student = HarmonicStudent()
+    dataset = collect_teacher_labels(
+        Teacher(HarmonicStudent(2.0)),
+        (_data(i + 1) for i in range(5)),
+        teacher_id="k2",
+        properties=("energy",),
+        shard_directory=tmp_path,
+        shard_size=1,
+    )
+    reads = []
+    read = dataset.samples._read
+
+    def track(number):
+        reads.append(number)
+        return read(number)
+
+    monkeypatch.setattr(dataset.samples, "_read", track)
+    with pytest.raises(ValueError, match="positively weighted"):
+        distill_student(
+            student, dataset, steps=1, weights=DistillationWeights(energy=0, forces=1)
+        )
+    assert not reads
+    result = distill_student(
+        student, dataset, steps=1, weights=DistillationWeights(energy=1, forces=0)
+    )
+    assert len(result.loss_history) == len(reads) == 1

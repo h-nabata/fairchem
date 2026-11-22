@@ -686,6 +686,7 @@ def test_same_directory_restarts_match_constrained_nve(tmp_path):
             steps=steps,
             timestep_fs=0.5,
             trajectory_interval=1,
+            log_interval=1,
             checkpoint_interval=interval,
         )
         runner._job_config = _create_mock_job_config(str(directory), str(checkpoint))
@@ -700,6 +701,9 @@ def test_same_directory_restarts_match_constrained_nve(tmp_path):
     run(tmp_path, 8, load=True, interval=4)
     resumed, result = run(tmp_path, 9, load=True)
     assert result["total_steps"] == result["target_steps"] == 9
+    assert (tmp_path / "thermo.log").read_bytes() == (
+        reference_dir / "thermo.log"
+    ).read_bytes()
     reference_frames = pd.read_parquet(reference_dir / "trajectory.parquet")
     frames = pd.read_parquet(tmp_path / "trajectory.parquet")
     assert list(frames.step) == list(range(10))
@@ -923,3 +927,81 @@ def test_parallel_checkpoint_publication_preserves_shards(tmp_path):
     assert sorted(
         int(path.read_text()) for path in Path(checkpoint).glob("shard-*.json")
     ) == list(range(8))
+
+
+def test_final_checkpoint_can_finish_publication(tmp_path, cu_atoms, monkeypatch):
+    checkpoint = tmp_path / "checkpoint"
+    config = _create_mock_job_config(str(tmp_path), str(checkpoint))
+
+    def fail_close(writer):
+        raise OSError("interrupted at publication")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ParquetTrajectoryWriter, "close", fail_close)
+        runner = MDRunner(
+            EMT(), VelocityVerletThermostat(), cu_atoms, steps=3, checkpoint_interval=3
+        )
+        runner._job_config = config
+        with pytest.raises(OSError, match="interrupted at publication"):
+            runner.run()
+    assert not (tmp_path / "trajectory.parquet").exists()
+
+    runner = MDRunner(EMT(), VelocityVerletThermostat(), steps=3)
+    runner._job_config = config
+    runner.load_state(str(checkpoint))
+    runner.run()
+    assert pq.read_table(tmp_path / "trajectory.parquet")["step"].to_pylist() == [
+        0,
+        1,
+        2,
+        3,
+    ]
+    assert json.loads((tmp_path / "metadata.json").read_text())["total_steps"] == 3
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_langevin_keeps_fixed_coordinates(cu_atoms, explicit):
+    fixed = FixAtoms(indices=[0, 1])
+    constraints = [fixed]
+    if explicit:
+        constraints.append(FixSubsetCom(indices=np.arange(2, len(cu_atoms))))
+    cu_atoms.set_constraint(constraints)
+    cu_atoms.calc = EMT()
+    before = cu_atoms.positions[:2].copy()
+    dyn = LangevinThermostat(300, 0.01, thermostat_seed=3).build(cu_atoms, 1)
+    dyn.run(4)
+    npt.assert_array_equal(cu_atoms.positions[:2], before)
+
+
+def test_initialize_momenta_with_overlapping_com_constraints():
+    atoms = Atoms(
+        "Cu6",
+        constraint=[FixAtoms(indices=[0]), FixSubsetCom([1, 2]), FixSubsetCom([2, 3])],
+    )
+    initialize_momenta(atoms, 300, 123)
+    momenta = atoms.get_momenta()
+    npt.assert_array_equal(momenta[0], 0.0)
+    for subset in [[1, 2], [2, 3], list(range(6))]:
+        npt.assert_allclose(momenta[subset].sum(axis=0), 0, atol=1e-13)
+    assert atoms.get_kinetic_energy() > 0
+    initialize_momenta(atoms, 0, 123)
+    npt.assert_array_equal(atoms.get_momenta(), 0.0)
+
+
+def test_trajectory_buffer_owns_native_arrays_and_nullable_vectors(tmp_path):
+    path = tmp_path / "trajectory.parquet"
+    frame = TrajectoryFrame.from_atoms(Atoms("He"), 0)
+    first_positions = frame.positions.copy()
+    with ParquetTrajectoryWriter(path, 4) as writer:
+        writer.append(frame)
+        frame.step = 1
+        frame.positions[:] = 2.0
+        frame.forces = np.ones((1, 3), dtype=np.float32)
+        writer.append(frame)
+        frame.forces[:] = -1
+        writer.append(TrajectoryFrame.from_atoms(Atoms(), 2))
+    first, second, empty = pq.read_table(path).to_pylist()
+    npt.assert_array_equal(first["positions"], first_positions)
+    assert first["forces"] is None
+    assert second["forces"] == [[1.0, 1.0, 1.0]]
+    assert empty["positions"] == []

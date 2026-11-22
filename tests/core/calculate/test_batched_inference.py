@@ -127,6 +127,17 @@ def test_batch_planner_limits_do_not_truncate_graphs():
     assert len(plan) == 2
 
 
+def test_stored_graph_edges_are_a_lower_bound_for_admission():
+    data = _structure()
+    data.edge_index = torch.tensor([[0, 1, 2], [1, 2, 0]])
+    with pytest.raises(ValueError, match="Structure 0"):
+        plan_microbatches([data], InferenceBatchLimits(max_edges=2), edge_counts=[0])
+    plan = plan_microbatches(
+        [data, data], InferenceBatchLimits(max_edges=5), edge_counts=[0, 0]
+    )
+    assert plan == [[0], [1]]
+
+
 def test_unknown_property_requires_explicit_output_layout():
     predictor = SimpleNamespace(predict=lambda data: {"descriptor": data.pos.square()})
     with pytest.raises(ValueError, match="descriptor"):
@@ -391,9 +402,11 @@ def test_staged_lease_records_allocator_lifetime_and_joins_consumer_streams(
     monkeypatch.setattr(device_buffers, "device_scope", lambda device: nullcontext())
     lease = device_buffers.StagedBatch(owner, slot, object())
     lease.wait()
+    lease.wait()
     current = second
     lease.wait()
     current = release_stream
+    lease.wait()
     lease.release()
     assert recorded == [first, second, release_stream]
     assert events[:3] == [

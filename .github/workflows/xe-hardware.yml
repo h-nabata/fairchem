@@ -48,6 +48,20 @@ jobs:
         run: |
           python -m pytest -q tests/core/common/test_distributed_subgroup_audit.py \
             tests/core/components/test_batch_server_live_cpu.py
+      - name: Exercise portable scientific and sampling regressions
+        run: |
+          python -m pytest -q \
+            tests/core/modules/test_loss.py \
+            tests/core/common/test_slurm_rendezvous.py \
+            tests/core/datasets/test_sampler_metadata_audit.py \
+            tests/core/calculate/test_resolve_checkpoint.py \
+            tests/core/calculate/test_xpu_pretrained.py \
+            tests/core/graph/test_geometry.py \
+            tests/core/models/uma/test_precision_contracts.py \
+            tests/core/regression_suite/test_measurement_integrity.py \
+            tests/core/units/mlip_unit/test_task_label_masks.py \
+            tests/core/units/mlip_unit/test_mlip_unit.py::test_full_train_eval_from_cli_aselmdb \
+            tests/core/units/mlip_unit/test_mlip_unit.py::test_full_conserving_mole_eval_from_cli
 
   two-b70:
     if: github.repository == 'h-nabata/fairchem' && github.ref == 'refs/heads/intel-xpu-fp32' && vars.XE_B70_CI == 'true'

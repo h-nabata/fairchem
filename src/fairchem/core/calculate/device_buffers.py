@@ -68,14 +68,15 @@ class StagedBatch:
         if self._owner.device.type != "cpu":
             with device_scope(self._owner.device):
                 stream = self._owner._backend.current_stream(self._owner.device)
+                if stream in self._consumer_streams:
+                    return self._batch
                 stream.wait_event(self._slot.ready)
                 # The allocator must also know about consumers if the lease and
                 # stager are dropped without close(). Waiting on the copy event
                 # alone does not extend allocation lifetime on another stream.
                 for tensor in self._slot.target.values():
                     tensor.record_stream(stream)
-                if stream not in self._consumer_streams:
-                    self._consumer_streams.append(stream)
+                self._consumer_streams.append(stream)
         return self._batch
 
     def release(self) -> None:
@@ -86,7 +87,7 @@ class StagedBatch:
         if self._released:
             return
         # Also order release after the copy when the caller never entered/waited.
-        self.wait()
+        self._wait()
         if self._owner.device.type != "cpu":
             with device_scope(self._owner.device):
                 stream = self._owner._backend.current_stream(self._owner.device)

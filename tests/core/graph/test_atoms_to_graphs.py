@@ -236,3 +236,25 @@ class TestAtomsToGraphs:
                 # r_edges=True,
                 molecule_cell_size=120.0,
             )
+
+
+@pytest.mark.parametrize("strict", [None, False, True])
+def test_unwrapped_pymatgen_search_keeps_exact_returned_image_ids(strict):
+    atoms = Atoms(
+        "H2",
+        positions=[[0.25, 0, 0], [1e8, 0, 0]],
+        cell=[3, 6, 6],
+        pbc=[True, False, False],
+    )
+    original = atoms.positions.copy()
+    centers, sources, distances, offsets = get_neighbors_pymatgen(
+        atoms, 1.1, 10, strict, target_dtype=torch.float32
+    )
+    edges, images = reshape_features(
+        centers, sources, distances, offsets, torch.float32
+    )
+    assert edges.tolist() == [[1, 0], [0, 1]]
+    assert images.dtype == torch.long
+    assert images.tolist() == [[-33333333, 0, 0], [33333333, 0, 0]]
+    np.testing.assert_array_equal(distances, [0.75, 0.75])
+    np.testing.assert_array_equal(atoms.positions, original)
